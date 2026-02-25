@@ -2,37 +2,63 @@
 Rule-based content classification and chunking strategy assignment.
 
 Improvements over original design:
-- Structural HTML detection for FAQs (dl/dt/dd, accordion markup, Q/A heading patterns).
-- classification_confidence field: 'high' for strong signal matches, 'medium' for
-  structural HTML detection, 'low' for default prose fallback.
+- Removes over-broad 'register'/'registration' from form signals (matched nearly
+  every page on an elections site, causing 258 pages to be classified as 'form').
+- Adds 'nav_hub' class for link-heavy hub pages (150–499 words).
+- Activates 'semantic_with_overlap' strategy for prose pages (was dead code before).
+- URL-path-based form detection instead of keyword matching.
+- press_room/* treated as press_release, not form.
+- classification_confidence: 'high' for URL/structural matches, 'medium' for
+  word-count-based fallbacks, 'low' for final default.
 """
 import re
 
 from bs4 import BeautifulSoup
+from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
-# Signal keywords (checked against combined URL + title + text head)
+# Signal keywords — checked against url + title + text head
 # ---------------------------------------------------------------------------
 
 FAQ_SIGNALS = [
     'faq', 'frequently-asked', 'frequently asked',
     'q&a', 'q & a', 'questions and answers',
 ]
+
+# URL path substrings for known FAQ pages on this site that lack faq keywords
+FAQ_URL_PATHS = [
+    'early_voting', 'absentee', 'election_day_questions',
+    'learn_about_the_new_voting_system', 'redistricting',
+    '/about/pia',
+]
+
 PRESS_SIGNALS = [
-    'press-release', 'press_release', 'news',
-    'announcement', 'media-release',
+    'press_room', 'press-room',
+    'press-release', 'press_release',
+    'news-release', 'announcement', 'media-release',
+    'rumor_control', 'dis-misinformation',
 ]
-FORM_SIGNALS = [
-    'form', 'application', 'register', 'registration',
-    'submit', 'apply',
+
+# URL path substrings that indicate actual online forms (not pages that mention forms)
+FORM_URL_PATHS = [
+    '/forms/',
+    'data_form',
+    'schedule_appointment',
+    'purchase_lists',
 ]
+
 TABLE_SIGNALS = [
-    'results', 'candidates', 'districts', 'precincts',
-    'statistics', 'lookup', 'search',
+    'municipal_results', 'election_results', 'results_archive',
+    '/elections/districts', '/elections/archive', '/elections/printed_copies',
+    'voter_registration/archive', 'voter_registration/stats',
+    '/voting/recount',
 ]
+
 SHORT_STATIC_SIGNALS = [
-    'contact', 'about', 'staff', 'office',
-    'hours', 'location', 'directions',
+    'contact', 'directions', 'social_media', 'county_boards',
+    'state-links', 'federal-links', 'feedback',
+    'voting_equipment', 'sbe_policy',
+    'qualifications',
 ]
 
 
@@ -59,41 +85,66 @@ def classify_page(result: dict) -> dict:
             'classification_confidence': 'high',
         }
 
+    path = urlparse(url).path.lower()
+    domain = urlparse(url).netloc.lower()
     combined = f"{url} {title} {text_head}"
     page_class = None
     confidence = 'low'
 
-    # --- 1. Keyword-signal matching (high confidence) ---
-    if any(s in combined for s in FAQ_SIGNALS):
+    # --- 1. Junk pages (Cloudflare stubs, empty external subdomains) ---
+    if 'cdn-cgi' in url:
+        page_class = 'junk'
+        confidence = 'high'
+
+    # --- 2. FAQ: keyword signals ---
+    elif any(s in combined for s in FAQ_SIGNALS) or any(s in path for s in FAQ_URL_PATHS):
         page_class = 'faq'
         confidence = 'high'
+
+    # --- 3. Press release / news ---
     elif any(s in combined for s in PRESS_SIGNALS):
         page_class = 'press_release'
         confidence = 'high'
-    elif any(s in combined for s in FORM_SIGNALS):
-        page_class = 'form'
-        confidence = 'high'
-    elif any(s in combined for s in TABLE_SIGNALS):
-        page_class = 'table_data'
-        confidence = 'medium'
-    elif any(s in combined for s in SHORT_STATIC_SIGNALS):
-        page_class = 'short_static'
+
+    # --- 4. Prose: long-form informational pages ---
+    # Run before table/form so high-word-count pages don't get mis-routed by
+    # incidental keyword matches.
+    elif word_count >= 500:
+        page_class = 'prose'
         confidence = 'medium'
 
-    # --- 2. Structural HTML detection (medium confidence) ---
-    # Only run if we haven't already found a high-confidence classification
-    if page_class is None and raw_html:
+    # --- 5. Table / data pages ---
+    elif any(s in combined for s in TABLE_SIGNALS):
+        page_class = 'table_data'
+        confidence = 'high'
+
+    # --- 6. Actual online forms (URL-path-based only) ---
+    elif any(p in path for p in FORM_URL_PATHS) or domain.startswith('voterservices'):
+        page_class = 'form'
+        confidence = 'high'
+
+    # --- 7. Short static pages (known URL patterns) ---
+    elif any(s in combined for s in SHORT_STATIC_SIGNALS):
+        page_class = 'short_static'
+        confidence = 'high'
+
+    # --- 8. Structural HTML detection (medium confidence) ---
+    elif raw_html:
         structural = _detect_structural_patterns(raw_html)
         if structural:
             page_class = structural
             confidence = 'medium'
 
-    # --- 3. Default fallback ---
+    # --- 9. Word-count fallbacks ---
     if page_class is None:
-        page_class = 'prose'
-        confidence = 'low'
+        if word_count >= 150:
+            page_class = 'nav_hub'
+            confidence = 'medium'
+        else:
+            page_class = 'short_static'
+            confidence = 'low'
 
-    # --- Assign chunking strategy based on classification + size ---
+    # --- Assign chunking strategy ---
     strategy = _assign_strategy(page_class, word_count)
 
     return {
@@ -139,7 +190,6 @@ def _has_faq_structure(soup: BeautifulSoup) -> bool:
             return True
 
     # Pattern 2: Accordion / collapsible components
-    # Common patterns: <details>/<summary>, .accordion, .collapsible, data-toggle
     accordions = soup.find_all('details')
     if len(accordions) >= 3:
         return True
@@ -151,7 +201,6 @@ def _has_faq_structure(soup: BeautifulSoup) -> bool:
         return True
 
     # Pattern 3: Repeated heading + paragraph pattern suggesting Q&A
-    # Look for 3+ consecutive heading-then-paragraph blocks where headings end with '?'
     question_headings = soup.find_all(
         ['h2', 'h3', 'h4', 'strong'],
         string=re.compile(r'\?\s*$')
@@ -167,16 +216,23 @@ def _assign_strategy(page_class: str, word_count: int) -> str:
     if word_count == 0:
         return 'skip'
 
+    if page_class == 'junk':
+        return 'skip'
+
     if page_class == 'faq':
         return 'qa_pairs'
 
     if page_class == 'table_data':
         return 'table_rows'
 
+    if page_class == 'prose':
+        return 'semantic_with_overlap'
+
+    if page_class in ('nav_hub', 'short_static'):
+        return 'ingest_as_single'
+
+    # press_release, form
     if word_count < 150:
         return 'ingest_as_single'
 
-    if page_class in ('press_release', 'form', 'short_static') or word_count < 800:
-        return 'simple_split'
-
-    return 'semantic_with_overlap'
+    return 'simple_split'
