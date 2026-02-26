@@ -8,9 +8,6 @@ so retrieval can reconstruct the document's structure.
 import logging
 import tempfile
 
-import requests
-
-from ...pass1.config import REQUEST_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -25,11 +22,9 @@ def extract_docx(url: str) -> dict:
     Returns:
         Dict with 'sections' (list of heading-aware sections) and 'full_text'.
     """
-    try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT * 2)
-        resp.raise_for_status()
-    except Exception as exc:
-        logger.error("Failed to download DOCX %s: %s", url, exc)
+    from ..cache import get_bytes
+    docx_bytes = get_bytes(url)
+    if not docx_bytes:
         return {'sections': [], 'full_text': ''}
 
     try:
@@ -39,7 +34,7 @@ def extract_docx(url: str) -> dict:
         return {'sections': [], 'full_text': ''}
 
     with tempfile.NamedTemporaryFile(suffix='.docx', delete=True) as tmp:
-        tmp.write(resp.content)
+        tmp.write(docx_bytes)
         tmp.flush()
 
         try:

@@ -12,9 +12,6 @@ import logging
 import re
 import tempfile
 
-import requests
-
-from ...pass1.config import REQUEST_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -30,16 +27,13 @@ def extract_pdf(url: str, needs_ocr: bool = False) -> dict:
     Returns:
         Dict with 'text', 'pages', 'tables', 'structure_type' keys.
     """
-    # Download PDF to temp file
-    try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT * 2)
-        resp.raise_for_status()
-    except Exception as exc:
-        logger.error("Failed to download PDF %s: %s", url, exc)
+    from ..cache import get_bytes
+    pdf_bytes = get_bytes(url)
+    if not pdf_bytes:
         return {'text': '', 'pages': [], 'tables': [], 'structure_type': 'empty'}
 
     with tempfile.NamedTemporaryFile(suffix='.pdf', delete=True) as tmp:
-        tmp.write(resp.content)
+        tmp.write(pdf_bytes)
         tmp.flush()
 
         if needs_ocr:
