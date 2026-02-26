@@ -4,10 +4,7 @@ Table-rows chunking strategy for pages classified as 'table_data'.
 Each table row (or logical row group) becomes one chunk, with
 column headers prepended for context so each chunk is self-contained.
 """
-import requests
 from bs4 import BeautifulSoup
-
-from ...pass1.config import REQUEST_TIMEOUT
 
 
 def extract_table_chunks(url: str, raw_html: str | None = None) -> list[dict]:
@@ -22,10 +19,9 @@ def extract_table_chunks(url: str, raw_html: str | None = None) -> list[dict]:
         List of dicts with 'text', 'table_index', 'row_index' keys.
     """
     if not raw_html:
-        try:
-            resp = requests.get(url, timeout=REQUEST_TIMEOUT)
-            raw_html = resp.text
-        except Exception:
+        from ...pass2.cache import get_html
+        raw_html = get_html(url)
+        if not raw_html:
             return []
 
     soup = BeautifulSoup(raw_html, 'html.parser')

@@ -10,8 +10,6 @@ import logging
 import os
 from collections import defaultdict
 
-import requests
-
 from ..pass1.config import DB_PATH, REQUEST_TIMEOUT
 from ..pass1.db import DB
 from .metadata import build_chunk_metadata, build_chunk_metadata_multi_source
@@ -75,6 +73,10 @@ def run_pass2(
 
         if strategy == 'skip':
             logger.debug("Skipping (strategy=skip): %s", url)
+            continue
+
+        if page['content_type'] != 'html':
+            logger.debug("Skipping non-HTML (%s): %s", page['content_type'], url)
             continue
 
         logger.info("Chunking [%s]: %s", strategy, url)
@@ -171,7 +173,7 @@ def _route_to_strategy(page) -> list:
         return extract_table_chunks(url)
 
     if strategy == 'document_extraction':
-        return _extract_document(url, content_type, page.get('needs_ocr', 0))
+        return _extract_document(url, content_type, page['needs_ocr'] or 0)
 
     logger.warning("Unknown strategy '%s' for %s, skipping", strategy, url)
     return []
@@ -250,12 +252,15 @@ def _extract_document(url: str, content_type: str, needs_ocr: int) -> list:
 
 
 def _fetch_text(url: str) -> str:
-    """Re-fetch a page and extract text for chunking."""
+    """Fetch a page via the disk cache and extract text with trafilatura."""
     try:
         import trafilatura
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+        from .cache import get_html
+        html = get_html(url)
+        if not html:
+            return ''
         text = trafilatura.extract(
-            resp.text,
+            html,
             include_links=False,
             include_tables=True,
             include_images=False,

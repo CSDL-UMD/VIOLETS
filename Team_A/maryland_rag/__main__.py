@@ -25,6 +25,11 @@ def main():
     p2.add_argument('--changed', action='store_true', help='Only process pages that changed')
     p2.add_argument('--output', default='data/chunks.jsonl', help='Output JSONL path')
 
+    # Pass 3
+    p3 = subparsers.add_parser('pass3', help='Embed chunks and upsert to Pinecone')
+    p3.add_argument('--chunks', default='data/chunks.jsonl', help='Path to chunks JSONL')
+    p3.add_argument('--resume', action='store_true', help='Skip already-upserted chunk IDs')
+
     # Audit
     subparsers.add_parser('audit', help='Print manifest audit report')
 
@@ -38,6 +43,11 @@ def main():
         from .pass2.chunker import run_pass2
         chunks = run_pass2(only_changed=args.changed, output_path=args.output)
         print(f"Produced {len(chunks)} chunks → {args.output}")
+
+    elif args.command == 'pass3':
+        from .pass3.embed import run_embed
+        n = run_embed(chunks_path=args.chunks, resume=args.resume)
+        print(f"Upserted {n} vectors to Pinecone")
 
     elif args.command == 'audit':
         _run_audit()
