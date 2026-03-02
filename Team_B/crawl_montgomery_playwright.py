@@ -359,6 +359,8 @@ async def crawl() -> None:
     seen.add(START_URL)
 
     rows: list[dict] = []
+    stats = {"dropped_url": 0, "dropped_duplicate": 0, "dropped_short": 0,
+             "dropped_score": 0, "kept": 0}
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -366,7 +368,6 @@ async def crawl() -> None:
 
         async def process(url: str) -> None:
             async with semaphore:
-                # Each concurrent task gets its own browser page
                 page = await browser.new_page()
                 try:
                     status, html = await fetch_page_playwright(page, url)
@@ -374,20 +375,60 @@ async def crawl() -> None:
                     await page.close()
 
             if not html:
+                # Fetch failed or non-HTML response — log minimal row, no index
                 rows.append({
                     "url": url, "status": status, "title": "", "h1": "",
-                    "meta_description": "", "body_text": "", "summary": "", "word_count": 0,
+                    "meta_description": "", "body_text": "", "summary": "",
+                    "word_count": 0, "relevance_score": None,
+                    "filter_reason": "fetch-failed",
                 })
                 return
 
             content = extract_content(html, url)
+            word_count = len(content["body_text"].split())
+            is_pdf = urlparse(url).path.endswith(".pdf")
+            effective_min = PDF_MIN_WORDS if is_pdf else MIN_WORD_COUNT
 
-            # Enqueue newly discovered links
-            for link in content["links"]:
-                if link not in seen and same_domain(link, root_netloc):
+            # ── Stage 1: duplicate check ───────────────────────────────────────
+            if is_duplicate(content["body_text"]):
+                stats["dropped_duplicate"] += 1
+                print(f"  [DUP ] {url}")
+                return
+
+            # ── Stage 2: word count prefilter ──────────────────────────────────
+            if word_count < effective_min:
+                stats["dropped_short"] += 1
+                print(f"  [SHORT] {url}  ({word_count} words)")
+                return
+
+            # ── Stage 3: relevance score ───────────────────────────────────────
+            score, reason = score_relevance(content, url)
+
+            if score < KEEP_SCORE_THRESHOLD:
+                stats["dropped_score"] += 1
+                print(f"  [DROP] score={score} {url}")
+                return
+
+            # ── Stage 4: decide whether to follow outbound links ───────────────
+            # Hub page override: short page with many /elections/ links is a
+            # navigation gateway — always expand regardless of score.
+            elections_links = [
+                lnk for lnk in content["links"]
+                if urlparse(lnk).path.startswith("/elections")
+            ]
+            is_hub = word_count < 400 and len(elections_links) >= 5
+
+            if score >= ENQUEUE_SCORE_THRESHOLD or is_hub:
+                for link in content["links"]:
+                    if link in seen or not same_domain(link, root_netloc):
+                        continue
                     seen.add(link)
-                    queue.put_nowait(link)
+                    if should_enqueue(link):
+                        queue.put_nowait(link)
+                    else:
+                        stats["dropped_url"] += 1
 
+            # ── Stage 5: optional summary ──────────────────────────────────────
             summary = ""
             if DO_SUMMARIES and content["body_text"]:
                 try:
@@ -395,8 +436,7 @@ async def crawl() -> None:
                 except Exception as e:
                     summary = f"[summary error: {e}]"
 
-            word_count = len(content["body_text"].split())
-
+            stats["kept"] += 1
             rows.append({
                 "url": url,
                 "status": status,
@@ -406,9 +446,11 @@ async def crawl() -> None:
                 "body_text": content["body_text"],
                 "summary": summary,
                 "word_count": word_count,
+                "relevance_score": score,
+                "filter_reason": reason,
             })
 
-            print(f"  [{status}] {url}  ({word_count} words)")
+            print(f"  [KEEP] score={score} {url}  ({word_count} words)")
 
         # ── Main crawl loop ────────────────────────────────────────────────────
         tasks: set[asyncio.Task] = set()
@@ -430,21 +472,33 @@ async def crawl() -> None:
     # ── Write CSV ──────────────────────────────────────────────────────────────
     rows.sort(key=lambda r: r["url"])
 
-    fieldnames = ["url", "status", "title", "h1", "meta_description", "summary", "word_count", "body_text"]
+    fieldnames = [
+        "url", "status", "title", "h1", "meta_description",
+        "relevance_score", "filter_reason", "summary", "word_count", "body_text",
+    ]
     with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"\n✓ Crawled {len(rows)} pages → {OUTPUT_CSV}")
+    kept  = stats["kept"]
+    total = sum(stats.values())
+    print(f"\n✓ Crawled {total} URLs → kept {kept} pages → {OUTPUT_CSV}")
+    print(f"  Dropped: {stats['dropped_url']} by URL filter | "
+          f"{stats['dropped_duplicate']} duplicates | "
+          f"{stats['dropped_short']} too short | "
+          f"{stats['dropped_score']} low score")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     print(f"Starting Playwright crawl: {START_URL}")
-    print(f"  Max pages   : {MAX_PAGES}")
-    print(f"  Concurrency : {CONCURRENCY}")
-    print(f"  Summaries   : {DO_SUMMARIES}")
-    print(f"  Output      : {OUTPUT_CSV}\n")
+    print(f"  Max pages        : {MAX_PAGES}")
+    print(f"  Concurrency      : {CONCURRENCY}")
+    print(f"  Min word count   : {MIN_WORD_COUNT}")
+    print(f"  Keep score       : >= {KEEP_SCORE_THRESHOLD}")
+    print(f"  Enqueue score    : >= {ENQUEUE_SCORE_THRESHOLD}")
+    print(f"  Summaries        : {DO_SUMMARIES}")
+    print(f"  Output           : {OUTPUT_CSV}\n")
     asyncio.run(crawl())
