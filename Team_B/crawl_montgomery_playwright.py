@@ -14,6 +14,9 @@ Run:
     python crawl_montgomery_playwright.py
 """
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import asyncio
 import csv
 import hashlib
@@ -33,7 +36,7 @@ MAX_PAGES       = 300          # hard cap on pages to crawl
 CONCURRENCY     = 5            # simultaneous browser pages (lower than httpx — browsers are heavier)
 SLEEP_SECS      = 0.5          # polite delay per request
 TIMEOUT         = 30_000       # milliseconds (Playwright uses ms)
-DO_SUMMARIES    = False        # set True and export OPENAI_API_KEY to enable
+DO_SUMMARIES    = True        # set True and export OPENAI_API_KEY to enable
 OUTPUT_CSV      = "report_montgomery.csv"
 
 # ── URL helpers ───────────────────────────────────────────────────────────────
