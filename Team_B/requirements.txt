@@ -1,0 +1,29 @@
+# Requirements for Team_B crawlers
+#
+# Install:
+#     pip install -r requirements.txt
+#
+# After installing, also run:
+#     playwright install chromium
+#     (if error, try this: python -m playwright install chromium)
+#
+# (Downloads the Chromium browser binary used by crawl_montgomery_playwright.py)
+
+# ── crawl_montgomery_playwright.py ────────────────────────────────────────────
+
+# Headless browser automation (replaces httpx for JS-rendered pages)
+playwright>=1.40.0
+
+# Main-content extraction from raw HTML
+trafilatura>=1.6.0
+
+# HTML parsing (used for title/h1/meta/link extraction)
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+lxml-html-clean>=0.1.0
+
+# Optional: OpenAI summaries (set DO_SUMMARIES=True)
+openai>=1.0.0
+
+# .env file loading
+python-dotenv>=1.0.0
