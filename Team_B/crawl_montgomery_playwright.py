@@ -298,7 +298,10 @@ def is_duplicate(body_text: str) -> bool:
 
 def summarize(text: str, url: str) -> str:
     from openai import OpenAI
-    client = OpenAI()
+    # OPENAI_BASE_URL in .env handles project-scoped keys that require a
+    # regional endpoint (e.g. us.api.openai.com instead of api.openai.com).
+    # If the var is absent the SDK falls back to its default endpoint.
+    client = OpenAI(base_url=os.getenv("OPENAI_BASE_URL") or None)
     snippet = text[:8_000]
     response = client.chat.completions.create(
         model="gpt-4o-mini",
