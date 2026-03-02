@@ -268,6 +268,33 @@ def extract_content(html: str, url: str) -> dict:
         "links": links,
     }
 
+# ── Content deduplication ─────────────────────────────────────────────────────
+#
+# CMS sites often serve identical content at multiple URLs (canonical + alias,
+# printer-friendly variant, redirect target, etc.).  We fingerprint the body
+# text so duplicate documents never reach the RAG index even if their URLs
+# look different.
+#
+# asyncio is single-threaded, so a plain module-level set is safe to share
+# across all concurrent tasks without a lock.
+
+_seen_hashes: set[str] = set()
+
+def is_duplicate(body_text: str) -> bool:
+    """
+    Return True if this body text has been seen before.
+    Side-effect: registers the fingerprint if it is new.
+    """
+    if not body_text.strip():
+        return False  # empty pages are handled by word_count check, not here
+    normalised = " ".join(body_text.split())  # collapse whitespace variants
+    fp = hashlib.md5(normalised.encode("utf-8")).hexdigest()
+    if fp in _seen_hashes:
+        return True
+    _seen_hashes.add(fp)
+    return False
+
+
 # ── OpenAI summarizer (optional) ──────────────────────────────────────────────
 
 def summarize(text: str, url: str) -> str:
