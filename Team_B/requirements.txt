@@ -24,3 +24,6 @@ lxml-html-clean>=0.1.0
 
 # Optional: OpenAI summaries (set DO_SUMMARIES=True)
 openai>=1.0.0
+
+# .env file loading
+python-dotenv>=1.0.0
