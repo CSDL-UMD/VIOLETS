@@ -42,7 +42,7 @@ OUTPUT_CSV      = "report_montgomery.csv"
 
 # ── URL helpers ───────────────────────────────────────────────────────────────
 
-# Query parameters that carry no page identity — strip them so the same page
+# Query parameters that carry no page identity, strip them so the same page
 # reached via two different tracking links doesn't appear twice in `seen`.
 _STRIP_PARAMS = {
     "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term",
@@ -87,6 +87,83 @@ def normalize_url(base: str, href: str) -> Optional[str]:
 
 def same_domain(url: str, root_netloc: str) -> bool:
     return urlparse(url).netloc == root_netloc
+
+# ── URL filtering ────────────────────────────────────────────────────────
+#
+# should_enqueue() is called for every discovered link BEFORE opening a browser
+# tab.  It is cheap (regex only) and eliminates whole categories of URLs that
+# would otherwise consume the MAX_PAGES budget with zero RAG value.
+#
+#   1. If the URL matches any BLOCKLIST pattern  → reject immediately.
+#   2. If the URL is a PDF, it must also match a PDF_ALLOWLIST keyword → else reject.
+#   3. The URL must be under the /elections path → else reject.
+#   4. Everything that survives → accept.
+
+# Patterns that are ALWAYS excluded.  Checked against the lowercased URL path.
+_BLOCKLIST_PATTERNS: list[re.Pattern] = [re.compile(p, re.I) for p in [
+    # Precinct map PDFs — the primary cause of crawl bloat
+    r"/elections/resources/files/pdfs/maps/precincts/",
+    r"/elections/resources/files/pdfs/maps/",
+    r"precinct[-_]?\d+.*\.pdf$",
+    r"precinct.*map.*\.pdf$",
+
+    # Other non-voter PDFs
+    r"gis.*\.pdf$",
+    r"district[-_]map.*\.pdf$",
+    r"canvass.*result.*\.pdf$",
+    r"statistics[-_]\d{4}.*\.pdf$",
+
+    # Binary / media assets — trafilatura can't extract text from these
+    r"\.(jpg|jpeg|png|gif|svg|webp|ico|bmp|tiff|mp4|mp3|wav|avi|mov)$",
+    r"\.(zip|tar\.gz|gz|exe|dmg|msi)$",
+    r"\.(css|js|woff2?|ttf|eot)$",
+
+    # Sitewide boilerplate and unrelated county departments
+    r"/finance/", r"/police/", r"/health/", r"/transportation/",
+    r"/parks/", r"/budget/", r"/council/", r"/permits/",
+    r"/hr/", r"/dhhs/", r"/dot/", r"/mcps/",
+    r"/content/templates/",
+    r"/content/resources/shared/",
+
+    # Dynamic / infinite pages — search results, print views, sitemaps
+    r"[?&](print|printview|print_view)=",
+    r"/sitemap",
+    r"/robots\.txt$",
+    r"/accessibility-statement$",
+    r"/privacy-policy$",
+    r"/terms-of-use$",
+    r"[?&]search=",
+]]
+
+# PDFs are blocked by default; they only pass if their path contains one of
+# these voter-facing keywords, indicating an actionable document (form, guide).
+_PDF_ALLOW_KEYWORDS = re.compile(
+    r"(application|form|guide|instruction|voter|ballot|registration|absentee|mail)",
+    re.I,
+)
+
+def should_enqueue(url: str) -> bool:
+    """
+    Returns True if this URL should be added to the crawl queue.
+    Called before any network request is made.
+    """
+    path = urlparse(url).path  # already lowercased by normalize_url
+
+    # 1. Hard blocklist — reject immediately
+    for pattern in _BLOCKLIST_PATTERNS:
+        if pattern.search(url):
+            return False
+
+    # 2. PDF-specific gate — only allow voter-facing documents
+    if path.endswith(".pdf"):
+        if not _PDF_ALLOW_KEYWORDS.search(path):
+            return False
+
+    # 3. Must be under the /elections path
+    if not path.startswith("/elections"):
+        return False
+
+    return True
 
 # ── Content extraction ────────────────────────────────────────────────────────
 
