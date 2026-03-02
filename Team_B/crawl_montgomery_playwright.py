@@ -20,9 +20,10 @@ Optional OpenAI summaries:
 
 import asyncio
 import csv
+import hashlib
 import os
 import re
-from urllib.parse import urljoin, urldefrag, urlparse
+from urllib.parse import urljoin, urldefrag, urlparse, parse_qs, urlencode, urlunparse
 from typing import Optional
 
 import trafilatura
@@ -41,18 +42,48 @@ OUTPUT_CSV      = "report_montgomery.csv"
 
 # ── URL helpers ───────────────────────────────────────────────────────────────
 
+# Query parameters that carry no page identity — strip them so the same page
+# reached via two different tracking links doesn't appear twice in `seen`.
+_STRIP_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term",
+    "fbclid", "gclid", "_ga", "ref", "source", "sessionid", "PHPSESSID",
+}
+
 def normalize_url(base: str, href: str) -> Optional[str]:
     if not href:
         return None
     href = href.strip()
     if href.startswith(("mailto:", "tel:", "javascript:", "data:", "#")):
         return None
+
     abs_url = urljoin(base, href)
-    abs_url, _ = urldefrag(abs_url)
-    scheme = urlparse(abs_url).scheme
-    if scheme not in {"http", "https"}:
+    abs_url, _ = urldefrag(abs_url)          # strip #fragment
+    parsed   = urlparse(abs_url)
+
+    if parsed.scheme not in {"http", "https"}:
         return None
-    return abs_url
+
+    # Lowercase scheme + netloc (RFC-correct); lowercase path so that
+    # /Elections/ and /elections/ are treated as the same resource.
+    netloc = parsed.netloc.lower()
+    path   = parsed.path.lower()
+
+    # Remove trailing slash on non-root paths  (/elections/ → /elections)
+    if path != "/" and path.endswith("/"):
+        path = path.rstrip("/")
+
+    # Strip tracking params; sort survivors so param order doesn't matter.
+    qs_pairs = [
+        (k, v)
+        for k, vs in parse_qs(parsed.query, keep_blank_values=True).items()
+        for v in vs
+        if k not in _STRIP_PARAMS
+    ]
+    qs_pairs.sort()
+    clean_query = urlencode(qs_pairs)
+
+    canonical = urlunparse((parsed.scheme, netloc, path, "", clean_query, ""))
+    return canonical
 
 def same_domain(url: str, root_netloc: str) -> bool:
     return urlparse(url).netloc == root_netloc
