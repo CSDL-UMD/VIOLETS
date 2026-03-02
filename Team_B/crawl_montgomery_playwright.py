@@ -165,6 +165,72 @@ def should_enqueue(url: str) -> bool:
 
     return True
 
+# ── Content relevance scoring ─────────────────────────────────────────────────
+#
+# score_relevance() runs after page extraction.  It scores the combined signal
+# of title + h1 + body text and returns (score, reason).
+#
+# Score tiers (applied in the crawl loop):
+#   >= 2  → KEEP + index + enqueue outbound links   (high-value page)
+#   0–1   → KEEP + index, do NOT enqueue links      (thin but relevant)
+#   <  0  → DROP entirely                           (net-irrelevant)
+#
+# word_count < MIN_WORD_COUNT causes an immediate DROP before this runs.
+
+MIN_WORD_COUNT          = 80   # below this → likely a nav shell
+KEEP_SCORE_THRESHOLD    = 0    # score must reach this to keep the page
+ENQUEUE_SCORE_THRESHOLD = 2    # score must reach this to follow outbound links
+PDF_MIN_WORDS           = 50   # voter PDFs that extracted almost no text → drop
+
+# (pattern, weight) pairs scored against lowercased title + h1 + body_text
+_RELEVANCE_SIGNALS: list[tuple[re.Pattern, int]] = [
+    (re.compile(r"early voting|election day|polling place|poll hours?|how to vote|cast (a |your )?ballot|vote in.?person", re.I), 3),
+    (re.compile(r"mail.?in ballot|absentee ballot|vote by mail|ballot request|drop box|ballot drop|return (a |your )?ballot|track (a |your )?ballot", re.I), 3),
+    (re.compile(r"register to vote|voter registration|registration deadline|update (your )?address|change of address|party affiliation|registration status", re.I), 3),
+    (re.compile(r"sample ballot|ballot question|candidate filing|election results?|official results?|primary election|general election|canvass|certification", re.I), 2),
+    (re.compile(r"eligible to vote|id required|photo id|proof of residency|citizenship|18 years|felony|provisional ballot", re.I), 2),
+    (re.compile(r"accessible voting|language assistance|\bada\b|audio ballot|curbside voting|accommodations?|spanish|korean|chinese|vietnamese|amharic", re.I), 2),
+    (re.compile(r"board of elections|contact us|office hours|election office|\bfaq\b|frequently asked|deadline|important dates?", re.I), 1),
+    (re.compile(r"\bmilitary\b|overseas|uocava|uniformed services|federal ballot|satellite office", re.I), 1),
+]
+
+_IRRELEVANCE_SIGNALS: list[tuple[re.Pattern, int]] = [
+    (re.compile(r"precinct map|precinct boundar|precinct number|precinct chart|\bgis\b|geographic information|district boundar|voting district map", re.I), -4),
+    (re.compile(r"internal use only|canvass worksheet|administrative record|staff meeting|board meeting agenda", re.I), -2),
+]
+
+def score_relevance(content: dict, url: str) -> tuple[int, str]:
+    """Return (score, reason) for a fetched page."""
+    haystack = " ".join([
+        content.get("title", ""),
+        content.get("h1", ""),
+        content.get("body_text", ""),
+    ])
+
+    score = 0
+    matched_pos: list[str] = []
+    matched_neg: list[str] = []
+
+    for pattern, weight in _RELEVANCE_SIGNALS:
+        if pattern.search(haystack):
+            score += weight
+            matched_pos.append(pattern.pattern[:45])
+
+    for pattern, weight in _IRRELEVANCE_SIGNALS:
+        if pattern.search(haystack):
+            score += weight
+            matched_neg.append(pattern.pattern[:45])
+
+    parts = []
+    if matched_pos:
+        parts.append("pos:" + "|".join(matched_pos))
+    if matched_neg:
+        parts.append("neg:" + "|".join(matched_neg))
+    reason = "; ".join(parts) if parts else "no signals matched"
+
+    return score, reason
+
+
 # ── Content extraction ────────────────────────────────────────────────────────
 
 def extract_content(html: str, url: str) -> dict:
