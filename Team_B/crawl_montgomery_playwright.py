@@ -8,14 +8,10 @@ This is a drop-in replacement for Ryan's httpx-based crawler,
 adapted for JS-heavy sites like montgomerycountymd.gov/elections.
 
 Install deps:
-    pip install playwright trafilatura beautifulsoup4 lxml lxml_html_clean openai
-    playwright install chromium
+    see requirements.txt
 
 Run:
     python crawl_montgomery_playwright.py
-
-Optional OpenAI summaries:
-    export OPENAI_API_KEY="sk-..."
 """
 
 import asyncio
