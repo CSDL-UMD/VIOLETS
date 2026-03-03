@@ -23,7 +23,7 @@ LOG_FILE = os.path.join(LOG_DIR, "crawl.log")
 
 # --- Feature Flags ---
 SAVE_RAW_HTML = False
-RESPECT_ROBOTS_TXT = True
+RESPECT_ROBOTS_TXT = False
 
 # --- Content Detection ---
 DOCUMENT_EXTENSIONS = {'.pdf', '.docx', '.doc', '.xls', '.xlsx', '.csv'}

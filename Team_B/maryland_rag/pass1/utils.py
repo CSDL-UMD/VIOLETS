@@ -37,6 +37,12 @@ def normalize_url(href: str, base: str) -> str | None:
         # Drop fragment
         clean_parsed = parsed._replace(fragment='')
 
+        # Fix double slashes in path (but not in https://)
+        path = clean_parsed.path
+        while '//' in path:
+            path = path.replace('//', '/')
+        clean_parsed = clean_parsed._replace(path=path)
+
         # Normalize: sort query params for consistency
         if clean_parsed.query:
             qs = parse_qs(clean_parsed.query, keep_blank_values=True)
@@ -49,9 +55,14 @@ def normalize_url(href: str, base: str) -> str | None:
 
 
 def is_internal(url: str) -> bool:
-    """Check if a URL belongs to the target domain."""
+    """Check if a URL belongs to the target domain (exact match only)."""
     try:
-        return DOMAIN in urlparse(url).netloc
+        netloc = urlparse(url).netloc
+        # Strip www. prefix before comparing so both
+        # www.montgomerycountymd.gov and montgomerycountymd.gov match
+        netloc_clean = netloc.replace('www.', '')
+        domain_clean = DOMAIN.replace('www.', '')
+        return netloc_clean == domain_clean or netloc_clean.endswith('.' + domain_clean)
     except Exception:
         return False
 
