@@ -49,6 +49,18 @@ EXCLUDED_PATH_PATTERNS = [
     # No text content, not useful for RAG ingestion.
     (r'(?i)/elections/resources/images/',                   "Site images - no text content"),
 
+    # Outdated election media guides
+    (r'(?i)/elections/resources/files/pdfs/mediaguide/', "Past election media guides - outdated"),
+
+    # Internal election worker documents
+    (r'(?i)/elections/resources/files/pdfs/judge/',      "Election judge internal documents"),
+
+    # Electioneering zone maps/photos
+    (r'(?i)/elections/resources/files/pdfs/electioneering/', "Electioneering zone images"),
+    
+    # Old press release archives - outdated, rules/info may have changed
+    (r'(?i)/elections/pressreleases\d{4}/', "Past year press release archives"),
+
     # Election maps index pages — these only link to the precinct
     # map PDFs already excluded above, so the pages themselves
     # have no standalone value.
