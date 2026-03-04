@@ -23,8 +23,15 @@ EXCLUDED_PATH_PATTERNS = [
     (r'(?i)/elections/\d{4}/',                              "Past election year folder"),
 
     (r'(?i)www3\.montgomerycountymd\.gov', "County 311 services - not elections"),
-    
 
+    (r'(?i)/elections/resources/files/pdfs/ej',   "Election judge internal admin PDFs"),
+    (r'(?i)/elections/resources/files/pdfs/ew',   "Election worker internal admin PDFs"),
+    # Confirmed past election result data - raw vote counts, not useful for chatbot
+    # Past election year folders - vote results, site maps, precinct breakdowns
+    (r'(?i)/elections/resources/files/htm/\d{4}/',     "Past election HTML result files"),
+    (r'(?i)/elections/resources/files/pdfs/stats/',    "Historical monthly voter count PDFs"),
+    (r'(?i)/elections/resources/files/pdfs/\d{4}',     "Past election year PDF folder"),
+    (r'(?i)/elections/\d{4}(primary|general)election', "Past election year index pages"),
     # External state elections site — Montgomery County pages link to it
     # but it is out of scope for this crawl.
     (r'(?i)elections\.maryland\.gov',          "Maryland state elections site - out of scope"),
