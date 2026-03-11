@@ -18,11 +18,11 @@ import time
 
 import requests
 
-from ..pass1.config import BASE_DIR, RATE_LIMIT_SECONDS, REQUEST_TIMEOUT
+from ..pass1.config import PROJECT_ROOT, RATE_LIMIT_SECONDS, REQUEST_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = os.path.join(BASE_DIR, "data", "cache")
+CACHE_DIR = os.path.join(PROJECT_ROOT, "data", "cache")
 
 
 def get_html(url: str, timeout: int = REQUEST_TIMEOUT) -> str:

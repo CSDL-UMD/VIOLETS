@@ -15,10 +15,11 @@ MAX_RETRIES = 3
 REQUESTS_PER_MINUTE_WARN = 80  # log warning if exceeded
 
 # --- Paths ---
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(BASE_DIR, "data", "manifest.db")
-RAW_HTML_DIR = os.path.join(BASE_DIR, "data", "raw")
-LOG_DIR = os.path.join(BASE_DIR, "logs")
+# Project root is two levels up from this file (pass1/ -> maryland_rag/ -> project root)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DB_PATH = os.path.join(PROJECT_ROOT, "data", "manifest.db")
+RAW_HTML_DIR = os.path.join(PROJECT_ROOT, "data", "raw")
+LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
 LOG_FILE = os.path.join(LOG_DIR, "crawl.log")
 
 # --- Feature Flags ---

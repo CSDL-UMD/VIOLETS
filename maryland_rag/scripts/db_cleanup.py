@@ -22,7 +22,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent.parent / "data" / "manifest.db"
+DB_PATH = Path(__file__).parent.parent.parent / "data" / "manifest.db"
 
 
 def backup_db(db_path: Path) -> Path:

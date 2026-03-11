@@ -21,7 +21,7 @@ from collections import defaultdict
 from pathlib import Path
 from urllib.parse import urlparse
 
-DB_PATH = Path(__file__).parent.parent / "data" / "manifest.db"
+DB_PATH = Path(__file__).parent.parent.parent / "data" / "manifest.db"
 
 # ---------------------------------------------------------------------------
 # Banner stripping
