@@ -9,6 +9,8 @@ Flow per query:
 Built with langchain_core runnables (no langchain.chains, no langchain-pinecone).
 """
 
+import logging
+
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage
@@ -20,6 +22,8 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from pinecone import Pinecone
 
 from . import config
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Prompt templates
@@ -76,7 +80,14 @@ class PineconeRetriever(BaseRetriever):
         docs = []
         for match in results.get("matches", []):
             meta = dict(match.get("metadata", {}))
+            score = match.get("score", 0)
             text = meta.pop("text", "")
+            source = meta.get("source_url", "unknown")
+            logger.info(
+                "  Retrieved [%.4f] %s — %s",
+                score, source, text[:80].replace("\n", " ")
+            )
+            meta["score"] = score
             docs.append(Document(page_content=text, metadata=meta))
         return docs
 
@@ -124,10 +135,13 @@ def build_chain():
                 "input": user_input,
                 "chat_history": chat_history,
             })
+            logger.info("Rephrased: '%s' → '%s'", user_input, standalone_q)
         else:
             standalone_q = user_input
+            logger.info("Query: '%s'", standalone_q)
 
         # Retrieve using the standalone question
+        logger.info("Retrieving top-%d from Pinecone...", retriever.k)
         docs = retriever.invoke(standalone_q)
         return {
             "context": _format_docs(docs),
