@@ -162,8 +162,10 @@ pip install -r server/requirements.txt
 | `openai` | Pass 3 | Generates embeddings |
 | `pinecone` | Pass 3 | Upserts vectors to Pinecone |
 | `fastapi` | Server | Web framework |
-| `langchain` | Server | RAG chain orchestration |
-| `langchain-openai` | Server | OpenAI LLM + embeddings integration |
+| `uvicorn` | Server | ASGI server to run FastAPI |
+| `langchain` | Server | RAG chain orchestration (core runnables, prompts, output parsers) |
+| `langchain-openai` | Server | ChatOpenAI LLM + OpenAI embeddings integration |
+| `pinecone` | Server | Vector store client (also used in Pass 3) |
 
 ### 3.3 Environment Variables
 
@@ -435,11 +437,40 @@ uvicorn server.main:app --host 0.0.0.0 --port 8000
 
 ### How It Works
 
-1. User sends `{ "user_id": "...", "query": "..." }` to `/chat`
-2. If the user has conversation history, the query is rephrased into a standalone question using the LLM
-3. The standalone question is embedded and used to retrieve top-k chunks from Pinecone
-4. The LLM generates an answer grounded in the retrieved context + conversation history
-5. The exchange is stored in an in-memory session (TTL-based expiration)
+```
+User query + chat history
+        │
+        ▼
+┌───────────────────────────────┐
+│  Stage 1: Contextualize       │
+│  If history exists, LLM       │
+│  rephrases the follow-up      │
+│  into a standalone question   │
+└───────────────┬───────────────┘
+                │  standalone question
+                ▼
+┌───────────────────────────────┐
+│  Stage 2: Retrieve            │
+│  Embed question → query       │
+│  Pinecone → top-k chunks      │
+└───────────────┬───────────────┘
+                │  context + history + query
+                ▼
+┌───────────────────────────────┐
+│  Stage 3: Answer              │
+│  LLM generates a grounded     │
+│  response using context        │
+└───────────────┬───────────────┘
+                │
+                ▼
+        Response + session update
+```
+
+Built with `langchain_core` runnables — no `langchain-pinecone` dependency. A custom `PineconeRetriever` queries the Pinecone SDK directly and logs retrieval scores for debugging.
+
+The contextualization prompt instructs the LLM to reformulate follow-ups into standalone questions without answering them. The QA prompt grounds the LLM in the retrieved context and tells it to say when it doesn't have enough information rather than guessing.
+
+Session history is stored in-memory per `user_id` with TTL expiration and a max turn limit. Thread-safe via `threading.Lock`. Designed for pilot-scale (tens of concurrent users) — swap to Redis or a database for production scale.
 
 ### Configuration
 
@@ -763,3 +794,6 @@ Project-specific terms and non-obvious library names only.
 | **pdfplumber** | Library for extracting text and tables from digital (non-scanned) PDFs. Primary PDF extractor in Pass 2. |
 | **nav_hub** | Our classification for pages that are 150-499 words and primarily consist of links — they're navigation, not content. |
 | **Pass** | One stage of the pipeline. Pass 1 = crawl, Pass 2 = chunk, Pass 3 = embed and upload. |
+| **RAG chain** | The LangChain runnable pipeline in the server: rephrase → retrieve → answer. Built from `langchain_core` primitives. |
+| **PineconeRetriever** | Custom `BaseRetriever` subclass in `rag_chain.py` that embeds queries with OpenAI and queries Pinecone directly (no `langchain-pinecone`). |
+| **SessionStore** | In-memory conversation store in `session.py`. Tracks chat history per user with TTL expiration and max turn limits. |

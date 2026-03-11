@@ -11,6 +11,8 @@ Built with langchain_core runnables (no langchain.chains, no langchain-pinecone)
 
 import logging
 
+from pydantic import ConfigDict
+
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage
@@ -63,8 +65,7 @@ class PineconeRetriever(BaseRetriever):
     index: object  # Pinecone Index
     k: int = 5
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def _get_relevant_documents(
         self, query: str, *, run_manager: CallbackManagerForRetrieverRun
