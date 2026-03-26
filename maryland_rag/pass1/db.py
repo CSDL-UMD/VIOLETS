@@ -232,6 +232,18 @@ class DB:
               AND content_hash != previous_content_hash
         """).fetchall()
 
+    def get_pdf_pages(self) -> list:
+        return self.conn.execute(
+            "SELECT * FROM pages WHERE crawl_status = 'crawled' AND content_type = 'pdf' ORDER BY id"
+        ).fetchall()
+
+    def update_triage(self, url: str, bucket: str, reason: str):
+        self.conn.execute(
+            "UPDATE pages SET triage_bucket = ?, triage_reason = ? WHERE url = ?",
+            (bucket, reason, url)
+        )
+        self.conn.commit()
+
     def get_duplicate_hashes(self) -> list:
         return self.conn.execute("""
             SELECT content_hash, COUNT(*) as dupes, GROUP_CONCAT(url) as urls
