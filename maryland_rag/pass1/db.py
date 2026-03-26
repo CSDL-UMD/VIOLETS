@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS pages (
     needs_ocr               INTEGER DEFAULT 0,  -- 1 if PDF appears to be image-only
     extracted_snippet       TEXT,           -- first 500 chars of extracted text
     links_out_count         INTEGER,
+    triage_bucket           TEXT,           -- 'process', 'skip', 'review' (PDFs only)
+    triage_reason           TEXT,           -- short explanation of triage decision
     discovered_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     crawled_at              TIMESTAMP
 );
