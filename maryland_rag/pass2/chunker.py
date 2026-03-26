@@ -75,7 +75,19 @@ def run_pass2(
             logger.debug("Skipping (strategy=skip): %s", url)
             continue
 
-        if page['content_type'] != 'html':
+        if page['content_type'] == 'pdf':
+            bucket = page['triage_bucket']
+            if bucket == 'skip':
+                logger.debug("Skipping PDF (triage=skip): %s", url)
+                continue
+            if bucket == 'review':
+                logger.debug("Skipping PDF (triage=review, not yet resolved): %s", url)
+                continue
+            if bucket != 'process':
+                logger.warning("PDF has no triage result, skipping: %s", url)
+                continue
+
+        elif page['content_type'] != 'html':
             logger.debug("Skipping non-HTML (%s): %s", page['content_type'], url)
             continue
 
