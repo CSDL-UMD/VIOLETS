@@ -30,6 +30,9 @@ def main():
     p3.add_argument('--chunks', default='data/chunks.jsonl', help='Path to chunks JSONL')
     p3.add_argument('--resume', action='store_true', help='Skip already-upserted chunk IDs')
 
+    # Triage
+    subparsers.add_parser('triage', help='Classify crawled PDFs into process/skip/review')
+
     # Audit
     subparsers.add_parser('audit', help='Print manifest audit report')
 
@@ -48,6 +51,11 @@ def main():
         from .pass3.embed import run_embed
         n = run_embed(chunks_path=args.chunks, resume=args.resume)
         print(f"Upserted {n} vectors to Pinecone")
+
+    elif args.command == 'triage':
+        from .pass2.pdf_triage import run_triage
+        n = run_triage()
+        print(f"Triaged {n} PDFs")
 
     elif args.command == 'audit':
         _run_audit()
