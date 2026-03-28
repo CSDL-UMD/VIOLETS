@@ -62,7 +62,7 @@ def main():
         from .pass2.chunker import run_pass2
         from .pass3.embed import run_embed
 
-        run_crawl()
+        run_crawl(resume = False)
 
         chunks = run_pass2(only_changed= True, output_path=args.output)
         print(f"Produced {len(chunks)} chunks → {args.output}")
