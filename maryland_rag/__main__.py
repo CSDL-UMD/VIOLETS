@@ -31,11 +31,10 @@ def main():
     p3.add_argument('--resume', action='store_true', help='Skip already-upserted chunk IDs')
 
     # All Passes
-    all = subparsers.add_parser('all', help='Run all passes sequentially')
+    all = subparsers.add_parser('all', help='Run all passes sequentially, resuming from previous runs')
 
     all.add_argument('--output', default='data/chunks.jsonl', help='Output JSONL path')
     all.add_argument('--chunks', default='data/chunks.jsonl', help='Path to chunks JSONL')
-    all.add_argument('--resume', action='store_true', help='Resume from previous run')
 
     # Audit
     subparsers.add_parser('audit', help='Print manifest audit report')
@@ -61,12 +60,12 @@ def main():
         from .pass2.chunker import run_pass2
         from .pass3.embed import run_embed
 
-        run_crawl(resume = not args.resume)
+        run_crawl()
 
-        chunks = run_pass2(only_changed= args.resume, output_path=args.output)
+        chunks = run_pass2(only_changed= True, output_path=args.output)
         print(f"Produced {len(chunks)} chunks → {args.output}")
 
-        n = run_embed(resume=args.resume)
+        n = run_embed(resume=True)
         print(f"Upserted {n} vectors to Pinecone")
 
     elif args.command == 'audit':
