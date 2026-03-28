@@ -30,6 +30,13 @@ def main():
     p3.add_argument('--chunks', default='data/chunks.jsonl', help='Path to chunks JSONL')
     p3.add_argument('--resume', action='store_true', help='Skip already-upserted chunk IDs')
 
+    # All Passes
+    all = subparsers.add_parser('all', help='Run all passes sequentially')
+
+    all.add_argument('--output', default='data/chunks.jsonl', help='Output JSONL path')
+    all.add_argument('--chunks', default='data/chunks.jsonl', help='Path to chunks JSONL')
+    all.add_argument('--resume', action='store_true', help='Resume from previous run')
+
     # Audit
     subparsers.add_parser('audit', help='Print manifest audit report')
 
@@ -47,6 +54,19 @@ def main():
     elif args.command == 'pass3':
         from .pass3.embed import run_embed
         n = run_embed(chunks_path=args.chunks, resume=args.resume)
+        print(f"Upserted {n} vectors to Pinecone")
+
+    elif args.command == 'all':
+        from .pass1.crawler import run_crawl
+        from .pass2.chunker import run_pass2
+        from .pass3.embed import run_embed
+
+        run_crawl(resume = not args.resume)
+
+        chunks = run_pass2(only_changed= args.resume, output_path=args.output)
+        print(f"Produced {len(chunks)} chunks → {args.output}")
+
+        n = run_embed(resume=args.resume)
         print(f"Upserted {n} vectors to Pinecone")
 
     elif args.command == 'audit':
