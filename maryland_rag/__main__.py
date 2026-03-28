@@ -7,6 +7,8 @@ Usage:
     python -m maryland_rag pass2              # Run Pass 2 chunking
     python -m maryland_rag pass2 --changed    # Only re-chunk changed pages
     python -m maryland_rag audit              # Print manifest audit queries
+    python -m maryland_rag all                # Run all passes, updates with any new links
+    
 """
 import argparse
 import sys
