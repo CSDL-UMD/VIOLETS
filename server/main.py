@@ -11,6 +11,7 @@ Run:
 """
 
 import logging
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
@@ -18,6 +19,7 @@ from pydantic import BaseModel
 
 from . import config
 from .rag_chain import build_chain, to_langchain_messages
+from .rag_logger import RAGCallbackHandler, log_request
 from .session import SessionStore
 
 logger = logging.getLogger(__name__)
@@ -59,7 +61,7 @@ async def lifespan(app: FastAPI):
         ttl_minutes=config.SESSION_TTL_MINUTES,
         max_turns=config.MAX_HISTORY_TURNS,
     )
-    chain = build_chain()
+    chain = build_chain().with_config({"callbacks": [RAGCallbackHandler()]})
 
     logger.info("Server ready.")
     yield
@@ -99,6 +101,7 @@ async def chat(req: ChatRequest):
     store.get_or_create(req.user_id)
     chat_history = to_langchain_messages(store.get_history(req.user_id))
 
+    start = time.time()
     try:
         result = await chain.ainvoke({
             "input": req.query,
@@ -110,6 +113,7 @@ async def chat(req: ChatRequest):
 
     # Chain returns a string directly (StrOutputParser)
     answer = result
+    log_request(req.user_id, req.query, answer, elapsed=time.time() - start)
 
     # Persist the exchange in session history
     store.add_exchange(req.user_id, req.query, answer)
