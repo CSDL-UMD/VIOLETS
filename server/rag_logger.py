@@ -44,6 +44,25 @@ automatically. Their logging is handled by the existing manual
 logger.info() calls already in rag_chain.py. Full callback coverage of
 those steps would require making contextualize_and_retrieve() async and
 using .ainvoke() throughout.
+
+TEST
+--------------
+To test this, create a virtual environment
+    python -m venv venv (one time)
+    venv\Scripts\activate (RUN THIS everytime you want to start the venv)
+    pip install -r maryland_rag/requirements.txt (one time)
+    pip install -r server/requirements.txt (one time)
+
+Then start a local server
+    uvicorn server.main:app --host 0.0.0.0 --port 8000
+
+In Git Bash:
+    curl -X POST http://localhost:8000/chat \
+    -H "Content-Type: application/json" \
+    -d '{"user_id": "test", "query": "When is the voter registration deadline?"}'
+
+And check the uvicorn terminal to see the logs
+
 """
 
 import logging
