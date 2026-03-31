@@ -26,6 +26,7 @@ import logging
 from dataclasses import dataclass
 from typing import Literal
 
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
@@ -123,7 +124,7 @@ _PII_PATTERNS = {
         re.IGNORECASE
     ),
     "credit_card": re.compile(
-        r"\b(?:\d[ \-]?){13,19}\b"
+    r"\b(?:\d{4}[\s\-]){3}\d{4}\b"
     ),
     "ip": re.compile(
         r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
@@ -191,6 +192,7 @@ _classifier_llm = (
         model="gpt-4o-mini",
         temperature=0,  # deterministic output
         openai_api_key=config.OPENAI_API_KEY,
+        openai_api_base=config.OPENAI_BASE_URL,
     )
     .with_structured_output(ClassificationResult)
 )
@@ -218,7 +220,7 @@ Be decisive — every query must map to exactly one category.
 """
 
 
-def classify_query(query: str, ctx: QueryContext) -> str | None:
+async def classify_query(query: str, ctx: QueryContext) -> str | None:
     """
     Classify the user query using a lightweight LLM.
 
@@ -231,9 +233,9 @@ def classify_query(query: str, ctx: QueryContext) -> str | None:
     gracefully, not take down the chatbot.
     """
     try:
-        result: ClassificationResult = _classifier_llm.invoke([
-            {"role": "system", "content": _CLASSIFIER_SYSTEM_PROMPT},
-            {"role": "user",   "content": query},
+        result: ClassificationResult = await _classifier_llm.ainvoke([
+            SystemMessage(content=_CLASSIFIER_SYSTEM_PROMPT),
+            HumanMessage(content=query),
         ])
 
         ctx.query_category = result.category
@@ -287,6 +289,7 @@ _partisan_checker_llm = (
         model="gpt-4o-mini",
         temperature=0,
         openai_api_key=config.OPENAI_API_KEY,
+        openai_api_base=config.OPENAI_BASE_URL,
     )
     .with_structured_output(PartisanCheckResult)
 )
@@ -315,7 +318,7 @@ _STRICT_NONPARTISAN_RETRY_PROMPT = (
 )
 
 
-def check_partisan_response(
+async def check_partisan_response(
     query: str,
     response: str,
     chat_history: list,
@@ -333,9 +336,9 @@ def check_partisan_response(
     rather than crashing the request.
     """
     try:
-        result: PartisanCheckResult = _partisan_checker_llm.invoke([
-            {"role": "system", "content": _PARTISAN_CHECKER_SYSTEM_PROMPT},
-            {"role": "user",   "content": response},
+        result = await _partisan_checker_llm.ainvoke([
+            SystemMessage(content=_PARTISAN_CHECKER_SYSTEM_PROMPT), 
+            HumanMessage(content=response),
         ])
 
         logger.info(
@@ -355,11 +358,11 @@ def check_partisan_response(
         )
 
         retry_history = [
-            {"role": "system", "content": _STRICT_NONPARTISAN_RETRY_PROMPT},
+            SystemMessage(content = _STRICT_NONPARTISAN_RETRY_PROMPT),
             *chat_history,
         ]
 
-        retry_response = chain.invoke({
+        retry_response = await chain.ainvoke({
             "input": query,
             "chat_history": retry_history,
         })

@@ -160,7 +160,7 @@ async def chat(req: ChatRequest):
     # Runs after PII check. Blocks out-of-scope and partisan queries
     # before the expensive RAG chain is invoked.
     # ------------------------------------------------------------------
-    classification_response = classify_query(req.query, ctx)
+    classification_response = await classify_query(req.query, ctx)
     if classification_response:
         logger.info(
             "Request blocked — query not in scope [user=%s category=%s]",
@@ -190,7 +190,7 @@ async def chat(req: ChatRequest):
     # Runs after the chain so it can inspect the output.
     # Retries once with a stricter prompt if partisan content is found.
     # ------------------------------------------------------------------
-    answer = check_partisan_response(
+    answer = await check_partisan_response(
         query=req.query,
         response=answer,
         chat_history=chat_history,
