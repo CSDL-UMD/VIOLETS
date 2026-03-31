@@ -220,7 +220,7 @@ Be decisive — every query must map to exactly one category.
 """
 
 
-async def classify_query(query: str, ctx: QueryContext) -> str | None:
+def classify_query(query: str, ctx: QueryContext) -> str | None:
     """
     Classify the user query using a lightweight LLM.
 
@@ -233,7 +233,7 @@ async def classify_query(query: str, ctx: QueryContext) -> str | None:
     gracefully, not take down the chatbot.
     """
     try:
-        result: ClassificationResult = await _classifier_llm.ainvoke([
+        result: ClassificationResult =  _classifier_llm.invoke([
             SystemMessage(content=_CLASSIFIER_SYSTEM_PROMPT),
             HumanMessage(content=query),
         ])
@@ -318,7 +318,7 @@ _STRICT_NONPARTISAN_RETRY_PROMPT = (
 )
 
 
-async def check_partisan_response(
+def check_partisan_response(
     query: str,
     response: str,
     chat_history: list,
@@ -336,7 +336,7 @@ async def check_partisan_response(
     rather than crashing the request.
     """
     try:
-        result = await _partisan_checker_llm.ainvoke([
+        result =  _partisan_checker_llm.invoke([
             SystemMessage(content=_PARTISAN_CHECKER_SYSTEM_PROMPT), 
             HumanMessage(content=response),
         ])
@@ -362,7 +362,7 @@ async def check_partisan_response(
             *chat_history,
         ]
 
-        retry_response = await chain.ainvoke({
+        retry_response = chain.invoke({
             "input": query,
             "chat_history": retry_history,
         })

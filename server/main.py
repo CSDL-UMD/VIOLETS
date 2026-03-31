@@ -134,7 +134,7 @@ class ResetRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+def chat(req: ChatRequest):
     store.get_or_create(req.user_id)
     chat_history = to_langchain_messages(store.get_history(req.user_id))
 
@@ -160,7 +160,7 @@ async def chat(req: ChatRequest):
     # Runs after PII check. Blocks out-of-scope and partisan queries
     # before the expensive RAG chain is invoked.
     # ------------------------------------------------------------------
-    classification_response = await classify_query(req.query, ctx)
+    classification_response = classify_query(req.query, ctx)
     if classification_response:
         logger.info(
             "Request blocked — query not in scope [user=%s category=%s]",
@@ -175,7 +175,7 @@ async def chat(req: ChatRequest):
     # ------------------------------------------------------------------
     start = time.time()
     try:
-        result = await chain.ainvoke({
+        result = chain.invoke({
             "input": req.query,
             "chat_history": chat_history,
         })
@@ -190,7 +190,7 @@ async def chat(req: ChatRequest):
     # Runs after the chain so it can inspect the output.
     # Retries once with a stricter prompt if partisan content is found.
     # ------------------------------------------------------------------
-    answer = await check_partisan_response(
+    answer = check_partisan_response(
         query=req.query,
         response=answer,
         chat_history=chat_history,

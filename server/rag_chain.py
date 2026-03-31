@@ -128,13 +128,13 @@ def build_chain():
     # Step 1: Rephrase chain — converts follow-ups into standalone questions
     rephrase_chain = _CONTEXTUALIZE_PROMPT | llm | StrOutputParser()
 
-    async def contextualize_and_retrieve(inputs: dict) -> dict:
+    def contextualize_and_retrieve(inputs: dict) -> dict:
         chat_history = inputs.get("chat_history", [])
         user_input = inputs["input"]
 
         # If there's history, rephrase; otherwise use as-is
         if chat_history:
-            standalone_q = await rephrase_chain.invoke({
+            standalone_q = rephrase_chain.invoke({
                 "input": user_input,
                 "chat_history": chat_history,
             })
@@ -145,7 +145,7 @@ def build_chain():
 
         # Retrieve using the standalone question
         logger.info("Retrieving top-%d from Pinecone...", retriever.k)
-        docs = await retriever.ainvoke(standalone_q)
+        docs = retriever.invoke(standalone_q)
         return {
             "context": _format_docs(docs),
             "input": user_input,
