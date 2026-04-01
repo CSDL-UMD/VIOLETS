@@ -118,19 +118,60 @@ FALLBACK_RESPONSES = {
 # the side of caution.
 # ---------------------------------------------------------------------------
 
+def _luhn_check(number_str: str) -> bool:
+    """
+    Validate a credit card number using the Luhn algorithm.
+ 
+    The Luhn algorithm is a checksum formula used by all major credit card
+    networks (Visa, Mastercard, Amex, Discover) to distinguish real card
+    numbers from random digit sequences. A random 16-digit number has only
+    a ~10% chance of passing Luhn, so this dramatically reduces false
+    positives from the regex pattern."""
+    digits = [int(d) for d in number_str]
+    # Double every second digit from the right (index from right = 1, 3, 5...)
+    for i in range(len(digits) - 2, -1, -2):
+        digits[i] *= 2
+        if digits[i] > 9:
+            digits[i] -= 9
+    return sum(digits) % 10 == 0
+
+def _is_valid_ipv4(ip_str: str) -> bool:
+    """
+    Validate that all four octets of an IPv4 address are in range 0-255.
+ 
+    The regex pattern allows values like "999.999.999.999" because it only
+    checks the digit count, not the value. This function adds the range
+    check to prevent false positives.
+ 
+    Parameters
+    ----------
+    ip_str : str
+        The IP address string matched by the regex.
+ 
+    Returns
+    -------
+    bool
+        True if all octets are 0-255 (a valid IPv4 range).
+    """
+    try:
+        parts = ip_str.split(".")
+        return len(parts) == 4 and all(0 <= int(p) <= 255 for p in parts)
+    except ValueError:
+        return False
+
 _PII_PATTERNS = {
     "email": re.compile(
         r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
         re.IGNORECASE
     ),
     "credit_card": re.compile(
-    r"\b(?:\d{4}[\s\-]){3}\d{4}\b"
+        r"\b\d{4}[\s\-]\d{4}[\s\-]\d{4}[\s\-]\d{4}\b"
     ),
     "ip": re.compile(
-        r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
+        r"\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b"
     ),
     "ssn": re.compile(
-        r"\b\d{3}[- ]?\d{2}[- ]?\d{4}\b"
+        r"\b\d{3}-\d{2}-\d{4}\b"
     ),
 }
 
@@ -147,16 +188,39 @@ def detect_pii(query: str, ctx: QueryContext) -> str | None:
     returns the fallback immediately and skips the RAG chain entirely.
     """
     for pii_type, pattern in _PII_PATTERNS.items():
-        if pattern.search(query):
-            # Never log the actual query — that would defeat the purpose.
-            logger.warning(
-                "PII detected in query [user=%s type=%s] — query blocked.",
-                ctx.user_id,
-                pii_type,
-            )
-            ctx.pii_detected = True
-            ctx.pii_type = pii_type
-            return FALLBACK_RESPONSES["pii"]
+        match = pattern.search(query)
+        if not match:
+            continue 
+        
+        #Secondary validation for credit cards: Luhn checksum. Regex confirmed the 4x4 digit format: check if real card
+        if pii_type == "credit_card":
+            digits_only = re.sub(r"[\s\-]", "", match.group())
+            if not _luhn_check(digits_only):
+                logger.debug(
+                    "Credit card format matched but Luhn failed [user=%s] — not blocking.",
+                    ctx.user_id,
+                )
+                continue  # false positive — not a real card
+        #Secondary validation of IPs : octet range check regex only confirms the nnn.nnn.nnn.nnn format; this verifies if the octets are valid
+
+        if pii_type == "ip":
+            if not _is_valid_ipv4(match.group()):
+                logger.debug(
+                    "IP format matched but octets out of range [user=%s] — not blocking.",
+                    ctx.user_id,
+                )
+                continue  # false positive — not a real IP
+                
+            
+        # Never log the actual query — that would defeat the purpose.
+        logger.warning(
+            "PII detected in query [user=%s type=%s] — query blocked.",
+            ctx.user_id,
+            pii_type,
+        )
+        ctx.pii_detected = True
+        ctx.pii_type = pii_type
+        return FALLBACK_RESPONSES["pii"]
 
     return None  # clean — proceed
 
