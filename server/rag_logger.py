@@ -78,6 +78,16 @@ from langchain_core.outputs import LLMResult
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Logging toggles
+# Set to False before deploying to production to avoid writing PII to logs.
+# Token counts, cost, and latency are always logged regardless of these flags.
+# ---------------------------------------------------------------------------
+
+LOG_PROMPTS: bool = False   # log full prompt sent to the LLM
+LOG_RESPONSES: bool = False  # log full response from the LLM
+LOG_QUERIES: bool = False    # log raw user query in log_request()
+
+# ---------------------------------------------------------------------------
 # Cost table (USD per million tokens)
 # Update if OpenAI changes pricing or if you swap models.
 # ---------------------------------------------------------------------------
@@ -144,15 +154,16 @@ class RAGCallbackHandler(BaseCallbackHandler):
         key = str(run_id)
         self._llm_starts[key] = (time.time(), model)
 
-        for i, message_group in enumerate(messages):
-            lines = []
-            for msg in message_group:
-                role = msg.__class__.__name__.replace("Message", "").lower()
-                lines.append(f"[{role}]: {msg.content}")
-            logger.info(
-                "LLM PROMPT [run=%s model=%s]:\n%s",
-                key[:8], model, "\n".join(lines),
-            )
+        if LOG_PROMPTS:
+            for i, message_group in enumerate(messages):
+                lines = []
+                for msg in message_group:
+                    role = msg.__class__.__name__.replace("Message", "").lower()
+                    lines.append(f"[{role}]: {msg.content}")
+                logger.info(
+                    "LLM PROMPT [run=%s model=%s]:\n%s",
+                    key[:8], model, "\n".join(lines),
+                )
 
     def on_llm_start(
         self,
@@ -170,11 +181,12 @@ class RAGCallbackHandler(BaseCallbackHandler):
         key = str(run_id)
         self._llm_starts[key] = (time.time(), model)
 
-        for i, prompt in enumerate(prompts):
-            logger.info(
-                "LLM PROMPT [run=%s model=%s]:\n%s",
-                key[:8], model, prompt,
-            )
+        if LOG_PROMPTS:
+            for i, prompt in enumerate(prompts):
+                logger.info(
+                    "LLM PROMPT [run=%s model=%s]:\n%s",
+                    key[:8], model, prompt,
+                )
 
     def on_llm_end(
         self,
@@ -187,13 +199,14 @@ class RAGCallbackHandler(BaseCallbackHandler):
         start, model = self._llm_starts.pop(key, (time.time(), "unknown"))
         elapsed = time.time() - start
 
-        for gen_list in response.generations:
-            for gen in gen_list:
-                text = getattr(gen, "text", str(gen))
-                logger.info(
-                    "LLM RESPONSE [run=%s] (%.2fs):\n%s",
-                    key[:8], elapsed, text,
-                )
+        if LOG_RESPONSES:
+            for gen_list in response.generations:
+                for gen in gen_list:
+                    text = getattr(gen, "text", str(gen))
+                    logger.info(
+                        "LLM RESPONSE [run=%s] (%.2fs):\n%s",
+                        key[:8], elapsed, text,
+                    )
 
         llm_output = response.llm_output or {}
         usage = llm_output.get("token_usage", {})
@@ -274,10 +287,11 @@ def log_request(
         log_request(req.user_id, req.query, result, elapsed=time.time() - start)
     """
     timing = f" elapsed={elapsed:.2f}s" if elapsed is not None else ""
+    query_field = repr(query[:120]) if LOG_QUERIES else f"len={len(query)}"
     logger.info(
-        "REQUEST user=%s query=%r response_chars=%d%s",
+        "REQUEST user=%s query=%s response_chars=%d%s",
         user_id,
-        query[:120],
+        query_field,
         len(response),
         timing,
     )
