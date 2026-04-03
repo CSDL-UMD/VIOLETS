@@ -72,6 +72,7 @@ from uuid import UUID
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.documents import Document
+from langchain_core.messages import BaseMessage
 from langchain_core.outputs import LLMResult
 
 logger = logging.getLogger(__name__)
@@ -118,6 +119,32 @@ class RAGCallbackHandler(BaseCallbackHandler):
         self._ret_starts: dict[str, float] = {}               # run_id → start_time
 
     # ---- LLM events ----
+
+    def on_chat_model_start(
+        self,
+        serialized: dict[str, Any],
+        messages: list[list[BaseMessage]],
+        *,
+        run_id: UUID,
+        **kwargs: Any,
+    ) -> None:
+        model = (
+            serialized.get("kwargs", {}).get("model_name")
+            or serialized.get("kwargs", {}).get("model")
+            or serialized.get("name", "unknown")
+        )
+        key = str(run_id)
+        self._llm_starts[key] = (time.time(), model)
+
+        for i, message_group in enumerate(messages):
+            lines = []
+            for msg in message_group:
+                role = msg.__class__.__name__.replace("Message", "").lower()
+                lines.append(f"[{role}]: {msg.content}")
+            logger.info(
+                "LLM PROMPT [run=%s model=%s]:\n%s",
+                key[:8], model, "\n".join(lines),
+            )
 
     def on_llm_start(
         self,
