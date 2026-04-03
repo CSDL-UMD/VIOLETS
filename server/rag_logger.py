@@ -92,7 +92,15 @@ _COST_FALLBACK = (0.0, 0.0)
 
 
 def _estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-    input_rate, output_rate = _COST_TABLE.get(model, _COST_FALLBACK)
+    # Exact match first, then prefix match to handle versioned names like
+    # "gpt-4o-mini-2024-07-18" mapping to "gpt-4o-mini".
+    rates = _COST_TABLE.get(model)
+    if rates is None:
+        rates = next(
+            (v for k, v in _COST_TABLE.items() if model.startswith(k)),
+            _COST_FALLBACK,
+        )
+    input_rate, output_rate = rates
     return (prompt_tokens * input_rate + completion_tokens * output_rate) / 1_000_000
 
 
@@ -156,6 +164,7 @@ class RAGCallbackHandler(BaseCallbackHandler):
     ) -> None:
         model = (
             serialized.get("kwargs", {}).get("model_name")
+            or serialized.get("kwargs", {}).get("model")
             or serialized.get("name", "unknown")
         )
         key = str(run_id)
@@ -186,8 +195,13 @@ class RAGCallbackHandler(BaseCallbackHandler):
                     key[:8], elapsed, text,
                 )
 
-        usage = (response.llm_output or {}).get("token_usage", {})
+        llm_output = response.llm_output or {}
+        usage = llm_output.get("token_usage", {})
         if usage:
+            # Prefer the model name from the response — OpenAI always populates
+            # llm_output["model_name"] with the exact model string used, which is
+            # more reliable than what we extracted from the serialized dict at start.
+            model = llm_output.get("model_name") or model
             prompt_tokens     = usage.get("prompt_tokens", 0)
             completion_tokens = usage.get("completion_tokens", 0)
             total_tokens      = usage.get("total_tokens", prompt_tokens + completion_tokens)
