@@ -145,6 +145,8 @@ From the project root:
 # Pipeline dependencies
 pip install -r maryland_rag/requirements.txt
 
+# Download spaCy language model for PII detection
+python -m spacy download en_core_web_lg
 # Server dependencies
 pip install -r server/requirements.txt
 ```
