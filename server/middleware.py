@@ -286,9 +286,14 @@ Classify the user query into exactly one of the following categories:
                  (registration, polling locations, mail-in ballots,
                   ID requirements, deadlines, absentee voting, etc.)
 
-- out_of_scope : the query targets federal races, other states,
-                 other countries, or elections before 2026.
-                 Also use this for completely off-topic questions.
+- out_of_scope : the query is about Maryland voting or elections.
+                 If no year is mentioned, assume the user means
+                 the upcoming 2026 election and classify as normal.
+                 Only classify as out_of_scope if a year OTHER than
+                 2026 is explicitly mentioned, or if the topic is
+                 clearly unrelated to Maryland elections entirely.
+                 (registration, polling locations, mail-in ballots,
+                  ID requirements, deadlines, absentee voting, etc.)
 
 - partisan     : the query requests candidate endorsements, asks
                  which party is better, or asks for partisan political
