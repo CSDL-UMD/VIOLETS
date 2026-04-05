@@ -99,7 +99,7 @@ async def lifespan(app: FastAPI):
         max_turns=config.MAX_HISTORY_TURNS,
     )
 
-    chain = build_chain().with_config({"callbacks": [RAGCallbackHandler()]})
+    chain = build_chain()
 
     logger.info("Server ready.")
     yield
@@ -175,10 +175,10 @@ def chat(req: ChatRequest):
     # ------------------------------------------------------------------
     start = time.time()
     try:
-        result = chain.invoke({
+        result = chain.with_config({"callbacks": [RAGCallbackHandler()]}).invoke({
             "input": req.query,
             "chat_history": chat_history,
-        })
+      })
     except Exception as exc:
         logger.error("RAG chain error [user=%s]: %s", req.user_id, exc)
         raise HTTPException(status_code=502, detail="Failed to generate response.")
