@@ -32,6 +32,8 @@ for _path in _search_paths:
 OPENAI_API_KEY: str = os.environ.get("OPENAI_API_KEY", "")
 PINECONE_API_KEY: str = os.environ.get("PINECONE_API_KEY", "")
 
+OPENAI_BASE_URL: str = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+
 # ---------------------------------------------------------------------------
 # Configurable settings
 # ---------------------------------------------------------------------------

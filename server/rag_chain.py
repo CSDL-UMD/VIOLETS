@@ -19,7 +19,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.retrievers import BaseRetriever
-from langchain_core.runnables import RunnableLambda, RunnablePassthrough
+from langchain_core.runnables import RunnableConfig, RunnableLambda, RunnablePassthrough
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from pinecone import Pinecone
 
@@ -106,6 +106,7 @@ def build_chain():
     embeddings = OpenAIEmbeddings(
         model="text-embedding-3-small",
         openai_api_key=config.OPENAI_API_KEY,
+        openai_api_base=config.OPENAI_BASE_URL,
     )
 
     pc = Pinecone(api_key=config.PINECONE_API_KEY)
@@ -121,21 +122,22 @@ def build_chain():
         model=config.LLM_MODEL,
         temperature=config.LLM_TEMPERATURE,
         openai_api_key=config.OPENAI_API_KEY,
+        openai_api_base=config.OPENAI_BASE_URL,
     )
 
     # Step 1: Rephrase chain — converts follow-ups into standalone questions
     rephrase_chain = _CONTEXTUALIZE_PROMPT | llm | StrOutputParser()
 
-    def contextualize_and_retrieve(inputs: dict) -> dict:
+    async def contextualize_and_retrieve(inputs: dict, config: RunnableConfig) -> dict:
         chat_history = inputs.get("chat_history", [])
         user_input = inputs["input"]
 
         # If there's history, rephrase; otherwise use as-is
         if chat_history:
-            standalone_q = rephrase_chain.invoke({
+            standalone_q = await rephrase_chain.ainvoke({
                 "input": user_input,
                 "chat_history": chat_history,
-            })
+            }, config)
             logger.info("Rephrased: '%s' → '%s'", user_input, standalone_q)
         else:
             standalone_q = user_input
@@ -143,7 +145,7 @@ def build_chain():
 
         # Retrieve using the standalone question
         logger.info("Retrieving top-%d from Pinecone...", retriever.k)
-        docs = retriever.invoke(standalone_q)
+        docs = await retriever.ainvoke(standalone_q, config)
         return {
             "context": _format_docs(docs),
             "input": user_input,
