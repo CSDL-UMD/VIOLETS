@@ -72,9 +72,20 @@ from uuid import UUID
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.documents import Document
+from langchain_core.messages import BaseMessage
 from langchain_core.outputs import LLMResult
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Logging toggles
+# Set to False before deploying to production to avoid writing PII to logs.
+# Token counts, cost, and latency are always logged regardless of these flags.
+# ---------------------------------------------------------------------------
+
+LOG_PROMPTS: bool = False   # log full prompt sent to the LLM
+LOG_RESPONSES: bool = False  # log full response from the LLM
+LOG_QUERIES: bool = False    # log raw user query in log_request()
 
 # ---------------------------------------------------------------------------
 # Cost table (USD per million tokens)
@@ -91,7 +102,15 @@ _COST_FALLBACK = (0.0, 0.0)
 
 
 def _estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-    input_rate, output_rate = _COST_TABLE.get(model, _COST_FALLBACK)
+    # Exact match first, then prefix match to handle versioned names like
+    # "gpt-4o-mini-2024-07-18" mapping to "gpt-4o-mini".
+    rates = _COST_TABLE.get(model)
+    if rates is None:
+        rates = next(
+            (v for k, v in _COST_TABLE.items() if model.startswith(k)),
+            _COST_FALLBACK,
+        )
+    input_rate, output_rate = rates
     return (prompt_tokens * input_rate + completion_tokens * output_rate) / 1_000_000
 
 
@@ -119,6 +138,33 @@ class RAGCallbackHandler(BaseCallbackHandler):
 
     # ---- LLM events ----
 
+    def on_chat_model_start(
+        self,
+        serialized: dict[str, Any],
+        messages: list[list[BaseMessage]],
+        *,
+        run_id: UUID,
+        **kwargs: Any,
+    ) -> None:
+        model = (
+            serialized.get("kwargs", {}).get("model_name")
+            or serialized.get("kwargs", {}).get("model")
+            or serialized.get("name", "unknown")
+        )
+        key = str(run_id)
+        self._llm_starts[key] = (time.time(), model)
+
+        if LOG_PROMPTS:
+            for i, message_group in enumerate(messages):
+                lines = []
+                for msg in message_group:
+                    role = msg.__class__.__name__.replace("Message", "").lower()
+                    lines.append(f"[{role}]: {msg.content}")
+                logger.info(
+                    "LLM PROMPT [run=%s model=%s]:\n%s",
+                    key[:8], model, "\n".join(lines),
+                )
+
     def on_llm_start(
         self,
         serialized: dict[str, Any],
@@ -129,16 +175,18 @@ class RAGCallbackHandler(BaseCallbackHandler):
     ) -> None:
         model = (
             serialized.get("kwargs", {}).get("model_name")
+            or serialized.get("kwargs", {}).get("model")
             or serialized.get("name", "unknown")
         )
         key = str(run_id)
         self._llm_starts[key] = (time.time(), model)
 
-        for i, prompt in enumerate(prompts):
-            logger.info(
-                "LLM PROMPT [run=%s model=%s]:\n%s",
-                key[:8], model, prompt,
-            )
+        if LOG_PROMPTS:
+            for i, prompt in enumerate(prompts):
+                logger.info(
+                    "LLM PROMPT [run=%s model=%s]:\n%s",
+                    key[:8], model, prompt,
+                )
 
     def on_llm_end(
         self,
@@ -151,16 +199,22 @@ class RAGCallbackHandler(BaseCallbackHandler):
         start, model = self._llm_starts.pop(key, (time.time(), "unknown"))
         elapsed = time.time() - start
 
-        for gen_list in response.generations:
-            for gen in gen_list:
-                text = getattr(gen, "text", str(gen))
-                logger.info(
-                    "LLM RESPONSE [run=%s] (%.2fs):\n%s",
-                    key[:8], elapsed, text,
-                )
+        if LOG_RESPONSES:
+            for gen_list in response.generations:
+                for gen in gen_list:
+                    text = getattr(gen, "text", str(gen))
+                    logger.info(
+                        "LLM RESPONSE [run=%s] (%.2fs):\n%s",
+                        key[:8], elapsed, text,
+                    )
 
-        usage = (response.llm_output or {}).get("token_usage", {})
+        llm_output = response.llm_output or {}
+        usage = llm_output.get("token_usage", {})
         if usage:
+            # Prefer the model name from the response — OpenAI always populates
+            # llm_output["model_name"] with the exact model string used, which is
+            # more reliable than what we extracted from the serialized dict at start.
+            model = llm_output.get("model_name") or model
             prompt_tokens     = usage.get("prompt_tokens", 0)
             completion_tokens = usage.get("completion_tokens", 0)
             total_tokens      = usage.get("total_tokens", prompt_tokens + completion_tokens)
@@ -233,10 +287,11 @@ def log_request(
         log_request(req.user_id, req.query, result, elapsed=time.time() - start)
     """
     timing = f" elapsed={elapsed:.2f}s" if elapsed is not None else ""
+    query_field = repr(query[:120]) if LOG_QUERIES else f"len={len(query)}"
     logger.info(
-        "REQUEST user=%s query=%r response_chars=%d%s",
+        "REQUEST user=%s query=%s response_chars=%d%s",
         user_id,
-        query[:120],
+        query_field,
         len(response),
         timing,
     )

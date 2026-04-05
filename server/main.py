@@ -99,7 +99,7 @@ async def lifespan(app: FastAPI):
         max_turns=config.MAX_HISTORY_TURNS,
     )
 
-    chain = build_chain().with_config({"callbacks": [RAGCallbackHandler()]})
+    chain = build_chain()
 
     logger.info("Server ready.")
     yield
@@ -175,7 +175,7 @@ async def chat(req: ChatRequest):
     # ------------------------------------------------------------------
     start = time.time()
     try:
-        result = await chain.ainvoke({
+        result = await chain.with_config({"callbacks": [RAGCallbackHandler()]}).ainvoke({
             "input": req.query,
             "chat_history": chat_history,
         })
