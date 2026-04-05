@@ -106,6 +106,7 @@ def build_chain():
     embeddings = OpenAIEmbeddings(
         model="text-embedding-3-small",
         openai_api_key=config.OPENAI_API_KEY,
+        openai_api_base=config.OPENAI_BASE_URL,
     )
 
     pc = Pinecone(api_key=config.PINECONE_API_KEY)
@@ -121,6 +122,7 @@ def build_chain():
         model=config.LLM_MODEL,
         temperature=config.LLM_TEMPERATURE,
         openai_api_key=config.OPENAI_API_KEY,
+        openai_api_base=config.OPENAI_BASE_URL,
     )
 
     # Step 1: Rephrase chain — converts follow-ups into standalone questions

@@ -4,3 +4,5 @@ langchain>=0.3
 langchain-openai>=0.3
 python-dotenv>=1.0
 pinecone>=8.0
+presidio-analyzer>=2.2.0
+spacy>=3.0.0
