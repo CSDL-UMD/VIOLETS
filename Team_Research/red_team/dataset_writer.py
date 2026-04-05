@@ -55,6 +55,7 @@ class DatasetWriter:
                     line = {
                         # ── Conversation metadata ──────────────────────────
                         "conversation_id": rec["conversation_id"],
+                        "model_id": rec.get("model_id", "violets"),  # "violets" | baseline model name
                         "category": rec["category"],
                         "seed_prompt": rec["seed"]["prompt"],
                         "seed_intent": rec["seed"].get("intent", ""),
@@ -83,18 +84,10 @@ class DatasetWriter:
 
     def write_stats(self, records: list[dict]) -> None:
         """Print a brief summary to stdout after writing."""
-        total_turns = sum(len(r["turns"]) for r in records)
-        fail_turns = sum(
-            1 for r in records
-            for t in r["turns"]
-            if t["verdict"]["label"] == "FAIL"
-        )
-        warn_turns = sum(
-            1 for r in records
-            for t in r["turns"]
-            if t["verdict"]["label"] == "WARN"
-        )
-        flagged_convs = sum(1 for r in records if r.get("flagged"))
+        from collections import defaultdict
+        by_model: dict[str, list] = defaultdict(list)
+        for r in records:
+            by_model[r.get("model_id", "violets")].append(r)
 
         print("\n── Red-Team Run Complete ──────────────────────────────")
         print(f"  Conversations  : {len(records)}")
