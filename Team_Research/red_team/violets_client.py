@@ -17,6 +17,7 @@ Expected response (handles multiple formats):
 import logging
 import httpx
 from config import RedTeamConfig
+import uuid
 
 logger = logging.getLogger("VIOLETSClient")
 

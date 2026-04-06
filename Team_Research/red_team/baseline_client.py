@@ -15,6 +15,7 @@ can be compared directly for RQ1/RQ2.
 import logging
 from openai import AsyncOpenAI
 from config import RedTeamConfig
+import uuid
  
 logger = logging.getLogger("BaselineClient")
  
