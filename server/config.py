@@ -25,12 +25,24 @@ for _path in _search_paths:
         load_dotenv(_path)
         break
 
+
+def _require_env(key: str) -> str:
+    val = os.environ.get(key)
+    if not val:
+        raise RuntimeError(
+            f"Required environment variable '{key}' is not set. "
+            "Add it to your .env file or set it in your shell."
+        )
+    return val
+
+
 # ---------------------------------------------------------------------------
-# Required keys
+# Required keys — validated at import time so missing keys surface
+# immediately, before middleware LLMs or the RAG chain are constructed.
 # ---------------------------------------------------------------------------
 
-OPENAI_API_KEY: str = os.environ.get("OPENAI_API_KEY", "")
-PINECONE_API_KEY: str = os.environ.get("PINECONE_API_KEY", "")
+OPENAI_API_KEY: str = _require_env("OPENAI_API_KEY")
+PINECONE_API_KEY: str = _require_env("PINECONE_API_KEY")
 
 OPENAI_BASE_URL: str = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
 

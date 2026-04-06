@@ -106,9 +106,9 @@ FALLBACK_RESPONSES = {
         "Maryland elections?"
     ),
     "pii_in_response": (
-        "I found some sensitive information in my response that I shouldn't"
-        "share directly. Please contact the Maryland State Board of Elections"
-        "at elections.maryland.gov for this information"
+        "I found some sensitive information in my response that I shouldn't "
+        "share directly. Please contact the Maryland State Board of Elections "
+        "at elections.maryland.gov for this information."
     )
     
     
@@ -304,7 +304,7 @@ Be decisive — every query must map to exactly one category.
 """
 
 
-def classify_query(query: str, ctx: QueryContext) -> str | None:
+async def classify_query(query: str, ctx: QueryContext) -> str | None:
     """
     Classify the user query using a lightweight LLM.
 
@@ -317,7 +317,7 @@ def classify_query(query: str, ctx: QueryContext) -> str | None:
     gracefully, not take down the chatbot.
     """
     try:
-        result: ClassificationResult =  _classifier_llm.invoke([
+        result: ClassificationResult = await _classifier_llm.ainvoke([
             SystemMessage(content=_CLASSIFIER_SYSTEM_PROMPT),
             HumanMessage(content=query),
         ])
@@ -402,7 +402,7 @@ _STRICT_NONPARTISAN_RETRY_PROMPT = (
 )
 
 
-def check_partisan_response(
+async def check_partisan_response(
     query: str,
     response: str,
     chat_history: list,
@@ -421,8 +421,8 @@ def check_partisan_response(
     rather than crashing the request.
     """
     try:
-        result =  _partisan_checker_llm.invoke([
-            SystemMessage(content=_PARTISAN_CHECKER_SYSTEM_PROMPT), 
+        result = await _partisan_checker_llm.ainvoke([
+            SystemMessage(content=_PARTISAN_CHECKER_SYSTEM_PROMPT),
             HumanMessage(content=response),
         ])
 
@@ -443,12 +443,12 @@ def check_partisan_response(
         )
 
 
-        retry_response = chain.invoke({
+        retry_response = await chain.ainvoke({
             "input": query + "\n\n" + _STRICT_NONPARTISAN_RETRY_PROMPT,
             "chat_history": chat_history,
         })
 
-        return retry_response
+        return str(retry_response)
 
     except Exception as exc:
         logger.error(

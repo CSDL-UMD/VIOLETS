@@ -78,10 +78,22 @@ class PineconeRetriever(BaseRetriever):
             include_metadata=True,
         )
 
+        if isinstance(results, dict):
+            matches = results.get("matches", [])
+        else:
+            matches = getattr(results, "matches", []) or []
+
+        if not matches:
+            logger.warning("Pinecone returned no matches for query")
+
         docs = []
-        for match in results.get("matches", []):
-            meta = dict(match.get("metadata", {}))
-            score = match.get("score", 0)
+        for match in matches:
+            if isinstance(match, dict):
+                meta = dict(match.get("metadata", {}))
+                score = match.get("score", 0)
+            else:
+                meta = dict(getattr(match, "metadata", {}) or {})
+                score = getattr(match, "score", 0) or 0
             text = meta.pop("text", "")
             source = meta.get("source_url", "unknown")
             logger.info(

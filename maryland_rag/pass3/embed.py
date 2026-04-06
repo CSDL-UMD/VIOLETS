@@ -23,6 +23,8 @@ import os
 import time
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 logger = logging.getLogger(__name__)
 
 EMBED_MODEL = "text-embedding-3-small"
@@ -56,7 +58,7 @@ def run_embed(
         Number of vectors upserted.
     """
     _setup_logging()
-    _load_dotenv()
+    load_dotenv()
 
     openai_api_key = _require_env("OPENAI_API_KEY")
     pinecone_api_key = _require_env("PINECONE_API_KEY")
@@ -314,22 +316,6 @@ def _require_env(key: str) -> str:
             "Add it to your .env file or shell environment."
         )
     return val
-
-
-def _load_dotenv():
-    """Load key=value pairs from a .env file in the current directory."""
-    env_file = Path(".env")
-    if not env_file.exists():
-        return
-    with open(env_file) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            # Strip inline comments and surrounding quotes
-            value = value.split("#")[0].strip().strip('"').strip("'")
-            os.environ.setdefault(key.strip(), value)
 
 
 def _setup_logging():

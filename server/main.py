@@ -81,10 +81,7 @@ async def lifespan(app: FastAPI):
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    if not config.OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY not set — check your .env file.")
-    if not config.PINECONE_API_KEY:
-        raise RuntimeError("PINECONE_API_KEY not set — check your .env file.")
+    # API key validation is handled at import time by config._require_env().
 
     logger.info(
         "Starting VIOLETS server — model=%s  index=%s  k=%d  session_ttl=%dm",
@@ -134,7 +131,7 @@ class ResetRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
+async def chat(req: ChatRequest):
     store.get_or_create(req.user_id)
     chat_history = to_langchain_messages(store.get_history(req.user_id))
 
@@ -160,7 +157,7 @@ def chat(req: ChatRequest):
     # Runs after PII check. Blocks out-of-scope and partisan queries
     # before the expensive RAG chain is invoked.
     # ------------------------------------------------------------------
-    classification_response = classify_query(req.query, ctx)
+    classification_response = await classify_query(req.query, ctx)
     if classification_response:
         logger.info(
             "Request blocked — query not in scope [user=%s category=%s]",
@@ -175,10 +172,10 @@ def chat(req: ChatRequest):
     # ------------------------------------------------------------------
     start = time.time()
     try:
-        result = chain.with_config({"callbacks": [RAGCallbackHandler()]}).invoke({
+        result = await chain.with_config({"callbacks": [RAGCallbackHandler()]}).ainvoke({
             "input": req.query,
             "chat_history": chat_history,
-      })
+        })
     except Exception as exc:
         logger.error("RAG chain error [user=%s]: %s", req.user_id, exc)
         raise HTTPException(status_code=502, detail="Failed to generate response.")
@@ -190,7 +187,7 @@ def chat(req: ChatRequest):
     # Runs after the chain so it can inspect the output.
     # Retries once with a stricter prompt if partisan content is found.
     # ------------------------------------------------------------------
-    answer = check_partisan_response(
+    answer = await check_partisan_response(
         query=req.query,
         response=answer,
         chat_history=chat_history,
