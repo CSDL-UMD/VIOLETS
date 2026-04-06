@@ -19,7 +19,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.retrievers import BaseRetriever
-from langchain_core.runnables import RunnableConfig, RunnableLambda, RunnablePassthrough
+from langchain_core.runnables import RunnableConfig, RunnableLambda
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from pinecone import Pinecone
 
@@ -47,6 +47,9 @@ _QA_PROMPT = ChatPromptTemplate.from_messages([
      "Answer questions using the provided context. If the context doesn't "
      "contain enough information to answer, say you don't have that "
      "information and suggest what the user could try instead.\n\n"
+     "Each context chunk is labeled [Source N] with a URL. When you use "
+     "information from a source, cite it inline using [Source N] notation. "
+     "Always cite your sources so users can verify the information.\n\n"
      "Be concise, accurate, and conversational.\n\n"
      "Context:\n{context}"),
     MessagesPlaceholder("chat_history"),
@@ -110,7 +113,13 @@ class PineconeRetriever(BaseRetriever):
 # ---------------------------------------------------------------------------
 
 def _format_docs(docs: list[Document]) -> str:
-    return "\n\n---\n\n".join(doc.page_content for doc in docs)
+    parts = []
+    for i, doc in enumerate(docs, 1):
+        source = doc.metadata.get("source_url", "unknown")
+        title = doc.metadata.get("title", "")
+        header = f"[Source {i}]: {title}" if title else f"[Source {i}]"
+        parts.append(f"{header}\nURL: {source}\n{doc.page_content}")
+    return "\n\n---\n\n".join(parts)
 
 
 def build_chain():
@@ -140,11 +149,13 @@ def build_chain():
     # Step 1: Rephrase chain — converts follow-ups into standalone questions
     rephrase_chain = _CONTEXTUALIZE_PROMPT | llm | StrOutputParser()
 
-    async def contextualize_and_retrieve(inputs: dict, config: RunnableConfig) -> dict:
+    qa_chain = _QA_PROMPT | llm | StrOutputParser()
+
+    async def full_pipeline(inputs: dict, config: RunnableConfig) -> dict:
         chat_history = inputs.get("chat_history", [])
         user_input = inputs["input"]
 
-        # If there's history, rephrase; otherwise use as-is
+        # Step 1: rephrase follow-ups into standalone questions
         if chat_history:
             standalone_q = await rephrase_chain.ainvoke({
                 "input": user_input,
@@ -155,22 +166,30 @@ def build_chain():
             standalone_q = user_input
             logger.info("Query: '%s'", standalone_q)
 
-        # Retrieve using the standalone question
+        # Step 2: retrieve from Pinecone
         logger.info("Retrieving top-%d from Pinecone...", retriever.k)
         docs = await retriever.ainvoke(standalone_q, config)
-        return {
+
+        # Step 3: extract source metadata for the response
+        sources = []
+        for i, doc in enumerate(docs, 1):
+            sources.append({
+                "source_number": i,
+                "source_url": doc.metadata.get("source_url", "unknown"),
+                "title": doc.metadata.get("title", ""),
+                "score": round(doc.metadata.get("score", 0), 4),
+            })
+
+        # Step 4: generate answer with citations
+        answer = await qa_chain.ainvoke({
             "context": _format_docs(docs),
             "input": user_input,
             "chat_history": chat_history,
-        }
+        }, config)
 
-    # Step 2: QA chain — generates answer from context + history
-    qa_chain = _QA_PROMPT | llm | StrOutputParser()
+        return {"answer": answer, "sources": sources}
 
-    # Combined chain: rephrase -> retrieve -> answer
-    full_chain = RunnableLambda(contextualize_and_retrieve) | qa_chain
-
-    return full_chain
+    return RunnableLambda(full_pipeline)
 
 
 # ---------------------------------------------------------------------------

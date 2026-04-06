@@ -118,8 +118,16 @@ class ChatRequest(BaseModel):
     query: str
 
 
+class SourceReference(BaseModel):
+    source_number: int
+    source_url: str
+    title: str
+    score: float
+
+
 class ChatResponse(BaseModel):
     response: str
+    sources: list[SourceReference] = []
 
 
 class ResetRequest(BaseModel):
@@ -180,7 +188,8 @@ async def chat(req: ChatRequest):
         logger.error("RAG chain error [user=%s]: %s", req.user_id, exc)
         raise HTTPException(status_code=502, detail="Failed to generate response.")
 
-    answer = str(result)
+    answer = result["answer"]
+    sources = [SourceReference(**s) for s in result.get("sources", [])]
 
     # ------------------------------------------------------------------
     # GUARDRAIL 3: Partisan response check (~100 tokens)
@@ -204,7 +213,7 @@ async def chat(req: ChatRequest):
     log_request(req.user_id, req.query, answer, elapsed=time.time() - start)
     store.add_exchange(req.user_id, req.query, answer)
 
-    return ChatResponse(response=answer)
+    return ChatResponse(response=answer, sources=sources)
 
 
 @app.post("/reset")

@@ -443,12 +443,14 @@ async def check_partisan_response(
         )
 
 
-        retry_response = await chain.ainvoke({
+        retry_result = await chain.ainvoke({
             "input": query + "\n\n" + _STRICT_NONPARTISAN_RETRY_PROMPT,
             "chat_history": chat_history,
         })
 
-        return str(retry_response)
+        if isinstance(retry_result, dict):
+            return str(retry_result.get("answer", retry_result))
+        return str(retry_result)
 
     except Exception as exc:
         logger.error(
