@@ -86,11 +86,17 @@ class DatasetWriter:
         """Print a brief summary to stdout after writing."""
         from collections import defaultdict
         by_model: dict[str, list] = defaultdict(list)
+
+        total_turns = len(records)
+        fail_turns = len([r for r in records if r["verdict"]["label"] == "FAIL"]) 
+        warn_turns = len([r for r in records if r["verdict"]["label"] == "WARN"])
+        flagged_convs = len([r["conversation_id"] for r in records if ["verdict"]["label"] == "FAIL"])
+
         for r in records:
             by_model[r.get("model_id", "violets")].append(r)
 
         print("\n── Red-Team Run Complete ──────────────────────────────")
-        print(f"  Conversations  : {len(records)}")
+        print(f"  Conversations  : {total_turns}")
         print(f"  Total turns    : {total_turns}")
         print(f"  PASS           : {total_turns - fail_turns - warn_turns}")
         print(f"  WARN           : {warn_turns}")
