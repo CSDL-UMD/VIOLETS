@@ -54,7 +54,9 @@
                                              │
                            ┌─────────────────▼────────────────────┐
                            │  FastAPI chatbot — /chat endpoint      │
-                           │  RAG chain with conversation history   │
+                           │  Guardrails (PII, classification,      │
+                           │  partisan check) + RAG chain with      │
+                           │  conversation history                  │
                            └──────────────────────────────────────┘
 ```
 
@@ -81,7 +83,6 @@ VIOLETS/
 │   └── crawl.log                     ← Crawl activity log
 │
 ├── maryland_rag/                     ← RAG pipeline Python package
-│   ├── __init__.py
 │   ├── __main__.py                   ← CLI entry point (run all passes from here)
 │   ├── requirements.txt              ← Pipeline Python dependencies
 │   │
@@ -115,10 +116,11 @@ VIOLETS/
 │       └── reclassify.py             ← Re-classify pages without re-crawling
 │
 └── server/                           ← FastAPI chatbot server
-    ├── __init__.py
     ├── main.py                       ← App, endpoints (/chat, /reset, /health)
     ├── config.py                     ← Loads .env, configurable settings
     ├── rag_chain.py                  ← LangChain RAG chain with Pinecone retriever
+    ├── middleware.py                  ← Guardrails: PII detection, query classification, partisan check
+    ├── rag_logger.py                 ← Callback handler for token/cost logging per request
     ├── session.py                    ← In-memory conversation session store
     └── requirements.txt              ← Server Python dependencies
 ```
@@ -145,10 +147,11 @@ From the project root:
 # Pipeline dependencies
 pip install -r maryland_rag/requirements.txt
 
-# Download spaCy language model for PII detection
-python -m spacy download en_core_web_lg
 # Server dependencies
 pip install -r server/requirements.txt
+
+# Download spaCy language model (required by server PII detection)
+python -m spacy download en_core_web_lg
 ```
 
 | Library | Used In | Purpose |
@@ -162,12 +165,13 @@ pip install -r server/requirements.txt
 | `pytesseract` | Pass 2 | OCR on scanned PDF page images |
 | `Pillow` | Pass 2 | Image processing (used with pytesseract) |
 | `openai` | Pass 3 | Generates embeddings |
-| `pinecone` | Pass 3 | Upserts vectors to Pinecone |
+| `pinecone` | Pass 3, Server | Upserts vectors to Pinecone / vector store client |
 | `fastapi` | Server | Web framework |
 | `uvicorn` | Server | ASGI server to run FastAPI |
 | `langchain` | Server | RAG chain orchestration (core runnables, prompts, output parsers) |
 | `langchain-openai` | Server | ChatOpenAI LLM + OpenAI embeddings integration |
-| `pinecone` | Server | Vector store client (also used in Pass 3) |
+| `presidio-analyzer` | Server | PII detection in user queries and LLM responses (SSN, credit card, phone, etc.) |
+| `spacy` | Server | NLP backend for Presidio PII entity recognition (requires `en_core_web_lg` model) |
 
 ### 3.3 Environment Variables
 
@@ -422,7 +426,7 @@ If Pass 3 is interrupted, `--resume` reads the checkpoint and skips already-uplo
 
 ## 7. Server — FastAPI Chatbot
 
-**Goal:** Serve a conversational RAG chatbot over HTTP, backed by the Pinecone index populated by Pass 3.
+**Goal:** Serve a conversational RAG chatbot over HTTP, backed by the Pinecone index populated by Pass 3. Includes guardrail middleware for PII protection, query classification, and partisan-response prevention.
 
 **Run it:**
 ```bash
@@ -435,14 +439,30 @@ uvicorn server.main:app --host 0.0.0.0 --port 8000
 |---|---|---|
 | `POST` | `/chat` | Send a message, get a response |
 | `POST` | `/reset` | Clear conversation history for a user |
-| `GET` | `/health` | Health check |
+| `GET` | `/health` | Health check (returns model + index name) |
 
 ### How It Works
 
 ```
-User query + chat history
+User query
         │
         ▼
+┌───────────────────────────────┐
+│  Guard 1: Input PII Detection │
+│  Presidio scans for SSN,      │
+│  credit card, phone, etc.     │
+│  → Block if PII found         │
+└───────────────┬───────────────┘
+                │
+                ▼
+┌───────────────────────────────┐
+│  Guard 2: Query Classification│
+│  LLM classifies as normal,    │
+│  out_of_scope, or partisan    │
+│  → Block if not normal        │
+└───────────────┬───────────────┘
+                │  normal query + chat history
+                ▼
 ┌───────────────────────────────┐
 │  Stage 1: Contextualize       │
 │  If history exists, LLM       │
@@ -465,14 +485,44 @@ User query + chat history
 └───────────────┬───────────────┘
                 │
                 ▼
-        Response + session update
+┌───────────────────────────────┐
+│  Guard 3: Partisan Check      │
+│  LLM verifies the response    │
+│  is nonpartisan. If not,       │
+│  retries with stricter prompt  │
+└───────────────┬───────────────┘
+                │
+                ▼
+┌───────────────────────────────┐
+│  Guard 4: Output PII Scrub    │
+│  Presidio re-scans the LLM    │
+│  response before returning     │
+└───────────────┬───────────────┘
+                │
+                ▼
+        Response + session update + request log
 ```
 
-Built with `langchain_core` runnables — no `langchain-pinecone` dependency. A custom `PineconeRetriever` queries the Pinecone SDK directly and logs retrieval scores for debugging.
+### Server Modules
 
-The contextualization prompt instructs the LLM to reformulate follow-ups into standalone questions without answering them. The QA prompt grounds the LLM in the retrieved context and tells it to say when it doesn't have enough information rather than guessing.
+**`main.py`** — FastAPI app with async lifespan startup (logging, `SessionStore`, `build_chain()`). The `/chat` handler orchestrates the full guardrail + RAG pipeline. On RAG failure, returns HTTP 502.
 
-Session history is stored in-memory per `user_id` with TTL expiration and a max turn limit. Thread-safe via `threading.Lock`. Designed for pilot-scale (tens of concurrent users) — swap to Redis or a database for production scale.
+**`rag_chain.py`** — Built with `langchain_core` runnables — no `langchain-pinecone` dependency. A custom `PineconeRetriever(BaseRetriever)` queries the Pinecone SDK directly and logs retrieval scores. The chain is `RunnableLambda(contextualize_and_retrieve) | qa_prompt | llm | StrOutputParser()`. The contextualization prompt instructs the LLM to reformulate follow-ups into standalone questions without answering them. The QA prompt grounds the LLM in the retrieved context and tells it to say when it doesn't have enough information rather than guessing.
+
+**`middleware.py`** — All guardrail logic:
+
+| Function | Purpose | Failure mode |
+|---|---|---|
+| `detect_pii(query, ctx)` | Scans user input for PII (SSN, credit card, email, phone, passport, driver's license) via Presidio | Hard block — returns canned response |
+| `classify_query(query, ctx)` | LLM-based structured classification (`normal` / `out_of_scope` / `partisan`) using `gpt-4o-mini` with structured output | Fail open — on error, allows query through |
+| `check_partisan_response(query, response, ...)` | LLM-based structured check for partisan bias in the generated answer; if flagged, retries the RAG chain with a stricter nonpartisan prompt appended | Fail open — on error, returns original response |
+| `detect_pii_in_response(response, ctx)` | Re-scans LLM output for PII before returning to user | Hard block — replaces response with fallback |
+
+The classifier and partisan checker use `gpt-4o-mini` with Pydantic structured output (`ClassificationResult`, `PartisanCheckResult`), independent of the main `LLM_MODEL` setting.
+
+**`rag_logger.py`** — LangChain `BaseCallbackHandler` that tracks LLM token usage, estimates cost per request (using a built-in cost table for OpenAI models), and logs retriever timing/doc counts. Optional prompt/response/query logging controlled by module-level flags (`LOG_PROMPTS`, `LOG_RESPONSES`, `LOG_QUERIES` — all `False` by default). Also provides `log_request()` for per-request summary logging.
+
+**`session.py`** — In-memory per-`user_id` conversation store with TTL expiration and max turn limit. Thread-safe via `threading.Lock`. Designed for pilot-scale (tens of concurrent users) — swap to Redis or a database for production scale.
 
 ### Configuration
 
@@ -482,8 +532,9 @@ All settings via environment variables (or `.env`):
 |---|---|---|
 | `OPENAI_API_KEY` | (required) | OpenAI API key |
 | `PINECONE_API_KEY` | (required) | Pinecone API key |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible API base URL |
 | `PINECONE_INDEX_NAME` | `maryland-elections` | Pinecone index name |
-| `LLM_MODEL` | `gpt-4o-mini` | Chat model |
+| `LLM_MODEL` | `gpt-4o-mini` | Chat model for RAG answers |
 | `LLM_TEMPERATURE` | `0.2` | Model temperature |
 | `RETRIEVER_K` | `5` | Number of chunks to retrieve |
 | `SESSION_TTL_MINUTES` | `30` | Session expiration |
@@ -495,15 +546,15 @@ All settings via environment variables (or `.env`):
 
 ### 8.1 Database Cleanup (`scripts/db_cleanup.py`)
 
-After the initial crawl, `manifest.db` had ~5,700 rows. This script reduced it to the canonical 1,347 by removing:
+After the initial crawl, `manifest.db` had ~5,700 rows. This script reduced it to the canonical 1,347 by removing (in order):
 
 1. All `http://` URLs — redirects to `https://`, pure duplicates
 2. All `https://www.elections.maryland.gov/` URLs — the canonical domain omits `www.`
 3. Cloudflare `cdn-cgi` stub pages — auto-generated email-obfuscation stubs, no real content
 4. `businessdisclosure` subdomain pages — out of scope
-5. URLs with spaces in filenames — broken links
+5. All remaining `failed` rows — spaces-in-filename PDFs, mailto fragments, dead weight
 
-Always creates a timestamped backup before modifying the database. Current backup: `data/manifest.db.bak.20260225_155124`.
+After deletions, orphaned `links` rows (where both source and target no longer exist in `pages`) are cleaned up and the database is VACUUMed. Always creates a timestamped backup before modifying the database.
 
 ```bash
 python -m maryland_rag.scripts.db_cleanup --dry-run   # preview
@@ -536,6 +587,8 @@ python -m maryland_rag.scripts.reclassify              # apply
 ```bash
 # 1. Install dependencies
 pip install -r maryland_rag/requirements.txt
+pip install -r server/requirements.txt
+python -m spacy download en_core_web_lg
 
 # 2. Create .env with API keys (see Section 3.3)
 
@@ -554,7 +607,6 @@ python -m maryland_rag pass3 --chunks data/chunks.jsonl
 # 7. Verify at console.pinecone.io → maryland-elections index
 
 # 8. Start the server
-pip install -r server/requirements.txt
 uvicorn server.main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -777,7 +829,7 @@ Run `python -m maryland_rag.scripts.reclassify --dry-run` to preview current rul
 A previous run didn't exit cleanly. Kill any running `python -m maryland_rag` processes and retry.
 
 **Server won't start**
-Check that `OPENAI_API_KEY` and `PINECONE_API_KEY` are set in `.env` at the project root.
+Check that `OPENAI_API_KEY` and `PINECONE_API_KEY` are set in `.env` at the project root. Also verify the spaCy model is installed (`python -m spacy download en_core_web_lg`) — Presidio's `AnalyzerEngine` loads it at import time.
 
 ---
 
@@ -799,3 +851,8 @@ Project-specific terms and non-obvious library names only.
 | **RAG chain** | The LangChain runnable pipeline in the server: rephrase → retrieve → answer. Built from `langchain_core` primitives. |
 | **PineconeRetriever** | Custom `BaseRetriever` subclass in `rag_chain.py` that embeds queries with OpenAI and queries Pinecone directly (no `langchain-pinecone`). |
 | **SessionStore** | In-memory conversation store in `session.py`. Tracks chat history per user with TTL expiration and max turn limits. |
+| **Presidio** | Microsoft's PII detection engine, used in `middleware.py` to scan both user input and LLM output for sensitive data (SSN, credit card, phone, etc.). |
+| **QueryContext** | Dataclass in `middleware.py` that tracks per-request guardrail state: classification result, PII detection flags, and safety status. |
+| **RAGCallbackHandler** | LangChain callback handler in `rag_logger.py` that captures token usage, estimates cost, and logs retriever performance per request. |
+| **Structured output** | LangChain/OpenAI feature used by the guardrail LLMs — returns Pydantic models (`ClassificationResult`, `PartisanCheckResult`) instead of free-form text. |
+| **Fail open** | Guardrail error-handling strategy: if the classifier or partisan checker LLM call fails, the query is allowed through rather than blocked. Prevents guardrail outages from taking down the chatbot. |
