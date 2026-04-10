@@ -278,23 +278,18 @@ _classifier_llm = (
 
 _CLASSIFIER_SYSTEM_PROMPT = """\
 You are a query classifier for VIOLETS, a voter information chatbot
-for Maryland (2026 elections only).
+for Maryland elections.
 
 Classify the user query into exactly one of the following categories:
 
-- normal       : the query is about Maryland voting or elections.
-                If no year is mentioned, assume the user means
-                the upcoming 2026 election and classify as normal.
-                Only classify as out_of_scope if a year OTHER than
-                2026 is explicitly mentioned, or if the topic is
-                clearly unrelated to Maryland elections entirely.
+- normal       : the query is about Maryland voting or elections
                 (registration, polling locations, mail-in ballots,
-                  ID requirements, deadlines, absentee voting, etc.)
+                  ID requirements, deadlines, absentee voting,
+                  election procedures, or any Maryland election topic).
 
-- out_of_scope : the query targets federal races, other states,
-                other countries, or elections before 2026.
-                Also use this for completely off-topic questions
-                unrelated to Maryland voting.
+- out_of_scope : the query is about other states, federal races,
+                other countries, or topics completely unrelated
+                to Maryland voting and elections.
 
 - partisan     : the query requests candidate endorsements, asks
                 which party is better, or asks for partisan political
@@ -303,7 +298,6 @@ Classify the user query into exactly one of the following categories:
 Return your classification and a brief reason (1 sentence).
 Be decisive — every query must map to exactly one category.
 """
-
 
 async def classify_query(query: str, ctx: QueryContext) -> str | None:
     """
