@@ -282,22 +282,23 @@ for Maryland (2026 elections only).
 
 Classify the user query into exactly one of the following categories:
 
-- normal       : the query is about Maryland voting in 2026
-                 (registration, polling locations, mail-in ballots,
+- normal       : the query is about Maryland voting or elections.
+                If no year is mentioned, assume the user means
+                the upcoming 2026 election and classify as normal.
+                Only classify as out_of_scope if a year OTHER than
+                2026 is explicitly mentioned, or if the topic is
+                clearly unrelated to Maryland elections entirely.
+                (registration, polling locations, mail-in ballots,
                   ID requirements, deadlines, absentee voting, etc.)
 
-- out_of_scope : the query is about Maryland voting or elections.
-                 If no year is mentioned, assume the user means
-                 the upcoming 2026 election and classify as normal.
-                 Only classify as out_of_scope if a year OTHER than
-                 2026 is explicitly mentioned, or if the topic is
-                 clearly unrelated to Maryland elections entirely.
-                 (registration, polling locations, mail-in ballots,
-                  ID requirements, deadlines, absentee voting, etc.)
+- out_of_scope : the query targets federal races, other states,
+                other countries, or elections before 2026.
+                Also use this for completely off-topic questions
+                unrelated to Maryland voting.
 
 - partisan     : the query requests candidate endorsements, asks
-                 which party is better, or asks for partisan political
-                 judgments about candidates or parties.
+                which party is better, or asks for partisan political
+                judgments about candidates or parties.
 
 Return your classification and a brief reason (1 sentence).
 Be decisive — every query must map to exactly one category.
