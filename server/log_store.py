@@ -251,6 +251,7 @@ class AsyncLogStore:
                 int(entry.pii_in_query),
                 entry.pii_type_in_query,
                 json.dumps(entry.retrieved_sources),
+                entry.response,
                 entry.response_len,
                 int(entry.pii_in_response),
                 entry.pii_type_in_response,
