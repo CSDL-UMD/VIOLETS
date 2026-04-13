@@ -164,8 +164,8 @@ async def lifespan(app: FastAPI):
 
     _pool = ConnectionPool(
         conninfo=config.DATABASE_URL,
-        min_size=2,
-        max_size=10,
+        min_size=4,
+        max_size=25,
         configure=lambda conn: register_vector(conn),
     )
 
@@ -194,10 +194,11 @@ app = FastAPI(title="VIOLETS Election Chatbot", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=os.environ.get(
+        "CORS_ORIGINS", "https://umdsurvey.umd.edu"
+    ).split(","),
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-API-Key"],
 )
 
 
