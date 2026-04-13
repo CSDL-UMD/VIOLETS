@@ -7,7 +7,7 @@
 3. [Prerequisites & Setup](#3-prerequisites--setup)
 4. [Pass 1 — Crawling & Classification](#4-pass-1--crawling--classification)
 5. [Pass 2 — Chunking](#5-pass-2--chunking)
-6. [Pass 3 — Embedding & Pinecone Upload](#6-pass-3--embedding--pinecone-upload)
+6. [Pass 3 — Embedding & pgvector Upload](#6-pass-3--embedding--pgvector-upload)
 7. [Server — FastAPI Chatbot](#7-server--fastapi-chatbot)
 8. [Utility Scripts](#8-utility-scripts)
 9. [Running the Full Pipeline](#9-running-the-full-pipeline)
@@ -46,7 +46,7 @@
                                 PASS 3: Embed & Upload
                                              │
                            ┌─────────────────▼────────────────────┐
-                           │  Pinecone — index: maryland-elections  │
+                           │  PostgreSQL + pgvector                   │
                            │  Ready for semantic search             │
                            └─────────────────┬────────────────────┘
                                              │
@@ -76,7 +76,6 @@ VIOLETS/
 ├── data/                             ← All pipeline artifacts (gitignored)
 │   ├── manifest.db                   ← SQLite crawl database (Pass 1 output)
 │   ├── chunks.jsonl                  ← Chunked text records (Pass 2 output)
-│   ├── chunks.checkpoint             ← Tracks what has been uploaded (Pass 3 resume)
 │   └── cache/                        ← Disk cache of fetched pages (used by Pass 2)
 │
 ├── logs/                             ← Runtime logs (gitignored)
@@ -109,7 +108,7 @@ VIOLETS/
 │   │       └── docx_strategy.py      ← Extract DOCX by heading hierarchy
 │   │
 │   ├── pass3/                        ← Phase 3: Embed and upload
-│   │   └── embed.py                  ← OpenAI embeddings + Pinecone upsert
+│   │   └── embed.py                  ← OpenAI embeddings + pgvector insert
 │   │
 │   └── scripts/                      ← Maintenance utilities
 │       ├── db_cleanup.py             ← Remove duplicates and junk from manifest.db
@@ -118,7 +117,7 @@ VIOLETS/
 └── server/                           ← FastAPI chatbot server
     ├── main.py                       ← App, endpoints (/chat, /reset, /health)
     ├── config.py                     ← Loads .env, configurable settings
-    ├── rag_chain.py                  ← LangChain RAG chain with Pinecone retriever
+    ├── rag_chain.py                  ← LangChain RAG chain with pgvector retriever
     ├── middleware.py                  ← Guardrails: PII detection, query classification, partisan check
     ├── rag_logger.py                 ← Callback handler for token/cost logging per request
     ├── session.py                    ← In-memory conversation session store
@@ -135,6 +134,10 @@ VIOLETS/
   ```bash
   python --version
   ```
+- **PostgreSQL 15+** with the **pgvector** extension
+  - macOS: `brew install postgresql@15 pgvector`
+  - Ubuntu: `sudo apt-get install postgresql-15 postgresql-15-pgvector`
+  - Create a database: `createdb violets`
 - **Tesseract OCR** *(optional — only needed for image-only PDFs)*
   - macOS: `brew install tesseract`
   - Ubuntu: `sudo apt-get install tesseract-ocr`
@@ -165,7 +168,8 @@ python -m spacy download en_core_web_lg
 | `pytesseract` | Pass 2 | OCR on scanned PDF page images |
 | `Pillow` | Pass 2 | Image processing (used with pytesseract) |
 | `openai` | Pass 3 | Generates embeddings |
-| `pinecone` | Pass 3, Server | Upserts vectors to Pinecone / vector store client |
+| `psycopg` | Pass 3, Server | PostgreSQL adapter for vector storage |
+| `pgvector` | Pass 3, Server | pgvector extension support for psycopg |
 | `fastapi` | Server | Web framework |
 | `uvicorn` | Server | ASGI server to run FastAPI |
 | `langchain` | Server | RAG chain orchestration (core runnables, prompts, output parsers) |
@@ -179,10 +183,7 @@ Create a `.env` file in the project root:
 
 ```
 OPENAI_API_KEY=sk-...
-PINECONE_API_KEY=pcsk_...
-PINECONE_INDEX_NAME=maryland-elections
-PINECONE_CLOUD=aws
-PINECONE_REGION=us-east-1
+DATABASE_URL=postgresql://user:pass@localhost:5432/violets
 ```
 
 > **See [Section 13](#13-security-warning) for API key security.**
@@ -351,7 +352,7 @@ Disk cache (not in-memory) because Pass 2 runs can be long and interrupted — a
 
 ### 5.3 Deduplication (`pass2/chunker.py`)
 
-Pages with identical `content_hash` values (same content under different URLs) are extracted once. The resulting chunks carry `source_urls` (plural) listing all URLs for that content, rather than a single `source_url`. This avoids uploading duplicate vectors to Pinecone while preserving full provenance.
+Pages with identical `content_hash` values (same content under different URLs) are extracted once. The resulting chunks carry `source_urls` (plural) listing all URLs for that content, rather than a single `source_url`. This avoids inserting duplicate vectors while preserving full provenance.
 
 ---
 
@@ -373,13 +374,13 @@ Every record in `chunks.jsonl`:
 | `text` | The chunk text |
 | `date_extracted` | ISO timestamp of when this was processed |
 
-This metadata is stored alongside the vector in Pinecone so retrieved chunks can be cited with source, title, and page location.
+This metadata is stored alongside the vector in PostgreSQL so retrieved chunks can be cited with source, title, and page location.
 
 ---
 
-## 6. Pass 3 — Embedding & Pinecone Upload
+## 6. Pass 3 — Embedding & pgvector Upload
 
-**Goal:** Embed every chunk with OpenAI and upsert to Pinecone.
+**Goal:** Embed every chunk with OpenAI and insert into PostgreSQL with pgvector.
 
 **Run it:**
 ```bash
@@ -395,38 +396,48 @@ python -m maryland_rag pass3 --chunks data/my_chunks.jsonl
 ### 6.1 How It Works (`pass3/embed.py`)
 
 1. Read chunks from `chunks.jsonl`
-2. If `--resume`: skip chunk IDs already listed in `data/chunks.checkpoint`
-3. Send texts to OpenAI in batches of 100 → `text-embedding-3-small` → 1,536-dim vectors
-4. Sanitize metadata for Pinecone (only accepts `str`, `int`, `float`, `bool`, `list[str]` — nested dicts are JSON-encoded to string)
-5. Upsert vectors to Pinecone in batches of 100
-6. Append successfully upserted chunk IDs to `chunks.checkpoint`
+2. Create the `chunks` table and IVFFlat index if they don't exist
+3. If `--resume`: skip chunk IDs already present in the database
+4. Send texts to OpenAI in batches of 100 → `text-embedding-3-small` → 1,536-dim vectors
+5. Insert rows into PostgreSQL with `ON CONFLICT ... DO UPDATE` (upsert)
 
-Retry logic: 3 attempts with 5s exponential backoff on API failures.
+Retry logic: 3 attempts with 5s exponential backoff on embedding API failures.
 
 ---
 
-### 6.2 Pinecone Index Configuration
+### 6.2 pgvector Table Schema
+
+```sql
+CREATE TABLE chunks (
+    chunk_id   TEXT PRIMARY KEY,
+    embedding  vector(1536),
+    text       TEXT,
+    source_url TEXT,
+    title      TEXT,
+    metadata   JSONB DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX chunks_embedding_idx
+ON chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+```
 
 | Setting | Value | Reason |
 |---|---|---|
 | Dimension | 1,536 | Matches `text-embedding-3-small` output |
 | Metric | Cosine | Standard for normalized text embeddings |
-| Cloud | AWS | Default; set via `PINECONE_CLOUD` |
-| Region | us-east-1 | Default; set via `PINECONE_REGION` |
+| Index | IVFFlat | Good balance of speed and recall for ~1K vectors |
 
 ---
 
-### 6.3 The Checkpoint System
+### 6.3 Resume Support
 
-`data/chunks.checkpoint` — one `chunk_id` per line for every chunk successfully upserted.
-
-If Pass 3 is interrupted, `--resume` reads the checkpoint and skips already-uploaded chunks. Without it, a failed run would either re-upload duplicates or require starting entirely from scratch.
+If Pass 3 is interrupted, `--resume` queries the database for existing `chunk_id`s and skips them. Uses `ON CONFLICT` upsert, so re-running without `--resume` safely updates existing rows.
 
 ---
 
 ## 7. Server — FastAPI Chatbot
 
-**Goal:** Serve a conversational RAG chatbot over HTTP, backed by the Pinecone index populated by Pass 3. Includes guardrail middleware for PII protection, query classification, and partisan-response prevention.
+**Goal:** Serve a conversational RAG chatbot over HTTP, backed by the pgvector table populated by Pass 3. Includes guardrail middleware for PII protection, query classification, and partisan-response prevention.
 
 **Run it:**
 ```bash
@@ -439,7 +450,7 @@ uvicorn server.main:app --host 0.0.0.0 --port 8000
 |---|---|---|
 | `POST` | `/chat` | Send a message, get a response |
 | `POST` | `/reset` | Clear conversation history for a user |
-| `GET` | `/health` | Health check (returns model + index name) |
+| `GET` | `/health` | Health check (returns model name) |
 
 ### How It Works
 
@@ -474,7 +485,7 @@ User query
 ┌───────────────────────────────┐
 │  Stage 2: Retrieve            │
 │  Embed question → query       │
-│  Pinecone → top-k chunks      │
+│  pgvector → top-k chunks       │
 └───────────────┬───────────────┘
                 │  context + history + query
                 ▼
@@ -507,7 +518,7 @@ User query
 
 **`main.py`** — FastAPI app with async lifespan startup (logging, `SessionStore`, `build_chain()`). The `/chat` handler orchestrates the full guardrail + RAG pipeline. On RAG failure, returns HTTP 502.
 
-**`rag_chain.py`** — Built with `langchain_core` runnables — no `langchain-pinecone` dependency. A custom `PineconeRetriever(BaseRetriever)` queries the Pinecone SDK directly and logs retrieval scores. The chain is `RunnableLambda(contextualize_and_retrieve) | qa_prompt | llm | StrOutputParser()`. The contextualization prompt instructs the LLM to reformulate follow-ups into standalone questions without answering them. The QA prompt grounds the LLM in the retrieved context and tells it to say when it doesn't have enough information rather than guessing.
+**`rag_chain.py`** — Built with `langchain_core` runnables. A custom `PgVectorRetriever(BaseRetriever)` queries PostgreSQL with pgvector directly and logs retrieval scores. The chain is `RunnableLambda(contextualize_and_retrieve) | qa_prompt | llm | StrOutputParser()`. The contextualization prompt instructs the LLM to reformulate follow-ups into standalone questions without answering them. The QA prompt grounds the LLM in the retrieved context and tells it to say when it doesn't have enough information rather than guessing.
 
 **`middleware.py`** — All guardrail logic:
 
@@ -531,9 +542,8 @@ All settings via environment variables (or `.env`):
 | Variable | Default | Description |
 |---|---|---|
 | `OPENAI_API_KEY` | (required) | OpenAI API key |
-| `PINECONE_API_KEY` | (required) | Pinecone API key |
+| `DATABASE_URL` | (required) | PostgreSQL connection string (e.g. `postgresql://user:pass@localhost:5432/violets`) |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible API base URL |
-| `PINECONE_INDEX_NAME` | `maryland-elections` | Pinecone index name |
 | `LLM_MODEL` | `gpt-4o-mini` | Chat model for RAG answers |
 | `LLM_TEMPERATURE` | `0.2` | Model temperature |
 | `RETRIEVER_K` | `5` | Number of chunks to retrieve |
@@ -604,7 +614,8 @@ python -m maryland_rag pass2 --output data/chunks.jsonl
 # 6. Embed and upload (~5-15 min depending on API rate limits)
 python -m maryland_rag pass3 --chunks data/chunks.jsonl
 
-# 7. Verify at console.pinecone.io → maryland-elections index
+# 7. Verify vectors are in PostgreSQL:
+#    psql $DATABASE_URL -c "SELECT count(*) FROM chunks;"
 
 # 8. Start the server
 uvicorn server.main:app --host 0.0.0.0 --port 8000
@@ -804,7 +815,7 @@ Heading hierarchy is preserved in each chunk so a retrieved chunk always carries
 - Verify `.gitignore` excludes it before pushing.
 - If keys have been exposed, rotate immediately:
   - OpenAI: https://platform.openai.com/api-keys
-  - Pinecone: https://console.pinecone.io → API Keys
+  - PostgreSQL: rotate the database password and update `DATABASE_URL`
 
 ---
 
@@ -816,8 +827,8 @@ Fully resumable — just rerun `python -m maryland_rag pass1`. It picks up from 
 **Pass 2 fails on a specific PDF**
 All three extraction tiers are tried before failing. If all fail, the error is logged and the batch continues. Check the URL manually — the PDF may be password-protected or corrupted.
 
-**Pass 3: "Dimension mismatch" from Pinecone**
-The Pinecone index was created with a different vector dimension than 1,536. Delete the index in the console and let Pass 3 recreate it, or adjust `EMBEDDING_DIM` in `embed.py`.
+**Pass 3: "Dimension mismatch" from pgvector**
+The `chunks` table was created with a different vector dimension than 1,536. Drop and recreate the table (`DROP TABLE chunks;`) and re-run Pass 3, or adjust `EMBED_DIM` in `embed.py`.
 
 **Pass 3: Persistent rate limit errors from OpenAI**
 The code already batches and retries. If limits persist, reduce `EMBED_BATCH_SIZE` in `embed.py`.
@@ -829,7 +840,7 @@ Run `python -m maryland_rag.scripts.reclassify --dry-run` to preview current rul
 A previous run didn't exit cleanly. Kill any running `python -m maryland_rag` processes and retry.
 
 **Server won't start**
-Check that `OPENAI_API_KEY` and `PINECONE_API_KEY` are set in `.env` at the project root. Also verify the spaCy model is installed (`python -m spacy download en_core_web_lg`) — Presidio's `AnalyzerEngine` loads it at import time.
+Check that `OPENAI_API_KEY` and `DATABASE_URL` are set in `.env` at the project root. Also verify the spaCy model is installed (`python -m spacy download en_core_web_lg`) — Presidio's `AnalyzerEngine` loads it at import time.
 
 ---
 
@@ -841,7 +852,7 @@ Project-specific terms and non-obvious library names only.
 |---|---|
 | **manifest.db** | The SQLite database produced by Pass 1. One row per discovered URL with all classification and metadata. |
 | **chunks.jsonl** | JSONL file (one JSON object per line) produced by Pass 2. Each line is one chunk with text and full metadata. |
-| **chunks.checkpoint** | Plain text file listing `chunk_id`s that have been successfully upserted to Pinecone. Enables `--resume`. |
+| **chunks (table)** | PostgreSQL table storing vectors and metadata. `--resume` queries existing `chunk_id`s to skip them. |
 | **content_hash** | SHA256 of a page's extracted text. Two pages with the same hash have identical content and are deduplicated in Pass 2. |
 | `needs_ocr` | Flag on PDFs where no text layer was detected in the first 4KB — meaning the PDF is a scanned image. |
 | **trafilatura** | Library that extracts clean article text from HTML, removing nav, footers, and boilerplate. Primary extractor in Pass 1. |
@@ -849,7 +860,7 @@ Project-specific terms and non-obvious library names only.
 | **nav_hub** | Our classification for pages that are 150-499 words and primarily consist of links — they're navigation, not content. |
 | **Pass** | One stage of the pipeline. Pass 1 = crawl, Pass 2 = chunk, Pass 3 = embed and upload. |
 | **RAG chain** | The LangChain runnable pipeline in the server: rephrase → retrieve → answer. Built from `langchain_core` primitives. |
-| **PineconeRetriever** | Custom `BaseRetriever` subclass in `rag_chain.py` that embeds queries with OpenAI and queries Pinecone directly (no `langchain-pinecone`). |
+| **PgVectorRetriever** | Custom `BaseRetriever` subclass in `rag_chain.py` that embeds queries with OpenAI and queries PostgreSQL via pgvector for cosine similarity search. |
 | **SessionStore** | In-memory conversation store in `session.py`. Tracks chat history per user with TTL expiration and max turn limits. |
 | **Presidio** | Microsoft's PII detection engine, used in `middleware.py` to scan both user input and LLM output for sensitive data (SSN, credit card, phone, etc.). |
 | **QueryContext** | Dataclass in `middleware.py` that tracks per-request guardrail state: classification result, PII detection flags, and safety status. |

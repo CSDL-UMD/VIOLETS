@@ -28,7 +28,7 @@ def main():
     p2.add_argument('--output', default='data/chunks.jsonl', help='Output JSONL path')
 
     # Pass 3
-    p3 = subparsers.add_parser('pass3', help='Embed chunks and upsert to Pinecone')
+    p3 = subparsers.add_parser('pass3', help='Embed chunks and insert into pgvector')
     p3.add_argument('--chunks', default='data/chunks.jsonl', help='Path to chunks JSONL')
     p3.add_argument('--resume', action='store_true', help='Skip already-upserted chunk IDs')
 
@@ -55,7 +55,7 @@ def main():
     elif args.command == 'pass3':
         from .pass3.embed import run_embed
         n = run_embed(chunks_path=args.chunks, resume=args.resume)
-        print(f"Upserted {n} vectors to Pinecone")
+        print(f"Inserted {n} vectors into pgvector")
 
     elif args.command == 'all':
         from .pass1.crawler import run_crawl
@@ -68,7 +68,7 @@ def main():
         print(f"Produced {len(chunks)} chunks → {args.output}")
 
         n = run_embed(resume=True)
-        print(f"Upserted {n} vectors to Pinecone")
+        print(f"Inserted {n} vectors into pgvector")
 
     elif args.command == 'audit':
         _run_audit()

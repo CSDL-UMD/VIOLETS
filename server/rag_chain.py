@@ -3,13 +3,14 @@ LangChain RAG chain with conversation-aware retrieval.
 
 Flow per query:
   1. Rephrase the user's question using chat history (handles follow-ups)
-  2. Embed the rephrased question and retrieve top-k chunks from Pinecone
+  2. Embed the rephrased question and retrieve top-k chunks from PostgreSQL (pgvector)
   3. Generate an answer grounded in retrieved context + chat history
 
-Built with langchain_core runnables (no langchain.chains, no langchain-pinecone).
+Built with langchain_core runnables (no langchain.chains).
 """
 
 import logging
+from typing import Any
 
 from pydantic import ConfigDict
 
@@ -21,7 +22,6 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.retrievers import BaseRetriever
 from langchain_core.runnables import RunnableConfig, RunnableLambda
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from pinecone import Pinecone
 
 from . import config
 
@@ -58,14 +58,14 @@ _QA_PROMPT = ChatPromptTemplate.from_messages([
 
 
 # ---------------------------------------------------------------------------
-# Custom Pinecone retriever
+# Custom pgvector retriever
 # ---------------------------------------------------------------------------
 
-class PineconeRetriever(BaseRetriever):
-    """Retriever that queries Pinecone directly using OpenAI embeddings."""
+class PgVectorRetriever(BaseRetriever):
+    """Retriever that queries PostgreSQL with pgvector using OpenAI embeddings."""
 
     embeddings: OpenAIEmbeddings
-    index: object  # Pinecone Index
+    pool: Any  # psycopg_pool.ConnectionPool
     k: int = 5
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -75,36 +75,33 @@ class PineconeRetriever(BaseRetriever):
     ) -> list[Document]:
         query_embedding = self.embeddings.embed_query(query)
 
-        results = self.index.query(
-            vector=query_embedding,
-            top_k=self.k,
-            include_metadata=True,
-        )
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT chunk_id, text, source_url, title, metadata,
+                       1 - (embedding <=> %s::vector) AS score
+                FROM chunks
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+                """,
+                (query_embedding, query_embedding, self.k),
+            ).fetchall()
 
-        if isinstance(results, dict):
-            matches = results.get("matches", [])
-        else:
-            matches = getattr(results, "matches", []) or []
-
-        if not matches:
-            logger.warning("Pinecone returned no matches for query")
+        if not rows:
+            logger.warning("pgvector returned no matches for query")
 
         docs = []
-        for match in matches:
-            if isinstance(match, dict):
-                meta = dict(match.get("metadata", {}))
-                score = match.get("score", 0)
-            else:
-                meta = dict(getattr(match, "metadata", {}) or {})
-                score = getattr(match, "score", 0) or 0
-            text = meta.pop("text", "")
-            source = meta.get("source_url", "unknown")
+        for row in rows:
+            chunk_id, text, source_url, title, metadata, score = row
+            meta = dict(metadata) if metadata else {}
+            meta["source_url"] = source_url or "unknown"
+            meta["title"] = title or ""
+            meta["score"] = round(score, 4)
             logger.info(
                 "  Retrieved [%.4f] %s — %s",
-                score, source, text[:80].replace("\n", " ")
+                score, source_url, (text or "")[:80].replace("\n", " ")
             )
-            meta["score"] = score
-            docs.append(Document(page_content=text, metadata=meta))
+            docs.append(Document(page_content=text or "", metadata=meta))
         return docs
 
 
@@ -122,7 +119,7 @@ def _format_docs(docs: list[Document]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
-def build_chain():
+def build_chain(pool):
     """Build and return the full RAG chain. Called once at server startup."""
     embeddings = OpenAIEmbeddings(
         model="text-embedding-3-small",
@@ -130,12 +127,9 @@ def build_chain():
         openai_api_base=config.OPENAI_BASE_URL,
     )
 
-    pc = Pinecone(api_key=config.PINECONE_API_KEY)
-    index = pc.Index(config.PINECONE_INDEX_NAME)
-
-    retriever = PineconeRetriever(
+    retriever = PgVectorRetriever(
         embeddings=embeddings,
-        index=index,
+        pool=pool,
         k=config.RETRIEVER_K,
     )
 
@@ -166,8 +160,8 @@ def build_chain():
             standalone_q = user_input
             logger.info("Query: '%s'", standalone_q)
 
-        # Step 2: retrieve from Pinecone
-        logger.info("Retrieving top-%d from Pinecone...", retriever.k)
+        # Step 2: retrieve from pgvector
+        logger.info("Retrieving top-%d from pgvector...", retriever.k)
         docs = await retriever.ainvoke(standalone_q, config)
 
         # Step 3: extract source metadata for the response
