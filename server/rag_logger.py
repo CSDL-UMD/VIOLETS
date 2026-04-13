@@ -241,6 +241,19 @@ class RAGCallbackHandler(BaseCallbackHandler):
             self._total_llm_ms            += elapsed * 1000
             self._model                    = model
 
+    @property
+    def stats(self) -> dict:
+        """Return accumulated metrics after the chain has finished."""
+        return {
+            "prompt_tokens":        self._total_prompt_tokens or None,
+            "completion_tokens":    self._total_completion_tokens or None,
+            "total_tokens":         self._total_tokens or None,
+            "estimated_cost_usd":   self._total_cost or None,
+            "llm_latency_ms":       self._total_llm_ms or None,
+            "retrieval_latency_ms": self._retrieval_latency_ms,
+            "model":                self._model,
+        }
+
     def on_llm_error(
         self,
         error: BaseException,
