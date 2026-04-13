@@ -40,6 +40,7 @@ HOW TO TEST:
 """
 
 import asyncio
+import hmac
 import logging
 import os
 import time
@@ -75,7 +76,7 @@ _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
 async def _verify_api_key(key: str | None = Security(_api_key_header)):
-    if key is None or key != config.VIOLETS_API_KEY:
+    if key is None or not hmac.compare_digest(key, config.VIOLETS_API_KEY):
         raise HTTPException(status_code=401, detail="Missing or invalid API key")
 
 
@@ -95,13 +96,20 @@ class _RateLimiter:
     def check(self, key: str) -> bool:
         now = time.time()
         with self._lock:
-            self._requests[key] = [
+            timestamps = [
                 t for t in self._requests[key]
                 if now - t < self._window
             ]
-            if len(self._requests[key]) >= self._max:
+            if not timestamps:
+                # Remove empty entries to prevent unbounded growth
+                self._requests.pop(key, None)
+                self._requests[key] = [now]
+                return True
+            if len(timestamps) >= self._max:
+                self._requests[key] = timestamps
                 return False
-            self._requests[key].append(now)
+            timestamps.append(now)
+            self._requests[key] = timestamps
             return True
 
 

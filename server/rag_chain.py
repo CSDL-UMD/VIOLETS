@@ -124,7 +124,7 @@ def build_chain(pool):
     embeddings = OpenAIEmbeddings(
         model="text-embedding-3-small",
         openai_api_key=config.OPENAI_API_KEY,
-        openai_api_base=config.OPENAI_BASE_URL,
+        base_url=config.OPENAI_BASE_URL,
     )
 
     retriever = PgVectorRetriever(
@@ -137,7 +137,7 @@ def build_chain(pool):
         model=config.LLM_MODEL,
         temperature=config.LLM_TEMPERATURE,
         openai_api_key=config.OPENAI_API_KEY,
-        openai_api_base=config.OPENAI_BASE_URL,
+        base_url=config.OPENAI_BASE_URL,
     )
 
     # Step 1: Rephrase chain — converts follow-ups into standalone questions
@@ -145,7 +145,7 @@ def build_chain(pool):
 
     qa_chain = _QA_PROMPT | llm | StrOutputParser()
 
-    async def full_pipeline(inputs: dict, config: RunnableConfig) -> dict:
+    async def full_pipeline(inputs: dict, run_config: RunnableConfig) -> dict:
         chat_history = inputs.get("chat_history", [])
         user_input = inputs["input"]
 
@@ -154,7 +154,7 @@ def build_chain(pool):
             standalone_q = await rephrase_chain.ainvoke({
                 "input": user_input,
                 "chat_history": chat_history,
-            }, config)
+            }, run_config)
             logger.info("Rephrased: '%s' → '%s'", user_input, standalone_q)
         else:
             standalone_q = user_input
@@ -162,7 +162,7 @@ def build_chain(pool):
 
         # Step 2: retrieve from pgvector
         logger.info("Retrieving top-%d from pgvector...", retriever.k)
-        docs = await retriever.ainvoke(standalone_q, config)
+        docs = await retriever.ainvoke(standalone_q, run_config)
 
         # Step 3: extract source metadata for the response
         sources = []
@@ -179,7 +179,7 @@ def build_chain(pool):
             "context": _format_docs(docs),
             "input": user_input,
             "chat_history": chat_history,
-        }, config)
+        }, run_config)
 
         return {"answer": answer, "sources": sources}
 

@@ -180,10 +180,15 @@ def _get_existing_ids(conn) -> set[str]:
 
 
 def _insert_batch(conn, rows: list[tuple]) -> int:
-    """Insert a batch of rows, using ON CONFLICT to upsert."""
+    """Insert a batch of rows, using ON CONFLICT to upsert.
+
+    Each row is wrapped in a savepoint so a single failure doesn't
+    roll back previously-committed rows in the same batch.
+    """
     count = 0
     for row in rows:
         try:
+            conn.execute("SAVEPOINT insert_row")
             conn.execute(
                 """
                 INSERT INTO chunks (chunk_id, embedding, text, source_url, title, metadata)
@@ -197,10 +202,11 @@ def _insert_batch(conn, rows: list[tuple]) -> int:
                 """,
                 row,
             )
+            conn.execute("RELEASE SAVEPOINT insert_row")
             count += 1
         except Exception as exc:
             logger.warning("Insert failed for chunk %s: %s", row[0], exc)
-            conn.rollback()
+            conn.execute("ROLLBACK TO SAVEPOINT insert_row")
             continue
     conn.commit()
     return count

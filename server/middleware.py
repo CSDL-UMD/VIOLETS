@@ -271,7 +271,7 @@ _classifier_llm = (
         model="gpt-4o-mini",
         temperature=0,  # deterministic output
         openai_api_key=config.OPENAI_API_KEY,
-        openai_api_base=config.OPENAI_BASE_URL,
+        base_url=config.OPENAI_BASE_URL,
     )
     .with_structured_output(ClassificationResult)
 )
@@ -368,7 +368,7 @@ _partisan_checker_llm = (
         model="gpt-4o-mini",
         temperature=0,
         openai_api_key=config.OPENAI_API_KEY,
-        openai_api_base=config.OPENAI_BASE_URL,
+        base_url=config.OPENAI_BASE_URL,
     )
     .with_structured_output(PartisanCheckResult)
 )
