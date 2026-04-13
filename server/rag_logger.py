@@ -136,6 +136,15 @@ class RAGCallbackHandler(BaseCallbackHandler):
         self._llm_starts: dict[str, tuple[float, str]] = {}  # run_id → (start_time, model)
         self._ret_starts: dict[str, float] = {}               # run_id → start_time
 
+        # Accumulated across all LLM calls in this request (rephrase + QA)
+        self._total_prompt_tokens: int = 0
+        self._total_completion_tokens: int = 0
+        self._total_tokens: int = 0
+        self._total_cost: float = 0.0
+        self._total_llm_ms: float = 0.0
+        self._model: str | None = None
+        self._retrieval_latency_ms: float | None = None
+
     # ---- LLM events ----
 
     def on_chat_model_start(
@@ -224,6 +233,14 @@ class RAGCallbackHandler(BaseCallbackHandler):
                 key[:8], model, prompt_tokens, completion_tokens, total_tokens, cost,
             )
 
+            # Accumulate across all LLM calls in this request
+            self._total_prompt_tokens     += prompt_tokens
+            self._total_completion_tokens += completion_tokens
+            self._total_tokens            += total_tokens
+            self._total_cost              += cost
+            self._total_llm_ms            += elapsed * 1000
+            self._model                    = model
+
     def on_llm_error(
         self,
         error: BaseException,
@@ -258,6 +275,7 @@ class RAGCallbackHandler(BaseCallbackHandler):
     ) -> None:
         key = str(run_id)
         elapsed = time.time() - self._ret_starts.pop(key, time.time())
+        self._retrieval_latency_ms = elapsed * 1000
         logger.info(
             "RETRIEVER END [run=%s] (%.2fs): %d docs",
             key[:8], elapsed, len(documents),
