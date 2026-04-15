@@ -10,6 +10,7 @@ Built with langchain_core runnables (no langchain.chains).
 """
 
 import logging
+import re
 from typing import Any
 
 from pydantic import ConfigDict
@@ -119,6 +120,23 @@ def _format_docs(docs: list[Document]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
+def _replace_source_refs(answer: str, sources: list[dict]) -> str:
+    """Replace [Source N] markers in the answer with markdown links."""
+    source_map = {
+        s["source_number"]: s for s in sources
+    }
+
+    def _sub(m: re.Match) -> str:
+        num = int(m.group(1))
+        src = source_map.get(num)
+        if not src or src["source_url"] == "unknown":
+            return m.group(0)
+        title = src.get("title") or src["source_url"]
+        return f"[{title}]({src['source_url']})"
+
+    return re.sub(r"\[Source\s+(\d+)\]", _sub, answer, flags=re.IGNORECASE)
+
+
 def build_chain(pool):
     """Build and return the full RAG chain. Called once at server startup."""
     embeddings = OpenAIEmbeddings(
@@ -180,6 +198,8 @@ def build_chain(pool):
             "input": user_input,
             "chat_history": chat_history,
         }, run_config)
+
+        answer = _replace_source_refs(answer, sources)
 
         return {"answer": answer, "sources": sources}
 
