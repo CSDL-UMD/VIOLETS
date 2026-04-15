@@ -145,7 +145,7 @@ def build_chain(pool):
 
     qa_chain = _QA_PROMPT | llm | StrOutputParser()
 
-    async def full_pipeline(inputs: dict, run_config: RunnableConfig) -> dict:
+    async def full_pipeline(inputs: dict, run_config: RunnableConfig | None = None) -> dict:
         chat_history = inputs.get("chat_history", [])
         user_input = inputs["input"]
 
