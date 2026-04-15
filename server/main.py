@@ -192,10 +192,8 @@ app = FastAPI(title="VIOLETS Election Chatbot", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.environ.get(
-        "CORS_ORIGINS", "https://umdsurvey.umd.edu"
-    ).split(","),
-    allow_methods=["GET", "POST"],
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "X-API-Key"],
 )
 
