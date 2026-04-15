@@ -210,7 +210,7 @@ class ClassificationResult(BaseModel):
     Using with_structured_output() guarantees the LLM returns exactly
     the fields we expect — no free-form text parsing needed.
     """
-    category: Literal["normal", "out_of_scope", "partisan"]
+    category: Literal["normal", "conversational", "out_of_scope", "partisan"]
     reason: str  # used for logging only, never shown to the user
 
 
@@ -231,18 +231,24 @@ for Maryland elections.
 
 Classify the user query into exactly one of the following categories:
 
-- normal       : the query is about Maryland voting or elections
-                (registration, polling locations, mail-in ballots,
-                  ID requirements, deadlines, absentee voting,
-                  election procedures, or any Maryland election topic).
+- normal          : the query is about Maryland voting or elections
+                  (registration, polling locations, mail-in ballots,
+                    ID requirements, deadlines, absentee voting,
+                    election procedures, or any Maryland election topic).
 
-- out_of_scope : the query is about other states, federal races,
-                other countries, or topics completely unrelated
-                to Maryland voting and elections.
+- conversational  : the query is about the conversation itself — e.g.
+                  summarizing what was discussed, asking what was said
+                  earlier, requesting clarification of a previous answer,
+                  saying thanks, or other meta/social messages that do
+                  not require external knowledge.
 
-- partisan     : the query requests candidate endorsements, asks
-                which party is better, or asks for partisan political
-                judgments about candidates or parties.
+- out_of_scope    : the query is about other states, federal races,
+                  other countries, or topics completely unrelated
+                  to Maryland voting and elections.
+
+- partisan        : the query requests candidate endorsements, asks
+                  which party is better, or asks for partisan political
+                  judgments about candidates or parties.
 
 Return your classification and a brief reason (1 sentence).
 Be decisive — every query must map to exactly one category.
@@ -267,7 +273,7 @@ async def classify_query(query: str, ctx: QueryContext) -> str | None:
         ])
 
         ctx.query_category = result.category
-        ctx.safety_flag = result.category != "normal"
+        ctx.safety_flag = result.category not in ("normal", "conversational")
 
         logger.info(
             "Query classified [user=%s category=%s reason=%s]",

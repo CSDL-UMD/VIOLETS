@@ -280,7 +280,8 @@ async def chat(req: ChatRequest):
     start = time.time()
     try:
         result = await chain.ainvoke(
-            {"input": req.query, "chat_history": chat_history},
+            {"input": req.query, "chat_history": chat_history,
+             "query_category": ctx.query_category},
             config={"callbacks": [_rag_callback]},
         )
     except Exception as exc:

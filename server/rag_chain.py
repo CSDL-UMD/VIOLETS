@@ -57,6 +57,18 @@ _QA_PROMPT = ChatPromptTemplate.from_messages([
     ("human", "{input}"),
 ])
 
+_CONVERSATIONAL_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a helpful assistant for Maryland elections information. "
+     "The user is asking about the conversation itself — for example, "
+     "summarizing what was discussed, clarifying a previous answer, or "
+     "just being conversational. Answer based on the chat history. "
+     "Be concise and friendly."),
+    MessagesPlaceholder("chat_history"),
+    ("human", "{input}"),
+])
+
+
 
 # ---------------------------------------------------------------------------
 # Custom pgvector retriever
@@ -158,14 +170,22 @@ def build_chain(pool):
         base_url=config.OPENAI_BASE_URL,
     )
 
-    # Step 1: Rephrase chain — converts follow-ups into standalone questions
     rephrase_chain = _CONTEXTUALIZE_PROMPT | llm | StrOutputParser()
-
     qa_chain = _QA_PROMPT | llm | StrOutputParser()
+    conversational_chain = _CONVERSATIONAL_PROMPT | llm | StrOutputParser()
 
     async def full_pipeline(inputs: dict, run_config: RunnableConfig | None = None) -> dict:
         chat_history = inputs.get("chat_history", [])
         user_input = inputs["input"]
+        query_category = inputs.get("query_category")
+
+        if query_category == "conversational" and chat_history:
+            logger.info("Conversational query — answering from chat history")
+            answer = await conversational_chain.ainvoke({
+                "input": user_input,
+                "chat_history": chat_history,
+            }, run_config)
+            return {"answer": answer, "sources": []}
 
         # Step 1: rephrase follow-ups into standalone questions
         if chat_history:
