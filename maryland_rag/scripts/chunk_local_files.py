@@ -14,8 +14,11 @@ import argparse
 import io
 import json
 import logging
+import re
 import sys
 from pathlib import Path
+
+CID_PATTERN = re.compile(r'\(cid:\d+\)')
 
 from ..pass2.metadata import build_chunk_metadata
 from ..pass2.strategies.semantic import semantic_chunk
@@ -175,7 +178,7 @@ def chunk_file(path: Path, input_root: Path) -> list[dict]:
 
     if suffix == '.pdf':
         result = extract_pdf_local(path)
-        text = result.get('text', '')
+        text = CID_PATTERN.sub('', result.get('text', ''))
         chunks = chunk_text(text)
         section_hierarchy = folder_chain
         for i, c in enumerate(chunks):
