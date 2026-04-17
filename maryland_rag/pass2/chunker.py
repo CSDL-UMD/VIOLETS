@@ -20,6 +20,7 @@ from .strategies.simple_split import simple_split
 from .strategies.table_rows import extract_table_chunks
 from .strategies.pdf import extract_pdf
 from .strategies.docx_strategy import extract_docx
+from .strategies.xls_strategy import extract_xls
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,11 +76,7 @@ def run_pass2(
             logger.debug("Skipping (strategy=skip): %s", url)
             continue
 
-        if page['content_type'] != 'html':
-            logger.debug("Skipping non-HTML (%s): %s", page['content_type'], url)
-            continue
-
-        logger.info("Chunking [%s]: %s", strategy, url)
+        logger.info("Chunking [%s %s]: %s", page['content_type'], strategy, url)
 
         try:
             chunks = _route_to_strategy(page)
@@ -245,6 +242,11 @@ def _extract_document(url: str, content_type: str, needs_ocr: int) -> list:
                         'heading_chain': heading_chain,
                     })
         return all_chunks
+
+    elif content_type in ('xls', 'xlsx', 'csv'):
+        result = extract_xls(url)
+        rows = result.get('rows', [])
+        return [{'text': r} for r in rows if r.strip()]
 
     else:
         logger.warning("Unsupported document type: %s", content_type)
