@@ -13,6 +13,7 @@ import re
 # Target chunk sizes (in words, roughly equivalent to 1.3x tokens)
 TARGET_CHUNK_WORDS = 300
 MAX_CHUNK_WORDS = 500
+MAX_CHUNK_CHARS = 20000  # ~5k tokens, safe under 8192-token embedding cap
 OVERLAP_RATIO = 0.20  # 20% overlap between chunks
 
 
@@ -43,9 +44,11 @@ def semantic_chunk(text: str) -> list[str]:
     if not sentences:
         return []
 
-    # If text is short enough, return as single chunk
+    sentences = _enforce_sentence_cap(sentences, MAX_CHUNK_WORDS)
+
+    # If text is short enough (by both word and char count), return as single chunk
     total_words = sum(len(s.split()) for s in sentences)
-    if total_words <= MAX_CHUNK_WORDS:
+    if total_words <= MAX_CHUNK_WORDS and len(text) <= MAX_CHUNK_CHARS:
         return [text.strip()]
 
     chunks = []
@@ -86,7 +89,42 @@ def semantic_chunk(text: str) -> list[str]:
         if chunk_text:
             chunks.append(chunk_text)
 
-    return chunks
+    # Final safety: hard-split any chunk still exceeding the char cap
+    safe = []
+    for c in chunks:
+        if len(c) <= MAX_CHUNK_CHARS:
+            safe.append(c)
+        else:
+            for j in range(0, len(c), MAX_CHUNK_CHARS):
+                safe.append(c[j:j + MAX_CHUNK_CHARS])
+    return safe
+
+
+def _enforce_sentence_cap(sentences: list[str], cap_words: int) -> list[str]:
+    """Hard-split any sentence exceeding cap_words or MAX_CHUNK_CHARS.
+
+    Sentence-boundary regex misses dense letters, OCR output without proper
+    punctuation, and tabular text — those collapse into one huge "sentence"
+    that blows past the embedding model's token limit. Force word-level
+    splits, and fall back to character-level splits for whitespace-free junk
+    like unmapped PDF CID streams.
+    """
+    out = []
+    for s in sentences:
+        words = s.split()
+        if len(words) <= cap_words and len(s) <= MAX_CHUNK_CHARS:
+            out.append(s)
+            continue
+        # First split on words
+        parts = [' '.join(words[i:i + cap_words]) for i in range(0, len(words), cap_words)] or [s]
+        # Then char-split any part that's still too long (whitespace-free text)
+        for p in parts:
+            if len(p) <= MAX_CHUNK_CHARS:
+                out.append(p)
+            else:
+                for j in range(0, len(p), MAX_CHUNK_CHARS):
+                    out.append(p[j:j + MAX_CHUNK_CHARS])
+    return out
 
 
 def _split_sentences(text: str) -> list[str]:
