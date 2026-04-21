@@ -83,9 +83,9 @@ logger = logging.getLogger(__name__)
 # Token counts, cost, and latency are always logged regardless of these flags.
 # ---------------------------------------------------------------------------
 
-LOG_PROMPTS: bool = False   # log full prompt sent to the LLM
-LOG_RESPONSES: bool = False  # log full response from the LLM
-LOG_QUERIES: bool = False    # log raw user query in log_request()
+LOG_PROMPTS: bool = True   # log full prompt sent to the LLM
+LOG_RESPONSES: bool = True  # log full response from the LLM
+LOG_QUERIES: bool = True    # log raw user query in log_request()
 
 # ---------------------------------------------------------------------------
 # Cost table (USD per million tokens)
