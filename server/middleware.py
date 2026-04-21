@@ -17,7 +17,6 @@ PIPELINE ORDER (called inside /chat in main.py):
 WHY THIS ORDER:
     - Cheapest checks run first (Presidio is free, regex was free).
     - If PII is found we never spend tokens on classification.
-    - If the query is out-of-scope we never hit the expensive RAG chain.
     - Partisan response check must run after chain — needs LLM output.
 """
 
@@ -56,7 +55,7 @@ class QueryContext:
 
     query_category : str or None
         Set by classify_query(). None means it hasn't run yet.
-        Possible values: "normal", "out_of_scope", "partisan"
+        Possible values: "normal", "partisan"
 
     safety_flag : bool
         Set to True by classify_query() when the query is not "normal".
@@ -84,11 +83,6 @@ class QueryContext:
 # ---------------------------------------------------------------------------
 
 FALLBACK_RESPONSES = {
-    "out_of_scope": (
-        "I can only answer questions about voting in Maryland for the 2026 "
-        "elections. For information about other states or federal races, "
-        "please visit vote.gov."
-    ),
     "partisan": (
         "I'm not able to provide candidate endorsements or partisan political "
         "opinions. I'm here to help with factual voting information for "
@@ -210,7 +204,7 @@ class ClassificationResult(BaseModel):
     Using with_structured_output() guarantees the LLM returns exactly
     the fields we expect — no free-form text parsing needed.
     """
-    category: Literal["normal", "conversational", "out_of_scope", "partisan"]
+    category: Literal["normal", "conversational", "partisan"]
     reason: str  # used for logging only, never shown to the user
 
 
@@ -231,10 +225,9 @@ for Maryland elections.
 
 Classify the user query into exactly one of the following categories:
 
-- normal          : the query is about Maryland voting or elections
-                  (registration, polling locations, mail-in ballots,
-                    ID requirements, deadlines, absentee voting,
-                    election procedures, or any Maryland election topic).
+- normal          : any query about Maryland voting, elections, or civic
+                    topics — OR any query that doesn't clearly fit the
+                    other categories. When in doubt, classify as normal.
 
 - conversational  : the query is about the conversation itself — e.g.
                   summarizing what was discussed, asking what was said
@@ -242,9 +235,6 @@ Classify the user query into exactly one of the following categories:
                   saying thanks, or other meta/social messages that do
                   not require external knowledge.
 
-- out_of_scope    : the query is about other states, federal races,
-                  other countries, or topics completely unrelated
-                  to Maryland voting and elections.
 
 - partisan        : the query requests candidate endorsements, asks
                   which party is better, or asks for partisan political
@@ -273,7 +263,7 @@ async def classify_query(query: str, ctx: QueryContext) -> str | None:
         ])
 
         ctx.query_category = result.category
-        ctx.safety_flag = result.category not in ("normal", "conversational")
+        ctx.safety_flag = result.category == "partisan"
 
         logger.info(
             "Query classified [user=%s category=%s reason=%s]",
@@ -283,7 +273,7 @@ async def classify_query(query: str, ctx: QueryContext) -> str | None:
         )
 
         if ctx.safety_flag:
-            return FALLBACK_RESPONSES[result.category]
+            return FALLBACK_RESPONSES["partisan"]
 
         return None  # normal — proceed to RAG chain
 
