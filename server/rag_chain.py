@@ -45,9 +45,10 @@ _CONTEXTUALIZE_PROMPT = ChatPromptTemplate.from_messages([
 _QA_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You are a helpful assistant for Maryland elections information. "
-     "Answer questions using the provided context. If the context doesn't "
-     "contain enough information to answer, say you don't have that "
-     "information and suggest what the user could try instead.\n\n"
+     "Answer questions as fully as possible using the provided context. "
+     "Even if the context only partially covers the question, share what you know — "
+     "do not refuse to answer just because the context is incomplete. "
+     "Only say you don't have information if the context contains nothing relevant whatsoever.\n\n"
      "Each context chunk is labeled [Source N] with a URL. When you use "
      "information from a source, cite it inline using [Source N] notation. "
      "Always cite your sources so users can verify the information.\n\n"
