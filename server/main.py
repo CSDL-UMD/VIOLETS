@@ -48,7 +48,8 @@ from pydantic import BaseModel
 
 from . import config
 from .rag_chain import build_chain, to_langchain_messages
-from .rag_logger import RAGCallbackHandler, log_request
+from .rag_logger import RAGCallbackHandler, log_request, LOG_QUERIES
+from .log_store import AsyncLogStore, ChatLogEntry
 from .session import SessionStore
 from .middleware import (
     QueryContext,
@@ -66,6 +67,7 @@ logger = logging.getLogger(__name__)
 
 store: SessionStore | None = None
 chain = None
+log_store: AsyncLogStore | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +76,7 @@ chain = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global chain, store
+    global chain, store, log_store
 
     logging.basicConfig(
         level=logging.INFO,
@@ -98,8 +100,13 @@ async def lifespan(app: FastAPI):
 
     chain = build_chain()
 
+    log_store = AsyncLogStore()
+    log_store.start()
+
     logger.info("Server ready.")
     yield
+
+    await log_store.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -141,10 +148,13 @@ class ResetRequest(BaseModel):
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     store.get_or_create(req.user_id)
-    chat_history = to_langchain_messages(store.get_history(req.user_id))
+    raw_history = store.get_history(req.user_id)
+    session_turn = len(raw_history) // 2 + 1
+    chat_history = to_langchain_messages(raw_history)
 
     # Shared context object — travels through all guardrails
     ctx = QueryContext(user_id=req.user_id)
+    start = time.time()
 
     # ------------------------------------------------------------------
     # GUARDRAIL 1: PII detection (Presidio, zero tokens)
@@ -158,6 +168,19 @@ async def chat(req: ChatRequest):
             req.user_id,
             ctx.pii_type,
         )
+        log_store.enqueue(ChatLogEntry(
+            timestamp=start,
+            user_id=req.user_id,
+            session_turn=session_turn,
+            query_len=len(req.query),
+            query=None,  # never store a PII-containing query
+            rephrased_query=None,
+            query_category=None,
+            guardrail_blocked_by="pii",
+            pii_in_query=True,
+            pii_type_in_query=ctx.pii_type,
+            total_latency_ms=(time.time() - start) * 1000,
+        ))
         return ChatResponse(response=pii_response)
 
     # ------------------------------------------------------------------
@@ -172,23 +195,46 @@ async def chat(req: ChatRequest):
             req.user_id,
             ctx.query_category,
         )
+        log_store.enqueue(ChatLogEntry(
+            timestamp=start,
+            user_id=req.user_id,
+            session_turn=session_turn,
+            query_len=len(req.query),
+            query=req.query if LOG_QUERIES else None,
+            rephrased_query=None,
+            query_category=ctx.query_category,
+            guardrail_blocked_by=ctx.query_category,
+            total_latency_ms=(time.time() - start) * 1000,
+        ))
         return ChatResponse(response=classification_response)
 
     # ------------------------------------------------------------------
     # MAIN RAG CHAIN
     # Only reached if both guardrails above passed.
     # ------------------------------------------------------------------
-    start = time.time()
+    callback = RAGCallbackHandler()
     try:
-        result = await chain.with_config({"callbacks": [RAGCallbackHandler()]}).ainvoke({
+        result = await chain.with_config({"callbacks": [callback]}).ainvoke({
             "input": req.query,
             "chat_history": chat_history,
         })
     except Exception as exc:
         logger.error("RAG chain error [user=%s]: %s", req.user_id, exc)
+        log_store.enqueue(ChatLogEntry(
+            timestamp=start,
+            user_id=req.user_id,
+            session_turn=session_turn,
+            query_len=len(req.query),
+            query=req.query if LOG_QUERIES else None,
+            rephrased_query=None,
+            query_category=ctx.query_category,
+            error=str(exc),
+            total_latency_ms=(time.time() - start) * 1000,
+        ))
         raise HTTPException(status_code=502, detail="Failed to generate response.")
 
     answer = result["answer"]
+    rephrased_query = result.get("rephrased_query")
     sources = [SourceReference(**s) for s in result.get("sources", [])]
 
     # ------------------------------------------------------------------
@@ -210,9 +256,38 @@ async def chat(req: ChatRequest):
     # ------------------------------------------------------------------
     answer = detect_pii_in_response(answer, ctx)
 
-    log_request(req.user_id, req.query, answer, elapsed=time.time() - start)
-    store.add_exchange(req.user_id, req.query, answer)
+    elapsed = time.time() - start
+    log_request(req.user_id, req.query, answer, elapsed=elapsed)
 
+    stats = callback.stats
+    log_store.enqueue(ChatLogEntry(
+        timestamp=start,
+        user_id=req.user_id,
+        session_turn=session_turn,
+        query_len=len(req.query),
+        query=req.query if LOG_QUERIES else None,
+        rephrased_query=rephrased_query,
+        query_category=ctx.query_category,
+        guardrail_blocked_by=None,
+        pii_in_query=False,
+        retrieved_sources=result.get("sources", []),
+        response=answer,
+        response_len=len(answer),
+        pii_in_response=ctx.pii_in_response,
+        pii_type_in_response=ctx.pii_type_in_response,
+        partisan_detected=ctx.partisan_detected,
+        partisan_retried=ctx.partisan_retried,
+        prompt_tokens=stats["prompt_tokens"],
+        completion_tokens=stats["completion_tokens"],
+        total_tokens=stats["total_tokens"],
+        estimated_cost_usd=stats["estimated_cost_usd"],
+        retrieval_latency_ms=stats["retrieval_latency_ms"],
+        llm_latency_ms=stats["llm_latency_ms"],
+        total_latency_ms=elapsed * 1000,
+        model=stats["model"],
+    ))
+
+    store.add_exchange(req.user_id, req.query, answer)
     return ChatResponse(response=answer, sources=sources)
 
 

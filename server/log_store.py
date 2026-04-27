@@ -16,7 +16,7 @@ Privacy contract
                    never reaches this path with text attached)
 - pii_type_*     : entity type label only (e.g. "EMAIL_ADDRESS") — never the
                    actual PII value
-- response_len   : character count only; the response text is NOT stored
+- response       : full text stored — always post-PII-sanitization, so safe to log
 - retrieved_sources : URL, title, and similarity score — no chunk text
 """
 
@@ -144,7 +144,7 @@ INSERT INTO chat_logs (
     ?,?,?,?,?,
     ?,?,?,
     ?,?,?,
-    ?,?,?,
+    ?,?,?,?,
     ?,?,
     ?,?,?,?,
     ?,?,?,

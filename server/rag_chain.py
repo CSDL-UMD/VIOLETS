@@ -187,7 +187,7 @@ def build_chain():
             "chat_history": chat_history,
         }, config)
 
-        return {"answer": answer, "sources": sources}
+        return {"answer": answer, "sources": sources, "rephrased_query": standalone_q}
 
     return RunnableLambda(full_pipeline)
 

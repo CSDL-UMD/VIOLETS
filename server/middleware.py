@@ -77,6 +77,10 @@ class QueryContext:
     safety_flag: bool = False
     pii_detected: bool = False
     pii_type: str | None = None
+    pii_in_response: bool = False
+    pii_type_in_response: str | None = None
+    partisan_detected: bool = False
+    partisan_retried: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -235,8 +239,8 @@ def detect_pii_in_response(response: str, ctx: QueryContext) -> str:
         top_hit.entity_type,
         top_hit.score,
     )
-    ctx.pii_detected = True 
-    ctx.pii_type = top_hit.entity_type
+    ctx.pii_in_response = True
+    ctx.pii_type_in_response = top_hit.entity_type
 
     return FALLBACK_RESPONSES["pii_in_response"]
 
@@ -432,12 +436,13 @@ async def check_partisan_response(
             return response  # clean — return as-is
 
         # Partisan detected — retry with stricter prompt
+        ctx.partisan_detected = True
         logger.warning(
             "Partisan response detected [user=%s] — retrying with strict prompt.",
             ctx.user_id,
         )
 
-
+        ctx.partisan_retried = True
         retry_result = await chain.ainvoke({
             "input": query + "\n\n" + _STRICT_NONPARTISAN_RETRY_PROMPT,
             "chat_history": chat_history,
