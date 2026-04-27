@@ -49,7 +49,7 @@ TEST
 --------------
 To test this, create a virtual environment
     python -m venv venv (one time)
-    venv\Scripts\activate (RUN THIS everytime you want to start the venv)
+    venv\\Scripts\\activate (RUN THIS everytime you want to start the venv)
     pip install -r maryland_rag/requirements.txt (one time)
     pip install -r server/requirements.txt (one time)
 
