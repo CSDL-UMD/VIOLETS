@@ -18,6 +18,17 @@ WHY THIS ORDER:
     - Cheapest checks run first (Presidio is free, regex was free).
     - If PII is found we never spend tokens on classification.
     - Partisan response check must run after chain — needs LLM output.
+
+QUERY CATEGORIES AND WHAT HAPPENS TO THEM:
+-------------------------------------------
+    - normal          → RAG chain runs normally
+    - conversational  → RAG chain runs using chat history only
+    - concerns        → RAG chain runs with Rumor Control system prompt
+    - polling_location → hardcoded URL returned, chain never runs
+    - voter_lookup     → hardcoded URL returned, chain never runs
+    - voter_update     → hardcoded URL returned, chain never runs
+    - candidates       → hardcoded URL returned, chain never runs
+    - partisan         → blocked entirely, fallback message returned
 """
 
 import logging
@@ -55,7 +66,9 @@ class QueryContext:
 
     query_category : str or None
         Set by classify_query(). None means it hasn't run yet.
-        Possible values: "normal", "partisan"
+        Possible values: "normal", "conversational", "concerns",
+        "polling_location", "voter_lookup", "voter_update",
+        "candidates", "partisan"
 
     safety_flag : bool
         Set to True by classify_query() when the query is not "normal".
@@ -80,6 +93,14 @@ class QueryContext:
 # ---------------------------------------------------------------------------
 # Defined here — not scattered through main.py — so the team can update
 # user-facing messaging in one place without touching endpoint logic.
+#
+# WHY HARDCODED URLS FOR SOME CATEGORIES:
+#   For polling location, voter lookup, voter update, and candidates,
+#   we return a direct URL instead of running the RAG chain because:
+#   1. The answer is always the same URL — no retrieval needed
+#   2. These are official Maryland election tools — better to send users
+#      there directly than have the LLM describe them
+#   3. Zero token cost — no LLM call needed at all
 # ---------------------------------------------------------------------------
 
 FALLBACK_RESPONSES = {
@@ -96,7 +117,25 @@ FALLBACK_RESPONSES = {
         "your question without it — what would you like to know about "
         "Maryland elections?"
     ),
-    
+    "polling_location": (
+        "You can find your polling place using the official Maryland Polling "
+        "Place Search tool here: "
+        "https://voterservices.elections.maryland.gov/PollingPlaceSearch"
+    ),
+    "voter_lookup": (
+        "You can look up your voter registration information using the "
+        "official Maryland Voter Search tool here: "
+        "https://voterservices.elections.maryland.gov/VoterSearch"
+    ),
+    "voter_update": (
+        "You can update your voter registration information online here: "
+        "https://voterservices.elections.maryland.gov/OnlineVoterUpdate/InstructionsStep1"
+    ),
+    "candidates": (
+        "You can find the up-to-date list of candidates for the 2026 "
+        "Maryland Primary Election here: "
+        "https://elections.maryland.gov/elections/2026/primary_candidates/index.html"
+    ),
 }
 
 
@@ -110,9 +149,6 @@ FALLBACK_RESPONSES = {
 #   3. Built-in validation — Luhn check for cards, range check for IPs
 #   4. Works identically for both input AND output checking
 #   5. Actively maintained — improvements come for free
-#
-# Trade-off: ~0.1-0.3s per check vs ~0.001s for regex.
-# Acceptable at pilot scale (tens of users).
 #
 # WHY PERSON and LOCATION are excluded:
 #   Users legitimately mention candidate names and Maryland counties.
@@ -149,9 +185,6 @@ def detect_pii(query: str, ctx : QueryContext) -> str | None:
 
     Node-style guardrail — runs BEFORE the RAG chain at zero token cost.
     Returns a fallback message string if PII is found, None if clean.
-
-    The caller (main.py) checks the return value: if not None, it
-    returns the fallback immediately and skips the RAG chain entirely.
     """
 
     query = str(query)
@@ -186,25 +219,30 @@ def detect_pii(query: str, ctx : QueryContext) -> str | None:
 #---------------------------------------------------------------------------
 # SECTION 4: Query classification (node-style, small LLM)
 # ---------------------------------------------------------------------------
-# We use an LLM here instead of regex because partisan/out-of-scope intent
-# is expressed in natural language and can't be caught with keywords.
-# Example: "What do you think about the candidates?" — no keywords, but
-# clearly partisan.
+# We use an LLM here instead of regex because intent is expressed in
+# natural language and can't be caught with keywords alone.
 #
-# We use a separate small model (not the full RAG model) because the
-# classifier only needs to output one of three labels. Using the full
-# RAG model with retrieval for this would be wasteful (~70 tokens vs
-# hundreds).
+# Each category maps to a specific behavior:
+#   - normal/conversational/concerns → pass through to RAG chain
+#   - polling_location/voter_lookup/voter_update/candidates → hardcoded URL
+#   - partisan → blocked entirely
+#
+# WHY SEPARATE CATEGORIES FOR EACH URL:
+#   Each URL serves a different user need. The category name is used as
+#   the key to look up the correct hardcoded response in FALLBACK_RESPONSES.
+#   If they shared a category we wouldn't know which URL to return.
 # ---------------------------------------------------------------------------
 
+# Categories that pass through to the RAG chain (with or without
+# system prompt modification). Everything else gets a hardcoded response
+# or is blocked entirely.
+
+_PASSTHROUGH_CATEGORIES = {"normal", "conversational", "concerns"}
 class ClassificationResult(BaseModel):
     """
     Structured output from the classifier LLM.
-
-    Using with_structured_output() guarantees the LLM returns exactly
-    the fields we expect — no free-form text parsing needed.
     """
-    category: Literal["normal", "conversational", "partisan"]
+    category: Literal["normal", "conversational", "concerns", "polling_location", "voter_lookup", "voter_update", "candidates", "partisan"]
     reason: str  # used for logging only, never shown to the user
 
 
@@ -235,6 +273,23 @@ Classify the user query into exactly one of the following categories:
                   saying thanks, or other meta/social messages that do
                   not require external knowledge.
 
+- concerns        : the query expresses concerns, rumors, conspiracy
+                    theories, or misinformation about elections — e.g.
+                    "I heard the election is rigged", "is mail-in voting
+                    fraudulent?", "I don't trust the voting machines".
+                    Also applies when the query is prefixed with
+                    "__User concerns:__" from the survey system.                  
+- polling_location : the user is asking where to vote, where their
+                    polling place is, or what their polling location is.
+ 
+- voter_lookup    : the user wants to look up or check their voter
+                    registration status or information.
+ 
+- voter_update    : the user wants to update, change, or correct their
+                    voter registration information.
+ 
+- candidates      : the user is asking about who is running, candidate
+                    lists, or who is on the ballot.
 
 - partisan        : the query requests candidate endorsements, asks
                   which party is better, or asks for partisan political
@@ -247,36 +302,53 @@ Be decisive — every query must map to exactly one category.
 async def classify_query(query: str, ctx: QueryContext) -> str | None:
     """
     Classify the user query using a lightweight LLM.
-
-    Node-style guardrail — runs BEFORE the RAG chain.
-    Returns a fallback message if the query should be blocked, or None
-    if it's normal and should proceed.
-
-    Fails open: if the classifier LLM errors, we log it and return None
-    so the user still gets an answer. A broken classifier should degrade
-    gracefully, not take down the chatbot.
+ 
+    Returns None for categories that should reach the RAG chain
+    (normal, conversational, concerns). Returns a hardcoded response
+    string for categories that should be short-circuited (polling_location,
+    voter_lookup, voter_update, candidates, partisan).
+ 
+    The query_category is always set on ctx so downstream components
+    (e.g. rag_chain.py) can adjust their behavior — for example,
+    the concerns category causes the system prompt to be overwritten
+    with a Rumor Control directive.
+ 
+    Fails open: if the classifier LLM errors, logs and returns None
+    so the user still gets an answer.
     """
+    # Check for hardcoded survey tag first — no LLM call needed
+    # The survey system prefixes concern queries with "__User concerns:__"
+    if query.strip().startswith("__User concerns:__"):
+        ctx.query_category = "concerns"
+        ctx.safety_flag = False
+        logger.info("Query tagged as concerns by survey system [user=%s]", ctx.user_id)
+        return None  # pass through to RAG chain with concerns prompt
+ 
     try:
         result: ClassificationResult = await _classifier_llm.ainvoke([
             SystemMessage(content=_CLASSIFIER_SYSTEM_PROMPT),
             HumanMessage(content=query),
         ])
-
+ 
         ctx.query_category = result.category
         ctx.safety_flag = result.category == "partisan"
-
+ 
         logger.info(
             "Query classified [user=%s category=%s reason=%s]",
             ctx.user_id,
             result.category,
             result.reason,
         )
-
-        if ctx.safety_flag:
-            return FALLBACK_RESPONSES["partisan"]
-
-        return None  # normal — proceed to RAG chain
-
+ 
+        # Passthrough categories go to the RAG chain
+        if result.category in _PASSTHROUGH_CATEGORIES:
+            return None
+ 
+        # All other categories return their specific hardcoded response
+        # Each category has its own key in FALLBACK_RESPONSES so we
+        # return exactly the right URL or message for that category
+        return FALLBACK_RESPONSES[result.category]
+ 
     except Exception as exc:
         logger.error(
             "classify_query failed [user=%s error=%s] — allowing query through.",
@@ -284,6 +356,7 @@ async def classify_query(query: str, ctx: QueryContext) -> str | None:
             exc,
         )
         return None  # fail open
+ 
 
 
 # ---------------------------------------------------------------------------
@@ -293,9 +366,6 @@ async def classify_query(query: str, ctx: QueryContext) -> str | None:
 # query accidentally gets a partisan answer from the LLM — for example,
 # "Who are the candidates for County Executive?" is a legitimate question
 # but the LLM might unexpectedly add "Candidate X has a stronger record."
-#
-# Why wrap-style? Because we can only detect a partisan *response* after
-# the LLM has spoken. There's no way to know what it will say beforehand.
 #
 # Retry logic: up to MAX_PARTISAN_RETRIES (2) additional attempts. The
 # checker re-runs after each retry so we never return partisan content

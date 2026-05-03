@@ -69,8 +69,31 @@ _CONVERSATIONAL_PROMPT = ChatPromptTemplate.from_messages([
     ("human", "{input}"),
 ])
 
+#SEPARATE USER CONCERN PROMPTS: 
+# When a user expresses a rumor, concern, or conspiracy theory about elections,
+# we don't want to simply answer with retrieved chunks — that might inadvertently
+# validate or engage with misinformation. Instead we overwrite the system prompt
+# to direct the user to Maryland's official Rumor Control page first, then
+# supplement with any relevant factual context from the RAG chain.
+# This prompt is used when query_category == "concerns" OR when the survey
+# system tags the query with "__User concerns:__".
 
-
+_CONCERNS_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a helpful assistant for Maryland elections information. "
+     "The user has expressed a concern, rumor, or question about election "
+     "integrity or misinformation.\n\n"
+     "IMPORTANT: Always start your response by directing the user to Maryland's "
+     "official Rumor Control page for verified information: "
+     "https://elections.maryland.gov/press_room/rumor_control.html\n\n"
+     "After referencing Rumor Control, you may use the provided context to "
+     "give additional factual information if relevant. Be empathetic, calm, "
+     "and factual. Do not dismiss the user's concern — acknowledge it and "
+     "redirect to official sources.\n\n"
+     "Context:\n{context}"),
+    MessagesPlaceholder("chat_history"),
+    ("human", "{input}"),
+])
 # ---------------------------------------------------------------------------
 # Custom pgvector retriever
 # ---------------------------------------------------------------------------
@@ -189,6 +212,9 @@ def build_chain(pool):
             return {"answer": answer, "sources": []}
 
         # Step 1: rephrase follow-ups into standalone questions
+        #For concerns queries we strip the survey tag before rephrasing so the LLM doesn't get confused by the "__User concerns:__" prefix.
+        clean_input = user_input.replace("__User concerns:__", "").strip()
+
         if chat_history:
             standalone_q = await rephrase_chain.ainvoke({
                 "input": user_input,
@@ -213,12 +239,22 @@ def build_chain(pool):
                 "score": round(doc.metadata.get("score", 0), 4),
             })
 
-        # Step 4: generate answer with citations
-        answer = await qa_chain.ainvoke({
-            "context": _format_docs(docs),
-            "input": user_input,
-            "chat_history": chat_history,
-        }, run_config)
+        # Step 4: generate answer with citations user concerns prompt if category is concern
+        #Otherwise use the standard QA prompt
+
+        if query_category == "concerns":
+            logger.info("Concerns query — using Rumor Control system prompt")
+            answer = await concerns_chain.ainvoke({
+                "context": _format_docs(docs),
+                "input": clean_input,
+                "chat_history": chat_history,
+            }, run_config)
+        else:
+          answer = await qa_chain.ainvoke({
+              "context": _format_docs(docs),
+              "input": user_input,
+              "chat_history": chat_history,
+          }, run_config)
 
         answer = _replace_source_refs(answer, sources)
 
