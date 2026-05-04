@@ -113,23 +113,22 @@ def classify_page(result: dict) -> dict:
         page_class = 'prose'
         confidence = 'medium'
 
-    # --- 5. Table / data pages ---
-    elif any(s in combined for s in TABLE_SIGNALS):
-        page_class = 'table_data'
-        confidence = 'high'
-
-    # --- 6. Actual online forms (URL-path-based only) ---
-    elif any(p in path for p in FORM_URL_PATHS) or domain.startswith('voterservices'):
-        page_class = 'form'
-        confidence = 'high'
-
-    # --- 7. Short static pages (known URL patterns) ---
-    elif any(s in combined for s in SHORT_STATIC_SIGNALS):
-        page_class = 'short_static'
-        confidence = 'high'
+    # --- 5–7: BoE-specific signals (not applied to MoCo — avoids cross-domain
+    #          false positives from shared keywords like 'contact', 'title') ---
+    elif domain == 'elections.maryland.gov':
+        if any(s in combined for s in TABLE_SIGNALS):
+            page_class = 'table_data'
+            confidence = 'high'
+        elif any(p in path for p in FORM_URL_PATHS) or domain.startswith('voterservices'):
+            page_class = 'form'
+            confidence = 'high'
+        elif any(s in combined for s in SHORT_STATIC_SIGNALS):
+            page_class = 'short_static'
+            confidence = 'high'
 
     # --- 8. Structural HTML detection (medium confidence) ---
-    elif raw_html:
+    # Separate if — not elif — so it runs for any domain when signals above didn't fire.
+    if page_class is None and raw_html:
         structural = _detect_structural_patterns(raw_html)
         if structural:
             page_class = structural

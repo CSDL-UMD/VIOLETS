@@ -15,11 +15,14 @@ import logging
 import os
 import time
 from collections import deque
+from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
 
 from .config import (
     SEED_URL,
+    SEED_URLS,
     DOMAIN,
+    DOMAINS,
     RATE_LIMIT_SECONDS,
     MAX_DEPTH,
     LOG_DIR,
@@ -108,10 +111,11 @@ def run_crawl(resume: bool = True):
     db = DB()
     db.init_schema()
 
-    # --- robots.txt ---
-    robots = None
+    # --- robots.txt (one parser per domain) ---
+    robots_map: dict[str, RobotFileParser | None] = {}
     if RESPECT_ROBOTS_TXT:
-        robots = _load_robots(DOMAIN)
+        for d in DOMAINS:
+            robots_map[d] = _load_robots(d)
 
     # --- Resume or fresh start ---
     pending = db.get_pending() if resume else []
@@ -120,21 +124,20 @@ def run_crawl(resume: bool = True):
         logger.info("Resuming crawl with %d pending URLs", len(pending))
         queue = deque((row['url'], row['parent_url'], row['depth']) for row in pending)
         visited = db.get_all_visited_urls()
-        # Find or create a run record
-        run_id = db.start_run(f"{SEED_URL} (resumed)")
+        run_id = db.start_run(f"multi-domain resumed ({len(SEED_URLS)} seeds)")
     else:
-        logger.info("Starting fresh crawl from %s", SEED_URL)
-        run_id = db.start_run(SEED_URL)
+        logger.info("Starting fresh crawl from %d seed URLs", len(SEED_URLS))
+        run_id = db.start_run(f"multi-domain ({len(SEED_URLS)} seeds)")
         queue = deque()
         visited = set()
 
-        excluded, reason = should_exclude(SEED_URL)
-        if excluded:
-            logger.error("Seed URL excluded: %s", reason)
-            return
-
-        db.add_page(url=SEED_URL, parent_url=None, depth=0)
-        queue.append((SEED_URL, None, 0))
+        for seed_url in SEED_URLS:
+            excluded, reason = should_exclude(seed_url)
+            if excluded:
+                logger.error("Seed URL excluded: %s — %s", seed_url, reason)
+                continue
+            db.add_page(url=seed_url, parent_url=None, depth=0)
+            queue.append((seed_url, None, 0))
 
     rate_monitor = RateMonitor(REQUESTS_PER_MINUTE_WARN)
     pages_crawled = 0
@@ -159,8 +162,9 @@ def run_crawl(resume: bool = True):
             visited.add(url)
             continue
 
-        # Gate 3: robots.txt
-        if robots and not robots.can_fetch('*', url):
+        # Gate 3: robots.txt — look up parser by domain
+        _robots = robots_map.get(urlparse(url).netloc)
+        if _robots and not _robots.can_fetch('*', url):
             logger.info("ROBOTS.TXT blocked: %s", url)
             db.update_status(url, 'excluded', reason='robots.txt')
             visited.add(url)
