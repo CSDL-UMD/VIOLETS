@@ -115,20 +115,20 @@ def classify_page(result: dict) -> dict:
         page_class = 'location_list'
         confidence = 'high'
 
-    # --- 5. Prose: long-form informational pages (any domain) ---
-    elif word_count >= 500:
-        page_class = 'prose'
-        confidence = 'medium'
-
-    # --- 6. Table data signals ---
+    # --- 5. Table data signals (URL-path based, takes priority over prose) ---
     elif any(s in combined for s in TABLE_SIGNALS):
         page_class = 'table_data'
         confidence = 'high'
 
-    # --- 7. Form signals ---
+    # --- 6. Form signals (URL-path based) ---
     elif any(p in path for p in FORM_URL_PATHS) or domain.startswith('voterservices'):
         page_class = 'form'
         confidence = 'high'
+
+    # --- 7. Prose: long-form informational pages (any domain) ---
+    elif word_count >= 500:
+        page_class = 'prose'
+        confidence = 'medium'
 
     # --- 8. Short static signals ---
     elif any(s in combined for s in SHORT_STATIC_SIGNALS):
@@ -143,7 +143,7 @@ def classify_page(result: dict) -> dict:
             page_class = structural
             confidence = 'medium'
 
-    # --- 9. Word-count fallbacks ---
+    # --- 10. Word-count fallbacks ---
     if page_class is None:
         if word_count >= 150:
             page_class = 'nav_hub'
