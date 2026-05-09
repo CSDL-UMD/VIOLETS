@@ -197,6 +197,7 @@ def build_chain(pool):
     rephrase_chain = _CONTEXTUALIZE_PROMPT | llm | StrOutputParser()
     qa_chain = _QA_PROMPT | llm | StrOutputParser()
     conversational_chain = _CONVERSATIONAL_PROMPT | llm | StrOutputParser()
+    concerns_chain = _CONCERNS_PROMPT | llm | StrOutputParser()
 
     async def full_pipeline(inputs: dict, run_config: RunnableConfig | None = None) -> dict:
         chat_history = inputs.get("chat_history", [])

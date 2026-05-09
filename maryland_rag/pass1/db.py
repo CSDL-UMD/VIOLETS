@@ -162,6 +162,13 @@ class DB:
             WHERE content_hash IS NOT NULL
         """)
         self.conn.commit()
+    
+    def is_first_run(self) -> bool:
+      """Return True if no pages have been crawled yet (no content hashes exist)."""
+      row = self.conn.execute(
+          "SELECT 1 FROM pages WHERE content_hash IS NOT NULL LIMIT 1"
+      ).fetchone()
+      return row is None
 
     # ---- Link operations ----
 
