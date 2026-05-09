@@ -164,11 +164,11 @@ class DB:
         self.conn.commit()
     
     def is_first_run(self) -> bool:
-      """Return True if no pages have been crawled yet (no content hashes exist)."""
-      row = self.conn.execute(
-          "SELECT 1 FROM pages WHERE content_hash IS NOT NULL LIMIT 1"
-      ).fetchone()
-      return row is None
+        """Return True if no pages have been crawled yet (no content hashes exist)."""
+        row = self.conn.execute(
+            "SELECT 1 FROM pages WHERE content_hash IS NOT NULL LIMIT 1"
+        ).fetchone()
+        return row is None
 
     # ---- Link operations ----
 
@@ -229,12 +229,14 @@ class DB:
         ).fetchall()
 
     def get_changed_pages(self) -> list:
-        """Pages whose content changed since last crawl."""
+        """Pages that are new or whose content changed since last crawl."""
         return self.conn.execute("""
             SELECT * FROM pages
             WHERE crawl_status = 'crawled'
-              AND previous_content_hash IS NOT NULL
-              AND content_hash != previous_content_hash
+              AND (
+                previous_content_hash IS NULL
+                OR content_hash != previous_content_hash
+              )
         """).fetchall()
 
     def get_duplicate_hashes(self) -> list:

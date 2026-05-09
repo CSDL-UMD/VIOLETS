@@ -2,8 +2,8 @@
 Chunk metadata assembly for vector store ingestion.
 Every chunk carries full provenance regardless of strategy.
 """
+import hashlib
 import json
-import uuid
 from datetime import datetime, timezone
 
 
@@ -41,8 +41,11 @@ def build_chunk_metadata(
         except (json.JSONDecodeError, TypeError):
             section_hierarchy = []
 
+    raw = f"{source_url}:{chunk_index}"
+    chunk_id = hashlib.sha256(raw.encode()).hexdigest()[:32]
+
     chunk = {
-        'chunk_id': str(uuid.uuid4()),
+        'chunk_id': chunk_id,
         'source_url': source_url,
         'title': title,
         'section_hierarchy': section_hierarchy,
@@ -74,6 +77,9 @@ def build_chunk_metadata_multi_source(
     """
     Build chunk metadata for deduplicated content that exists at multiple URLs.
     The source_url field becomes a JSON array of all source URLs.
+
+    chunk_id is derived from the sorted URL set so it remains stable even if
+    the URL list order changes or a secondary URL disappears between runs.
     """
     chunk = build_chunk_metadata(
         source_url=source_urls[0],
@@ -85,5 +91,9 @@ def build_chunk_metadata_multi_source(
         chunk_total=chunk_total,
         text=text,
     )
+    # Override chunk_id with one derived from the full sorted URL set
+    stable_key = ':'.join(sorted(source_urls))
+    raw = f"{stable_key}:{chunk_index}"
+    chunk['chunk_id'] = hashlib.sha256(raw.encode()).hexdigest()[:32]
     chunk['source_urls'] = source_urls
     return chunk

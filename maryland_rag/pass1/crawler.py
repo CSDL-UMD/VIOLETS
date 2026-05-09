@@ -19,9 +19,7 @@ from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
 
 from .config import (
-    SEED_URL,
     SEED_URLS,
-    DOMAIN,
     DOMAINS,
     RATE_LIMIT_SECONDS,
     MAX_DEPTH,
@@ -106,7 +104,7 @@ def run_crawl(resume: bool = True):
 
     Args:
         resume: If True and there are pending rows in the DB, resume from them
-                instead of re-seeding from SEED_URL.
+                instead of re-seeding from SEED_URLS.
     """
     db = DB()
     db.init_schema()
@@ -225,11 +223,11 @@ def run_crawl(resume: bool = True):
                     db.add_page(url=norm, parent_url=url, depth=depth + 1)
                     queue.append((norm, url, depth + 1))
 
-            time.sleep(RATE_LIMIT_SECONDS)
-
         except Exception as exc:
             logger.error("Exception on %s: %s", url, exc, exc_info=True)
             db.update_status(url, 'failed')
+        finally:
+            time.sleep(RATE_LIMIT_SECONDS)
 
     # --- Finalize ---
     db.finalize_run(run_id)

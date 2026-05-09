@@ -1,15 +1,22 @@
 """
-Chunk local PDF/DOCX files from the needtochunk/ folder.
+DEPRECATED: Use `python -m box_ingest.ingest` instead.
 
-Walks the folder recursively, extracts text from each document, and appends
-chunks to data/chunks.jsonl. Bypasses the manifest DB and HTTP cache entirely
-so it works on arbitrary local files.
+This script has been superseded by box_ingest/ingest.py, which provides:
+  - Proper Box share URLs (instead of local:// paths)
+  - Deterministic SHA256 chunk IDs (no duplicates on re-run)
+  - OCR fallback for scanned PDFs
 
-Usage:
-    python -m maryland_rag.scripts.chunk_local_files
-    python -m maryland_rag.scripts.chunk_local_files --input needtochunk --output data/chunks.jsonl
-    python -m maryland_rag.scripts.chunk_local_files --overwrite
+Running this script alongside box_ingest on the same needtochunk/ folder
+produces duplicate chunks with mismatched source URLs in the vector DB.
 """
+import sys
+print(
+    "ERROR: chunk_local_files.py is deprecated.\n"
+    "Use 'python -m box_ingest.ingest' instead.\n"
+    "See box_ingest/ingest.py for details."
+)
+sys.exit(1)
+
 import argparse
 import io
 import json

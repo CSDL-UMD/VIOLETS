@@ -10,9 +10,8 @@ Improvements over original design:
 - press_room/* treated as press_release, not form.
 - classification_confidence: 'high' for URL/structural matches, 'medium' for
   word-count-based fallbacks, 'low' for final default.
-- Gates BoE-specific keyword signals to elections.maryland.gov domain only.
-- Adds MoCo domain block for mcg.montgomerycountymd.gov with location_list
-  class for drop box and early voting pages.
+- TABLE_SIGNALS, FORM_URL_PATHS, SHORT_STATIC_SIGNALS applied to all domains.
+- Adds MoCo location_list class for drop box and early voting pages.
 """
 import re
 
@@ -109,35 +108,34 @@ def classify_page(result: dict) -> dict:
         page_class = 'press_release'
         confidence = 'high'
 
-    # --- 4. Prose: long-form informational pages ---
-    # Run before table/form so high-word-count pages don't get mis-routed by
-    # incidental keyword matches.
+    # --- 4. MoCo location pages (path-based, high confidence) ---
+    # Only the specific location-list paths are caught here; other MoCo pages
+    # (vote-by-mail, accessibility, etc.) fall through to prose/nav_hub below.
+    elif domain == 'mcg.montgomerycountymd.gov' and ('earlyvotin' in path or 'dropbox' in path):
+        page_class = 'location_list'
+        confidence = 'high'
+
+    # --- 5. Prose: long-form informational pages (any domain) ---
     elif word_count >= 500:
         page_class = 'prose'
         confidence = 'medium'
 
-    # --- 5–7: BoE-specific signals (not applied to MoCo — avoids cross-domain
-    #          false positives from shared keywords like 'contact', 'title') ---
-    elif domain == 'elections.maryland.gov':
-        if any(s in combined for s in TABLE_SIGNALS):
-            page_class = 'table_data'
-            confidence = 'high'
-        elif any(p in path for p in FORM_URL_PATHS) or domain.startswith('voterservices'):
-            page_class = 'form'
-            confidence = 'high'
-        elif any(s in combined for s in SHORT_STATIC_SIGNALS):
-            page_class = 'short_static'
-            confidence = 'high'
+    # --- 6. Table data signals ---
+    elif any(s in combined for s in TABLE_SIGNALS):
+        page_class = 'table_data'
+        confidence = 'high'
 
-    # --- 5b. MoCo-specific signals ---
-    # Only fires for mcg.montgomerycountymd.gov pages that weren't already
-    elif domain == 'mcg.montgomerycountymd.gov':
-        if 'earlyvotin' in path or 'dropbox' in path:
-            page_class = 'location_list'
-            confidence = 'high'
-        
+    # --- 7. Form signals ---
+    elif any(p in path for p in FORM_URL_PATHS) or domain.startswith('voterservices'):
+        page_class = 'form'
+        confidence = 'high'
 
-    # --- 8. Structural HTML detection (medium confidence) ---
+    # --- 8. Short static signals ---
+    elif any(s in combined for s in SHORT_STATIC_SIGNALS):
+        page_class = 'short_static'
+        confidence = 'high'
+
+    # --- 9. Structural HTML detection (medium confidence) ---
     # Separate if — not elif — so it runs for any domain when signals above didn't fire.
     if page_class is None and raw_html:
         structural = _detect_structural_patterns(raw_html)

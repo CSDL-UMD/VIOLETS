@@ -2,13 +2,19 @@
 Maryland Elections RAG Pipeline entry point.
 
 Usage:
-    python -m maryland_rag pass1              # Run Pass 1 crawl
-    python -m maryland_rag pass1 --resume     # Resume interrupted Pass 1
-    python -m maryland_rag pass2              # Run Pass 2 chunking
+    python -m maryland_rag pass1              # Run Pass 1 crawl (BoE + MoCo)
+    python -m maryland_rag pass1 --no-resume  # Start fresh instead of resuming
+    python -m maryland_rag pass2              # Run Pass 2 chunking (all pages)
     python -m maryland_rag pass2 --changed    # Only re-chunk changed pages
-    python -m maryland_rag audit              # Print manifest audit queries
-    python -m maryland_rag all                # Run all passes, updates with any new links
-    
+    python -m maryland_rag pass3              # Embed chunks and insert into pgvector
+    python -m maryland_rag pass3 --resume     # Skip already-embedded chunk IDs
+    python -m maryland_rag audit              # Print manifest audit report
+    python -m maryland_rag all                # Full pipeline end-to-end:
+                                              #   pass1 → pass2 → box_ingest → pass3 (web) → pass3 (box)
+                                              #   First run: processes everything
+                                              #   Subsequent runs: only changed/new pages re-chunked;
+                                              #   pass3 always upserts (resume=False) so changed
+                                              #   content is never skipped in the vector DB
 """
 import argparse
 import sys
@@ -35,8 +41,7 @@ def main():
     # All Passes
     all = subparsers.add_parser('all', help='Run all passes sequentially, resuming from previous runs')
 
-    all.add_argument('--output', default='data/chunks.jsonl', help='Output JSONL path')
-    all.add_argument('--chunks', default='data/chunks.jsonl', help='Path to chunks JSONL')
+    all.add_argument('--output', default='data/chunks.jsonl', help='Output JSONL path for web chunks')
 
     # Audit
     subparsers.add_parser('audit', help='Print manifest audit report')
@@ -73,8 +78,16 @@ def main():
         chunks = run_pass2(only_changed=not first_run, output_path=args.output)
         print(f"Produced {len(chunks)} chunks → {args.output}")
 
-        n = run_embed(chunks_path=args.output, resume=not first_run)
-        print(f"Inserted {n} vectors into pgvector")
+        from box_ingest.ingest import run_ingest, DEFAULT_OUTPUT as BOX_OUTPUT
+        box_chunks = run_ingest()
+        print(f"Box ingest: {len(box_chunks)} chunks")
+
+        n = run_embed(chunks_path=args.output, resume=False)
+        print(f"Inserted {n} web vectors into pgvector")
+
+        if box_chunks:
+            n_box = run_embed(chunks_path=str(BOX_OUTPUT), resume=False)
+            print(f"Inserted {n_box} Box vectors into pgvector")
 
     elif args.command == 'audit':
         _run_audit()

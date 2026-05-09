@@ -241,6 +241,19 @@ def _extract_document(url: str, content_type: str, needs_ocr: int) -> list:
                         'text': sc,
                         'heading_chain': heading_chain,
                     })
+
+        # Also chunk any tables extracted from the DOCX
+        for table in result.get('tables', []):
+            headers = table.get('headers', [])
+            for row in table.get('rows', []):
+                if headers and len(row) == len(headers):
+                    pairs = [f"{h}: {v}" for h, v in zip(headers, row) if v]
+                    row_text = ' | '.join(pairs)
+                else:
+                    row_text = ' | '.join(str(c) for c in row if c)
+                if row_text.strip():
+                    all_chunks.append({'text': row_text})
+
         return all_chunks
 
     elif content_type in ('xls', 'xlsx', 'csv'):
