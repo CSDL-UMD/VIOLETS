@@ -10,6 +10,9 @@ Improvements over original design:
 - press_room/* treated as press_release, not form.
 - classification_confidence: 'high' for URL/structural matches, 'medium' for
   word-count-based fallbacks, 'low' for final default.
+- Gates BoE-specific keyword signals to elections.maryland.gov domain only.
+- Adds MoCo domain block for mcg.montgomerycountymd.gov with location_list
+  class for drop box and early voting pages.
 """
 import re
 
@@ -126,6 +129,14 @@ def classify_page(result: dict) -> dict:
             page_class = 'short_static'
             confidence = 'high'
 
+    # --- 5b. MoCo-specific signals ---
+    # Only fires for mcg.montgomerycountymd.gov pages that weren't already
+    elif domain == 'mcg.montgomerycountymd.gov':
+        if 'earlyvotin' in path or 'dropbox' in path:
+            page_class = 'location_list'
+            confidence = 'high'
+        
+
     # --- 8. Structural HTML detection (medium confidence) ---
     # Separate if — not elif — so it runs for any domain when signals above didn't fire.
     if page_class is None and raw_html:
@@ -226,6 +237,9 @@ def _assign_strategy(page_class: str, word_count: int) -> str:
 
     if page_class == 'prose':
         return 'semantic_with_overlap'
+    
+    if page_class == 'location_list':
+        return 'ingest_as_single'
 
     if page_class in ('nav_hub', 'short_static'):
         return 'ingest_as_single'

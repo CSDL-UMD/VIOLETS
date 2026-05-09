@@ -61,13 +61,19 @@ def main():
         from .pass1.crawler import run_crawl
         from .pass2.chunker import run_pass2
         from .pass3.embed import run_embed
+        from .pass1.db import DB
 
-        run_crawl(resume = False)
+        db = DB()
+        first_run = db.is_first_run()
+        db.snapshot_hashes_for_recrawl()
+        db.close()
 
-        chunks = run_pass2(only_changed= True, output_path=args.output)
+        run_crawl(resume=False)
+
+        chunks = run_pass2(only_changed=not first_run, output_path=args.output)
         print(f"Produced {len(chunks)} chunks → {args.output}")
 
-        n = run_embed(resume=True)
+        n = run_embed(chunks_path=args.output, resume=not first_run)
         print(f"Inserted {n} vectors into pgvector")
 
     elif args.command == 'audit':
