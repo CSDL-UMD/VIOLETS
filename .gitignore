@@ -224,3 +224,4 @@ data/chunks.jsonl
 data/chunks.checkpoint
 data/raw/
 logs/venv/
+logs/chat_logs.db
