@@ -93,6 +93,9 @@ LOG_QUERIES: bool = True    # log raw user query in log_request()
 # ---------------------------------------------------------------------------
 
 _COST_TABLE: dict[str, tuple[float, float]] = {
+    "gpt-5-nano":           (0.05,  0.40),
+    "gpt-5-mini":           (0.25,  2.00),
+    "gpt-5":                (1.25, 10.00),
     "gpt-4o-mini":          (0.15,  0.60),
     "gpt-4o":               (5.00, 15.00),
     "gpt-4-turbo":          (10.0, 30.00),
@@ -103,7 +106,9 @@ _COST_FALLBACK = (0.0, 0.0)
 
 def _estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
     # Exact match first, then prefix match to handle versioned names like
-    # "gpt-4o-mini-2024-07-18" mapping to "gpt-4o-mini".
+    # "gpt-5-nano-2025-08-07" mapping to "gpt-5-nano". Table order matters
+    # for prefix matching — list more specific entries (gpt-5-nano) before
+    # less specific ones (gpt-5) so dated snapshots resolve correctly.
     rates = _COST_TABLE.get(model)
     if rates is None:
         rates = next(

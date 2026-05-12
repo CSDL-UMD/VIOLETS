@@ -189,9 +189,10 @@ def build_chain(pool):
 
     llm = ChatOpenAI(
         model=config.LLM_MODEL,
-        temperature=config.LLM_TEMPERATURE,
         openai_api_key=config.OPENAI_API_KEY,
         base_url=config.OPENAI_BASE_URL,
+        reasoning_effort="medium",
+        verbosity="low",
     )
 
     rephrase_chain = _CONTEXTUALIZE_PROMPT | llm | StrOutputParser()

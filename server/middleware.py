@@ -249,10 +249,11 @@ class ClassificationResult(BaseModel):
 # Build the classifier once at module load time, not on every request.
 _classifier_llm = (
     ChatOpenAI(
-        model="gpt-4o-mini",
-        temperature=0,  # deterministic output
+        model=config.LLM_MODEL,
         openai_api_key=config.OPENAI_API_KEY,
         base_url=config.OPENAI_BASE_URL,
+        reasoning_effort="medium",
+        verbosity="low",
     )
     .with_structured_output(ClassificationResult)
 )
@@ -382,10 +383,11 @@ class PartisanCheckResult(BaseModel):
 
 _partisan_checker_llm = (
     ChatOpenAI(
-        model="gpt-4o-mini",
-        temperature=0,
+        model=config.LLM_MODEL,
         openai_api_key=config.OPENAI_API_KEY,
         base_url=config.OPENAI_BASE_URL,
+        reasoning_effort="medium",
+        verbosity="low",
     )
     .with_structured_output(PartisanCheckResult)
 )

@@ -525,11 +525,11 @@ User query
 | Function | Purpose | Failure mode |
 |---|---|---|
 | `detect_pii(query, ctx)` | Scans user input for PII (SSN, credit card, email, phone, passport, driver's license) via Presidio | Hard block — returns canned response |
-| `classify_query(query, ctx)` | LLM-based structured classification (`normal` / `out_of_scope` / `partisan`) using `gpt-4o-mini` with structured output | Fail open — on error, allows query through |
+| `classify_query(query, ctx)` | LLM-based structured classification (`normal` / `out_of_scope` / `partisan`) using `gpt-5-nano` with structured output | Fail open — on error, allows query through |
 | `check_partisan_response(query, response, ...)` | LLM-based structured check for partisan bias in the generated answer; if flagged, retries the RAG chain with a stricter nonpartisan prompt appended | Fail open — on error, returns original response |
 | `detect_pii_in_response(response, ctx)` | Re-scans LLM output for PII before returning to user | Hard block — replaces response with fallback |
 
-The classifier and partisan checker use `gpt-4o-mini` with Pydantic structured output (`ClassificationResult`, `PartisanCheckResult`), independent of the main `LLM_MODEL` setting.
+The classifier and partisan checker share the same model as the main RAG chain (controlled by `LLM_MODEL`, default `gpt-5-nano`) with Pydantic structured output (`ClassificationResult`, `PartisanCheckResult`).
 
 **`rag_logger.py`** — LangChain `BaseCallbackHandler` that tracks LLM token usage, estimates cost per request (using a built-in cost table for OpenAI models), and logs retriever timing/doc counts. Optional prompt/response/query logging controlled by module-level flags (`LOG_PROMPTS`, `LOG_RESPONSES`, `LOG_QUERIES` — all `False` by default). Also provides `log_request()` for per-request summary logging.
 
@@ -544,8 +544,7 @@ All settings via environment variables (or `.env`):
 | `OPENAI_API_KEY` | (required) | OpenAI API key |
 | `DATABASE_URL` | (required) | PostgreSQL connection string (e.g. `postgresql://user:pass@localhost:5432/violets`) |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible API base URL |
-| `LLM_MODEL` | `gpt-4o-mini` | Chat model for RAG answers |
-| `LLM_TEMPERATURE` | `0.2` | Model temperature |
+| `LLM_MODEL` | `gpt-5-nano` | Chat model for RAG answers (GPT-5 family does not accept `temperature` or other sampling params) |
 | `RETRIEVER_K` | `5` | Number of chunks to retrieve |
 | `SESSION_TTL_MINUTES` | `30` | Session expiration |
 | `MAX_HISTORY_TURNS` | `20` | Max conversation turns kept |

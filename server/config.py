@@ -51,9 +51,11 @@ OPENAI_BASE_URL: str = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com
 # Configurable settings
 # ---------------------------------------------------------------------------
 
-# LLM — change via LLM_MODEL env var to swap models without code changes
-LLM_MODEL: str = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-LLM_TEMPERATURE: float = float(os.environ.get("LLM_TEMPERATURE", "0.2"))
+# LLM — change via LLM_MODEL env var to swap models without code changes.
+# GPT-5 family does not accept `temperature` or other sampling params, so we
+# no longer expose a temperature knob; if you swap to a sampling-class model
+# (e.g. gpt-4o-mini), pass temperature explicitly at the call site.
+LLM_MODEL: str = os.environ.get("LLM_MODEL", "gpt-5-nano")
 
 # Retrieval
 RETRIEVER_K: int = int(os.environ.get("RETRIEVER_K", "5"))
