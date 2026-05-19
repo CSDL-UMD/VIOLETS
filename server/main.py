@@ -165,7 +165,9 @@ async def lifespan(app: FastAPI):
         min_size=4,
         max_size=25,
         configure=lambda conn: register_vector(conn),
+        open=False,
     )
+    _pool.open()
 
     store = SessionStore(
         ttl_minutes=config.SESSION_TTL_MINUTES,
@@ -181,7 +183,7 @@ async def lifespan(app: FastAPI):
     yield
 
     cleanup_task.cancel()
-    _pool.close()
+    _pool.close(timeout=30)
 
 
 # ---------------------------------------------------------------------------

@@ -134,12 +134,17 @@ class PgVectorRetriever(BaseRetriever):
             meta["source_url"] = source_url or "unknown"
             meta["title"] = title or ""
             meta["score"] = round(score, 4)
-            logger.info(
+            logger.debug(
                 "  Retrieved [%.4f] %s — %s",
                 score, source_url, (text or "")[:80].replace("\n", " ")
             )
             docs.append(Document(page_content=text or "", metadata=meta))
         return docs
+
+    # TODO: implement _aget_relevant_documents using psycopg AsyncConnectionPool
+    # and an async embeddings call. BaseRetriever.ainvoke currently runs the
+    # sync method in a threadpool, which blocks one worker thread per
+    # concurrent request and caps throughput under load.
 
 
 # ---------------------------------------------------------------------------

@@ -22,10 +22,6 @@ from .strategies.pdf import extract_pdf
 from .strategies.docx_strategy import extract_docx
 from .strategies.xls_strategy import extract_xls
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(message)s',
-)
 logger = logging.getLogger(__name__)
 
 
@@ -305,5 +301,9 @@ def _write_jsonl(chunks: list[dict], path: str):
 
 
 if __name__ == '__main__':
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(message)s',
+    )
     chunks = run_pass2(output_path='data/chunks.jsonl')
     print(f"Produced {len(chunks)} chunks")

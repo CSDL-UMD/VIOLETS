@@ -89,12 +89,19 @@ def semantic_chunk(text: str) -> list[str]:
         if chunk_text:
             chunks.append(chunk_text)
 
-    # Final safety: hard-split any chunk still exceeding the char cap
+    # Final safety: hard-split any chunk still exceeding the char cap.
+    # Hitting this branch usually means OCR garbage or whitespace-free
+    # junk upstream — log it so the source can be cleaned.
     safe = []
     for c in chunks:
         if len(c) <= MAX_CHUNK_CHARS:
             safe.append(c)
         else:
+            logger.warning(
+                "semantic_chunk: hard-splitting %d-char chunk at %d-char boundaries "
+                "(likely OCR/CID stream — check upstream extraction)",
+                len(c), MAX_CHUNK_CHARS,
+            )
             for j in range(0, len(c), MAX_CHUNK_CHARS):
                 safe.append(c[j:j + MAX_CHUNK_CHARS])
     return safe

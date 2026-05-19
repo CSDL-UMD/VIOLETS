@@ -36,20 +36,6 @@ from .classifier import classify_page
 from .exclusions import should_exclude, is_excluded_status
 from .utils import normalize_url, is_internal, get_content_type
 
-# ---------------------------------------------------------------------------
-# Logging setup
-# ---------------------------------------------------------------------------
-
-os.makedirs(LOG_DIR, exist_ok=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(),
-    ]
-)
 logger = logging.getLogger(__name__)
 
 
@@ -249,4 +235,13 @@ def _save_raw_html(url: str, html: str):
 
 
 if __name__ == '__main__':
+    os.makedirs(LOG_DIR, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(message)s',
+        handlers=[
+            logging.FileHandler(LOG_FILE),
+            logging.StreamHandler(),
+        ],
+    )
     run_crawl()

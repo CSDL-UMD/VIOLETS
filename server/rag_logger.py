@@ -66,6 +66,7 @@ And check the uvicorn terminal to see the logs
 """
 
 import logging
+import threading
 import time
 from typing import Any
 from uuid import UUID
@@ -140,6 +141,10 @@ class RAGCallbackHandler(BaseCallbackHandler):
     def __init__(self):
         self._llm_starts: dict[str, tuple[float, str]] = {}  # run_id → (start_time, model)
         self._ret_starts: dict[str, float] = {}               # run_id → start_time
+        # LangChain's threadpool-backed retriever can fire callbacks from
+        # worker threads concurrently with the event loop, so guard the
+        # bookkeeping dicts with a lock.
+        self._lock = threading.Lock()
 
     # ---- LLM events ----
 
@@ -157,7 +162,8 @@ class RAGCallbackHandler(BaseCallbackHandler):
             or serialized.get("name", "unknown")
         )
         key = str(run_id)
-        self._llm_starts[key] = (time.time(), model)
+        with self._lock:
+            self._llm_starts[key] = (time.time(), model)
 
         if LOG_PROMPTS:
             for i, message_group in enumerate(messages):
@@ -184,7 +190,8 @@ class RAGCallbackHandler(BaseCallbackHandler):
             or serialized.get("name", "unknown")
         )
         key = str(run_id)
-        self._llm_starts[key] = (time.time(), model)
+        with self._lock:
+            self._llm_starts[key] = (time.time(), model)
 
         if LOG_PROMPTS:
             for i, prompt in enumerate(prompts):
@@ -201,7 +208,8 @@ class RAGCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         key = str(run_id)
-        start, model = self._llm_starts.pop(key, (time.time(), "unknown"))
+        with self._lock:
+            start, model = self._llm_starts.pop(key, (time.time(), "unknown"))
         elapsed = time.time() - start
 
         if LOG_RESPONSES:
@@ -237,7 +245,8 @@ class RAGCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         key = str(run_id)
-        self._llm_starts.pop(key, None)
+        with self._lock:
+            self._llm_starts.pop(key, None)
         logger.error("LLM ERROR [run=%s]: %s", key[:8], error)
 
     # ---- Retriever events ----
@@ -251,7 +260,8 @@ class RAGCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         key = str(run_id)
-        self._ret_starts[key] = time.time()
+        with self._lock:
+            self._ret_starts[key] = time.time()
         logger.info("RETRIEVER START [run=%s]: %r", key[:8], query)
 
     def on_retriever_end(
@@ -262,7 +272,9 @@ class RAGCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         key = str(run_id)
-        elapsed = time.time() - self._ret_starts.pop(key, time.time())
+        with self._lock:
+            start = self._ret_starts.pop(key, time.time())
+        elapsed = time.time() - start
         logger.info(
             "RETRIEVER END [run=%s] (%.2fs): %d docs",
             key[:8], elapsed, len(documents),

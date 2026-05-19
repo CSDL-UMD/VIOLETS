@@ -17,10 +17,26 @@ Usage:
                                               #   content is never skipped in the vector DB
 """
 import argparse
+import logging
+import os
 import sys
 
 
+def _configure_logging():
+    from .pass1.config import LOG_DIR, LOG_FILE
+    os.makedirs(LOG_DIR, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(message)s',
+        handlers=[
+            logging.FileHandler(LOG_FILE),
+            logging.StreamHandler(),
+        ],
+    )
+
+
 def main():
+    _configure_logging()
     parser = argparse.ArgumentParser(description='Maryland Elections RAG Pipeline')
     subparsers = parser.add_subparsers(dest='command', help='Pipeline pass to run')
 

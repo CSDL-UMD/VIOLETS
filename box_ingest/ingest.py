@@ -37,7 +37,6 @@ from pathlib import Path
 OCR_DPI = 250
 SHORT_DOC_WORDS = 150
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -300,6 +299,7 @@ def run_ingest(dry_run: bool = False, output_path: Path | None = None) -> list[d
 
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     parser = argparse.ArgumentParser()
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--output', type=Path, default=None)
