@@ -304,6 +304,7 @@ async def chat(req: ChatRequest):
         chat_history=chat_history,
         chain=chain,
         ctx=ctx,
+        callbacks=[_rag_callback] if _rag_callback else None,
     )
     if new_sources is not None:
         sources = [SourceReference(**s) for s in new_sources]

@@ -228,7 +228,20 @@ def _probe_pdf_text_extractable(url: str) -> bool:
             headers={'Range': f'bytes=0-{PDF_PROBE_BYTES}'},
             stream=True,
         )
-        chunk = resp.content
+        try:
+            # If the server honored the Range request we'll see 206 Partial
+            # Content; anything else (200 OK from a CDN that ignores Range,
+            # 4xx/5xx errors) means resp.content would download the full
+            # PDF, so read just one chunk and discard the rest.
+            if resp.status_code == 206:
+                chunk = resp.content
+            else:
+                chunk = next(
+                    resp.iter_content(chunk_size=PDF_PROBE_BYTES),
+                    b'',
+                )
+        finally:
+            resp.close()
 
         # Look for text stream markers in PDF binary
         # /Type /Page + stream content with text operators (Tj, TJ, Tf)

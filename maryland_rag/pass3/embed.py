@@ -157,12 +157,6 @@ def _setup_pgvector(database_url: str):
             metadata   JSONB DEFAULT '{{}}'::jsonb
         )
     """)
-    # Index for fast approximate nearest-neighbor search
-    conn.execute("""
-        CREATE INDEX IF NOT EXISTS chunks_embedding_idx
-        ON chunks USING ivfflat (embedding vector_cosine_ops)
-        WITH (lists = 100)
-    """)
     conn.commit()
     logger.info("pgvector table 'chunks' is ready (dim=%d).", EMBED_DIM)
     return conn

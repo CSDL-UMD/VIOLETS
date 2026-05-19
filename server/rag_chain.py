@@ -205,8 +205,8 @@ def build_chain(pool):
         user_input = inputs["input"]
         query_category = inputs.get("query_category")
 
-        if query_category == "conversational" and chat_history:
-            logger.info("Conversational query — answering from chat history")
+        if query_category == "conversational":
+            logger.info("Conversational query — answering without retrieval")
             answer = await conversational_chain.ainvoke({
                 "input": user_input,
                 "chat_history": chat_history,

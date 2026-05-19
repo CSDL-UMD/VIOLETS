@@ -69,6 +69,12 @@ def main():
         from .pass1.db import DB
 
         db = DB()
+        # INVARIANT: first_run must be captured BEFORE snapshot_hashes_for_recrawl().
+        # is_first_run() returns True only when no content hashes exist; once the
+        # snapshot runs, previous_content_hash is populated and the question
+        # becomes meaningless. The captured value is then passed to pass2 as
+        # only_changed=not first_run so a first-ever run chunks everything and
+        # subsequent runs only re-chunk pages whose content actually changed.
         first_run = db.is_first_run()
         db.snapshot_hashes_for_recrawl()
         db.close()

@@ -58,8 +58,15 @@ def build_chunk_metadata(
         'date_extracted': datetime.now(timezone.utc).isoformat(),
     }
 
+    # Strategies emit chunk dicts that may carry strategy-specific fields
+    # (e.g. FAQ pairs include 'question'/'answer'; DOCX sections include
+    # 'heading_chain'). Restrict the merge to an allowlist so a strategy
+    # can never overwrite the canonical chunk_id / chunk_index / text /
+    # word_count values computed above.
     if extra:
-        chunk.update(extra)
+        for key in ("question", "answer", "heading_chain", "table_index", "row_index"):
+            if key in extra:
+                chunk[key] = extra[key]
 
     return chunk
 

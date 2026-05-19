@@ -73,6 +73,7 @@ async def test_same_user_concurrent():
         resp = await client.post(
             f"{BASE}/chat",
             json={"user_id": "race-user", "query": "What did I just ask you about?"},
+            headers=AUTH_HEADERS,
             timeout=TIMEOUT,
         )
         record(
@@ -101,6 +102,7 @@ async def test_malformed_inputs():
         resp = await client.post(
             f"{BASE}/chat",
             json={"query": "test"},
+            headers=AUTH_HEADERS,
             timeout=TIMEOUT,
         )
         record(
@@ -112,6 +114,7 @@ async def test_malformed_inputs():
         resp = await client.post(
             f"{BASE}/chat",
             json={"user_id": "test"},
+            headers=AUTH_HEADERS,
             timeout=TIMEOUT,
         )
         record(
@@ -123,7 +126,7 @@ async def test_malformed_inputs():
         resp = await client.post(
             f"{BASE}/chat",
             content=b"",
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **AUTH_HEADERS},
             timeout=TIMEOUT,
         )
         record(
@@ -135,7 +138,7 @@ async def test_malformed_inputs():
         resp = await client.post(
             f"{BASE}/chat",
             content=b"this is not json",
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **AUTH_HEADERS},
             timeout=TIMEOUT,
         )
         record(

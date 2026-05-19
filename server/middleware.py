@@ -422,6 +422,7 @@ async def check_partisan_response(
     chat_history: list,
     chain,
     ctx: QueryContext,
+    callbacks: list | None = None,
 ) -> tuple[str, list | None]:
     """
     Check the RAG chain's response for partisan content, retrying up to
@@ -471,10 +472,14 @@ async def check_partisan_response(
                     ctx.user_id,
                     attempt,
                 )
-                retry_result = await chain.ainvoke({
-                    "input": query + "\n\n" + _STRICT_NONPARTISAN_RETRY_PROMPT,
-                    "chat_history": chat_history,
-                })
+                retry_result = await chain.ainvoke(
+                    {
+                        "input": query + "\n\n" + _STRICT_NONPARTISAN_RETRY_PROMPT,
+                        "chat_history": chat_history,
+                        "query_category": ctx.query_category,
+                    },
+                    config={"callbacks": callbacks} if callbacks else None,
+                )
                 if isinstance(retry_result, dict):
                     current_response = str(retry_result.get("answer", retry_result))
                     current_sources = retry_result.get("sources")
