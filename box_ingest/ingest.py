@@ -1,30 +1,19 @@
 """
-Box materials ingestion pipeline.
+Box materials ingestion pipeline — Step 2 of 2.
 
-Everything in needtochunk/ is assumed pre-selected. This script:
-  1. Walks all files in needtochunk/ (recursively)
-  2. Looks up the Box share URL from url_manifest.json
-  3. Extracts text:
-       PDF  → pdfplumber → pymupdf → OCR (tesseract, for scanned PDFs)
-       DOCX → heading-aware section extraction
-       TXT  → plain read
-  4. Chunks the text:
-       DOCX with headings → each section chunked independently, heading chain
-                            stored in section_hierarchy
-       Short docs (≤150 words) → ingest_as_single
-       Long docs              → semantic_chunk with paragraph fallback
-  5. Assigns deterministic SHA256 chunk IDs (stable across re-runs)
-  6. Writes data/box_chunks.jsonl in pass2-compatible format for pass3
+Run:
+    box_ingest.automate 
+to download files into needtochunk/.
 
-Files with no Box URL in the manifest are skipped with a warning.
-Re-running is safe: same content produces the same chunk_id, so pass3
-upserts are no-ops for unchanged files.
+Then run this script to process them into chunks for the database:
+  1. Reads every file in needtochunk/
+  2. Extracts the text (PDF, DOCX, or TXT)
+  3. Splits the text into chunks
+  4. Writes data/box_chunks.jsonl for the database (Pass 3)
 
 Usage:
-    DOWNLOAD requirements in venv if you haven't already
-    playwright install chromium
     python -m box_ingest.ingest
-    python -m box_ingest.ingest --dry-run        # preview manifest mappings
+    python -m box_ingest.ingest --dry-run        # preview only, no output written
     python -m box_ingest.ingest --output data/box_chunks.jsonl
 """
 import argparse
