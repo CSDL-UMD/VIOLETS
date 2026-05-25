@@ -2,7 +2,8 @@
 Box materials ingestion pipeline — Step 2 of 2.
 
 Run:
-    box_ingest.automate 
+    python -m box_ingest.automate                 #includes ingestion (WHICH ALSO INCLUDES CHUNKING)
+    python -m box_ingest.automate --no-ingest     #no chunking, run .ingest after to chunk
 to download files into needtochunk/.
 
 Then run this script to process them into chunks for the database:
