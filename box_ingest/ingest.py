@@ -21,6 +21,8 @@ Re-running is safe: same content produces the same chunk_id, so pass3
 upserts are no-ops for unchanged files.
 
 Usage:
+    DOWNLOAD requirements in venv if you haven't already
+    playwright install chromium
     python -m box_ingest.ingest
     python -m box_ingest.ingest --dry-run        # preview manifest mappings
     python -m box_ingest.ingest --output data/box_chunks.jsonl
