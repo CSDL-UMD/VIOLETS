@@ -20,11 +20,8 @@ from .strategies.simple_split import simple_split
 from .strategies.table_rows import extract_table_chunks
 from .strategies.pdf import extract_pdf
 from .strategies.docx_strategy import extract_docx
+from .strategies.xls_strategy import extract_xls
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(message)s',
-)
 logger = logging.getLogger(__name__)
 
 
@@ -75,11 +72,7 @@ def run_pass2(
             logger.debug("Skipping (strategy=skip): %s", url)
             continue
 
-        if page['content_type'] != 'html':
-            logger.debug("Skipping non-HTML (%s): %s", page['content_type'], url)
-            continue
-
-        logger.info("Chunking [%s]: %s", strategy, url)
+        logger.info("Chunking [%s %s]: %s", page['content_type'], strategy, url)
 
         try:
             chunks = _route_to_strategy(page)
@@ -244,7 +237,25 @@ def _extract_document(url: str, content_type: str, needs_ocr: int) -> list:
                         'text': sc,
                         'heading_chain': heading_chain,
                     })
+
+        # Also chunk any tables extracted from the DOCX
+        for table in result.get('tables', []):
+            headers = table.get('headers', [])
+            for row in table.get('rows', []):
+                if headers and len(row) == len(headers):
+                    pairs = [f"{h}: {v}" for h, v in zip(headers, row) if v]
+                    row_text = ' | '.join(pairs)
+                else:
+                    row_text = ' | '.join(str(c) for c in row if c)
+                if row_text.strip():
+                    all_chunks.append({'text': row_text})
+
         return all_chunks
+
+    elif content_type in ('xls', 'xlsx', 'csv'):
+        result = extract_xls(url)
+        rows = result.get('rows', [])
+        return [{'text': r} for r in rows if r.strip()]
 
     else:
         logger.warning("Unsupported document type: %s", content_type)
@@ -290,5 +301,9 @@ def _write_jsonl(chunks: list[dict], path: str):
 
 
 if __name__ == '__main__':
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(message)s',
+    )
     chunks = run_pass2(output_path='data/chunks.jsonl')
     print(f"Produced {len(chunks)} chunks")

@@ -1,0 +1,15 @@
+{
+  "_comment": "Maps relative paths (from needtochunk/) to their Box.com URLs. Add one line per file when uploading to Box.",
+  "_format": "\"<year-folder>/<filename>\": \"https://mdsbe.app.box.com/s/ly67mqf875239kr4otek9phuueqzxw3r/file/<file-id>\"",
+
+  "Montgomery County Election Day Plans.txt": "https://mdsbe.app.box.com/s/ly67mqf875239kr4otek9phuueqzxw3r/file/2178848535792",
+
+  "2026-01/03-Assistant Attorney General's Report.pdf": "",
+  "2026-01/03-State Administrator's Report- January 22, 2026.pdf": "",
+
+  "2026-02/2026-02-19 AAG report.pdf": "",
+  "2026-02/State Administrator's Report- February 19, 2026.pdf": "",
+
+  "2026-03/2026-03-26 AAG report.pdf": "",
+  "2026-03/State Administrator's Report- March 26, 2026.pdf": ""
+}

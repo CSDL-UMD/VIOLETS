@@ -4,7 +4,7 @@ URL normalization, domain checks, and file type detection utilities.
 import os
 from urllib.parse import urlparse, urljoin, urlunparse, parse_qs, urlencode
 
-from .config import DOMAIN, DOCUMENT_EXTENSIONS, SKIP_DOMAINS
+from .config import DOMAINS, DOCUMENT_EXTENSIONS, SKIP_DOMAINS
 
 
 def normalize_url(href: str, base: str) -> str | None:
@@ -49,9 +49,10 @@ def normalize_url(href: str, base: str) -> str | None:
 
 
 def is_internal(url: str) -> bool:
-    """Check if a URL belongs to the target domain."""
+    """Check if a URL belongs to one of the target domains."""
     try:
-        return DOMAIN in urlparse(url).netloc
+        netloc = urlparse(url).netloc
+        return any(d in netloc for d in DOMAINS)
     except Exception:
         return False
 

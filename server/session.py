@@ -55,6 +55,11 @@ class SessionStore:
         with self._lock:
             self._sessions.pop(user_id, None)
 
+    def cleanup_expired(self):
+        """Remove expired sessions. Called by background task."""
+        with self._lock:
+            self._cleanup_expired()
+
     def _cleanup_expired(self):
         now = time.time()
         expired = [

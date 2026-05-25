@@ -66,6 +66,7 @@ And check the uvicorn terminal to see the logs
 """
 
 import logging
+import threading
 import time
 from typing import Any
 from uuid import UUID
@@ -83,9 +84,9 @@ logger = logging.getLogger(__name__)
 # Token counts, cost, and latency are always logged regardless of these flags.
 # ---------------------------------------------------------------------------
 
-LOG_PROMPTS: bool = False   # log full prompt sent to the LLM
-LOG_RESPONSES: bool = False  # log full response from the LLM
-LOG_QUERIES: bool = False    # log raw user query in log_request()
+LOG_PROMPTS: bool = True   # log full prompt sent to the LLM
+LOG_RESPONSES: bool = True  # log full response from the LLM
+LOG_QUERIES: bool = True    # log raw user query in log_request()
 
 # ---------------------------------------------------------------------------
 # Cost table (USD per million tokens)
@@ -93,6 +94,9 @@ LOG_QUERIES: bool = False    # log raw user query in log_request()
 # ---------------------------------------------------------------------------
 
 _COST_TABLE: dict[str, tuple[float, float]] = {
+    "gpt-5-nano":           (0.05,  0.40),
+    "gpt-5-mini":           (0.25,  2.00),
+    "gpt-5":                (1.25, 10.00),
     "gpt-4o-mini":          (0.15,  0.60),
     "gpt-4o":               (5.00, 15.00),
     "gpt-4-turbo":          (10.0, 30.00),
@@ -103,7 +107,9 @@ _COST_FALLBACK = (0.0, 0.0)
 
 def _estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
     # Exact match first, then prefix match to handle versioned names like
-    # "gpt-4o-mini-2024-07-18" mapping to "gpt-4o-mini".
+    # "gpt-5-nano-2025-08-07" mapping to "gpt-5-nano". Table order matters
+    # for prefix matching — list more specific entries (gpt-5-nano) before
+    # less specific ones (gpt-5) so dated snapshots resolve correctly.
     rates = _COST_TABLE.get(model)
     if rates is None:
         rates = next(
@@ -135,6 +141,10 @@ class RAGCallbackHandler(BaseCallbackHandler):
     def __init__(self):
         self._llm_starts: dict[str, tuple[float, str]] = {}  # run_id → (start_time, model)
         self._ret_starts: dict[str, float] = {}               # run_id → start_time
+        # LangChain's threadpool-backed retriever can fire callbacks from
+        # worker threads concurrently with the event loop, so guard the
+        # bookkeeping dicts with a lock.
+        self._lock = threading.Lock()
 
     # ---- LLM events ----
 
@@ -152,7 +162,8 @@ class RAGCallbackHandler(BaseCallbackHandler):
             or serialized.get("name", "unknown")
         )
         key = str(run_id)
-        self._llm_starts[key] = (time.time(), model)
+        with self._lock:
+            self._llm_starts[key] = (time.time(), model)
 
         if LOG_PROMPTS:
             for i, message_group in enumerate(messages):
@@ -179,7 +190,8 @@ class RAGCallbackHandler(BaseCallbackHandler):
             or serialized.get("name", "unknown")
         )
         key = str(run_id)
-        self._llm_starts[key] = (time.time(), model)
+        with self._lock:
+            self._llm_starts[key] = (time.time(), model)
 
         if LOG_PROMPTS:
             for i, prompt in enumerate(prompts):
@@ -196,7 +208,8 @@ class RAGCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         key = str(run_id)
-        start, model = self._llm_starts.pop(key, (time.time(), "unknown"))
+        with self._lock:
+            start, model = self._llm_starts.pop(key, (time.time(), "unknown"))
         elapsed = time.time() - start
 
         if LOG_RESPONSES:
@@ -232,7 +245,8 @@ class RAGCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         key = str(run_id)
-        self._llm_starts.pop(key, None)
+        with self._lock:
+            self._llm_starts.pop(key, None)
         logger.error("LLM ERROR [run=%s]: %s", key[:8], error)
 
     # ---- Retriever events ----
@@ -246,7 +260,8 @@ class RAGCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         key = str(run_id)
-        self._ret_starts[key] = time.time()
+        with self._lock:
+            self._ret_starts[key] = time.time()
         logger.info("RETRIEVER START [run=%s]: %r", key[:8], query)
 
     def on_retriever_end(
@@ -257,7 +272,9 @@ class RAGCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         key = str(run_id)
-        elapsed = time.time() - self._ret_starts.pop(key, time.time())
+        with self._lock:
+            start = self._ret_starts.pop(key, time.time())
+        elapsed = time.time() - start
         logger.info(
             "RETRIEVER END [run=%s] (%.2fs): %d docs",
             key[:8], elapsed, len(documents),

@@ -116,7 +116,7 @@ def run_cleanup(dry_run: bool = False):
     conn.execute("""
         DELETE FROM links
         WHERE source_url NOT IN (SELECT url FROM pages)
-          AND target_url NOT IN (SELECT url FROM pages)
+           OR target_url NOT IN (SELECT url FROM pages)
     """)
     links_deleted = links_before - conn.execute("SELECT COUNT(*) FROM links").fetchone()[0]
     conn.commit()

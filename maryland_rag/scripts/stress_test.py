@@ -1,13 +1,18 @@
 """
 Production-readiness stress test for VIOLETS server.
 Tests concurrency, session races, bad inputs, and edge cases.
+
+Requires VIOLETS_API_KEY env var (or set API_KEY below).
 """
 import asyncio
 import json
+import os
 import time
 import httpx
 BASE = "http://localhost:8000"
 TIMEOUT = 30.0
+API_KEY = os.environ.get("VIOLETS_API_KEY", "")
+AUTH_HEADERS = {"X-API-Key": API_KEY}
 results = {"pass": 0, "fail": 0, "errors": []}
 def record(name, passed, detail=""):
     if passed:
@@ -21,6 +26,7 @@ async def chat(client, user_id, query):
     resp = await client.post(
         f"{BASE}/chat",
         json={"user_id": user_id, "query": query},
+        headers=AUTH_HEADERS,
         timeout=TIMEOUT,
     )
     return resp.status_code, resp.json()
@@ -67,6 +73,7 @@ async def test_same_user_concurrent():
         resp = await client.post(
             f"{BASE}/chat",
             json={"user_id": "race-user", "query": "What did I just ask you about?"},
+            headers=AUTH_HEADERS,
             timeout=TIMEOUT,
         )
         record(
@@ -78,16 +85,16 @@ async def test_malformed_inputs():
     """Bad inputs that shouldn't crash the server."""
     print("\n[3] Malformed / edge-case inputs")
     async with httpx.AsyncClient() as client:
-        # Empty query
+        # Empty query (rejected by input validation)
         s, body = await chat(client, "edge-1", "")
-        record("Empty string query", s == 200, f"status={s}")
-        # Whitespace-only query
+        record("Empty string query returns 422", s == 422, f"status={s}")
+        # Whitespace-only query (single space passes min_length but is just whitespace)
         s, body = await chat(client, "edge-2", "   ")
-        record("Whitespace-only query", s == 200, f"status={s}")
-        # Very long query (5000 chars)
+        record("Whitespace-only query handled", s in (200, 422), f"status={s}")
+        # Very long query (over 2000 char limit)
         long_q = "What is voter registration? " * 200
         s, body = await chat(client, "edge-3", long_q)
-        record(f"Very long query ({len(long_q)} chars)", s == 200, f"status={s}")
+        record(f"Over-limit query ({len(long_q)} chars) returns 422", s == 422, f"status={s}")
         # Unicode / emoji query
         s, body = await chat(client, "edge-4", "How do I vote? 🗳️ 投票はどうすればいいですか？")
         record("Unicode/emoji query", s == 200, f"status={s}")
@@ -95,6 +102,7 @@ async def test_malformed_inputs():
         resp = await client.post(
             f"{BASE}/chat",
             json={"query": "test"},
+            headers=AUTH_HEADERS,
             timeout=TIMEOUT,
         )
         record(
@@ -106,6 +114,7 @@ async def test_malformed_inputs():
         resp = await client.post(
             f"{BASE}/chat",
             json={"user_id": "test"},
+            headers=AUTH_HEADERS,
             timeout=TIMEOUT,
         )
         record(
@@ -117,7 +126,7 @@ async def test_malformed_inputs():
         resp = await client.post(
             f"{BASE}/chat",
             content=b"",
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **AUTH_HEADERS},
             timeout=TIMEOUT,
         )
         record(
@@ -129,7 +138,7 @@ async def test_malformed_inputs():
         resp = await client.post(
             f"{BASE}/chat",
             content=b"this is not json",
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **AUTH_HEADERS},
             timeout=TIMEOUT,
         )
         record(
@@ -173,6 +182,7 @@ async def test_session_reset_under_load():
         reset_resp = await client.post(
             f"{BASE}/reset",
             json={"user_id": "reset-race"},
+            headers=AUTH_HEADERS,
             timeout=TIMEOUT,
         )
         record("Reset during in-flight request", reset_resp.status_code == 200)
@@ -213,6 +223,8 @@ async def main():
     print("=" * 60)
     print("VIOLETS Production Stress Test")
     print("=" * 60)
+    if not API_KEY:
+        print("WARNING: VIOLETS_API_KEY not set. Auth-protected endpoints will fail.")
     # Quick sanity check
     async with httpx.AsyncClient() as client:
         h = await client.get(f"{BASE}/health", timeout=5.0)

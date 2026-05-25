@@ -1,21 +1,18 @@
 """
-Pass 3: Embed chunks and upsert to Pinecone.
+Pass 3: Embed chunks and insert into PostgreSQL with pgvector.
 
 Reads data/chunks.jsonl (output from Pass 2), embeds each chunk's text
-using OpenAI text-embedding-3-small (1536-dim), and upserts vectors +
-metadata to a Pinecone serverless index.
+using OpenAI text-embedding-3-small (1536-dim), and inserts vectors +
+metadata into a PostgreSQL table with the pgvector extension.
 
 Env vars (set in .env or shell):
     OPENAI_API_KEY
-    PINECONE_API_KEY
-    PINECONE_INDEX_NAME   (default: maryland-elections)
-    PINECONE_CLOUD        (default: aws)
-    PINECONE_REGION       (default: us-east-1)
+    DATABASE_URL          (e.g. postgresql://user:pass@localhost:5432/violets)
 
 Usage:
     python -m maryland_rag pass3
     python -m maryland_rag pass3 --chunks data/chunks.jsonl
-    python -m maryland_rag pass3 --resume        # skip already-upserted chunk IDs
+    python -m maryland_rag pass3 --resume        # skip already-inserted chunk IDs
 """
 import json
 import logging
@@ -29,15 +26,13 @@ logger = logging.getLogger(__name__)
 
 EMBED_MODEL = "text-embedding-3-small"
 EMBED_DIM = 1536
-METRIC = "cosine"
 
 # OpenAI allows up to 2048 inputs per request; 100 is conservative and
 # keeps individual request payloads small.
 EMBED_BATCH_SIZE = 100
 
-# Pinecone serverless supports large upsert batches but 100 vectors is a
-# safe default that avoids payload-size errors.
-UPSERT_BATCH_SIZE = 100
+# Number of rows to insert per transaction.
+INSERT_BATCH_SIZE = 100
 
 # Seconds to wait after a retryable API error before re-attempting.
 RETRY_DELAY = 5
@@ -48,50 +43,46 @@ def run_embed(
     resume: bool = False,
 ) -> int:
     """
-    Embed all chunks and upsert to Pinecone.
+    Embed all chunks and insert into PostgreSQL.
 
     Args:
         chunks_path: Path to the JSONL file produced by Pass 2.
-        resume: If True, skip chunk IDs already recorded in the checkpoint file.
+        resume: If True, skip chunk IDs already present in the database.
 
     Returns:
-        Number of vectors upserted.
+        Number of vectors inserted.
     """
     _setup_logging()
     load_dotenv()
 
     openai_api_key = _require_env("OPENAI_API_KEY")
-    pinecone_api_key = _require_env("PINECONE_API_KEY")
-    index_name = os.environ.get("PINECONE_INDEX_NAME", "maryland-elections")
-    cloud = os.environ.get("PINECONE_CLOUD", "aws")
-    region = os.environ.get("PINECONE_REGION", "us-east-1")
+    database_url = _require_env("DATABASE_URL")
 
     chunks = _load_chunks(chunks_path)
     logger.info("Loaded %d chunks from %s", len(chunks), chunks_path)
 
+    conn = _setup_pgvector(database_url)
+
     if resume:
-        done_ids = _load_checkpoint(chunks_path)
+        done_ids = _get_existing_ids(conn)
         before = len(chunks)
         chunks = [c for c in chunks if c["chunk_id"] not in done_ids]
         logger.info(
-            "Resume mode: skipping %d already-upserted, %d remaining",
+            "Resume mode: skipping %d already-inserted, %d remaining",
             before - len(chunks),
             len(chunks),
         )
-    else:
-        done_ids = set()
 
     if not chunks:
-        logger.info("Nothing to upsert.")
+        logger.info("Nothing to insert.")
+        conn.close()
         return 0
-
-    index = _setup_pinecone(pinecone_api_key, index_name, cloud, region)
 
     from openai import OpenAI
     oai = OpenAI(api_key=openai_api_key)
 
     total = len(chunks)
-    upserted = 0
+    inserted = 0
 
     for batch_start in range(0, total, EMBED_BATCH_SIZE):
         batch = chunks[batch_start : batch_start + EMBED_BATCH_SIZE]
@@ -107,90 +98,112 @@ def run_embed(
             )
             continue
 
-        # --- Build Pinecone vectors ---
-        vectors = []
+        # --- Insert into PostgreSQL ---
+        rows = []
         for chunk, embedding in zip(batch, embeddings):
-            meta = _sanitize_metadata(
-                {k: v for k, v in chunk.items() if k != "chunk_id"}
-            )
-            vectors.append(
-                {
-                    "id": chunk["chunk_id"],
-                    "values": embedding,
-                    "metadata": meta,
-                }
-            )
+            # Separate known columns from extra metadata
+            chunk_id = chunk["chunk_id"]
+            text = chunk.get("text", "")
+            source_url = chunk.get("source_url", "")
+            title = chunk.get("title", "")
+            meta = {
+                k: v for k, v in chunk.items()
+                if k not in ("chunk_id", "text", "source_url", "title")
+            }
+            rows.append((chunk_id, embedding, text, source_url, title, json.dumps(meta)))
 
-        # --- Upsert in sub-batches ---
-        for i in range(0, len(vectors), UPSERT_BATCH_SIZE):
-            sub = vectors[i : i + UPSERT_BATCH_SIZE]
-            success = _upsert_with_retry(index, sub)
-            if success:
-                upserted += len(sub)
-
-        # --- Checkpoint ---
-        for c in batch:
-            done_ids.add(c["chunk_id"])
-        _save_checkpoint(chunks_path, done_ids)
+        count = _insert_batch(conn, rows)
+        inserted += count
 
         pct = 100.0 * (batch_start + len(batch)) / total
         logger.info(
-            "Progress: %d/%d (%.1f%%) — %d upserted",
+            "Progress: %d/%d (%.1f%%) — %d inserted",
             batch_start + len(batch),
             total,
             pct,
-            upserted,
+            inserted,
         )
 
-    logger.info(
-        "Pass 3 complete. %d vectors in Pinecone index '%s'.", upserted, index_name
-    )
-    return upserted
+    conn.close()
+    logger.info("Pass 3 complete. %d vectors inserted into pgvector.", inserted)
+    return inserted
 
 
 # ---------------------------------------------------------------------------
-# Pinecone setup
+# PostgreSQL / pgvector setup
 # ---------------------------------------------------------------------------
 
 
-def _setup_pinecone(api_key: str, index_name: str, cloud: str, region: str):
+def _setup_pgvector(database_url: str):
     try:
-        from pinecone import Pinecone, ServerlessSpec
+        import psycopg
+        from pgvector.psycopg import register_vector
     except ImportError:
         raise ImportError(
-            "pinecone package not installed. Run: pip install pinecone-client"
+            "psycopg or pgvector not installed. Run: pip install 'psycopg[binary]' pgvector"
         )
 
-    pc = Pinecone(api_key=api_key)
-    existing_names = [idx.name for idx in pc.list_indexes()]
+    conn = psycopg.connect(database_url)
+    register_vector(conn)
 
-    if index_name not in existing_names:
-        logger.info(
-            "Creating Pinecone serverless index '%s' (dim=%d, metric=%s, %s/%s)...",
-            index_name,
-            EMBED_DIM,
-            METRIC,
-            cloud,
-            region,
+    conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS chunks (
+            chunk_id   TEXT PRIMARY KEY,
+            embedding  vector({EMBED_DIM}),
+            text       TEXT,
+            source_url TEXT,
+            title      TEXT,
+            metadata   JSONB DEFAULT '{{}}'::jsonb
         )
-        pc.create_index(
-            name=index_name,
-            dimension=EMBED_DIM,
-            metric=METRIC,
-            spec=ServerlessSpec(cloud=cloud, region=region),
-        )
-        # Poll until ready
-        while True:
-            status = pc.describe_index(index_name).status
-            if status.get("ready", False):
-                break
-            logger.info("Waiting for index to become ready...")
-            time.sleep(3)
-        logger.info("Index '%s' is ready.", index_name)
-    else:
-        logger.info("Using existing Pinecone index '%s'.", index_name)
+    """)
+    conn.commit()
+    logger.info("pgvector table 'chunks' is ready (dim=%d).", EMBED_DIM)
+    return conn
 
-    return pc.Index(index_name)
+
+def _get_existing_ids(conn) -> set[str]:
+    """Return the set of chunk_ids already in the database."""
+    rows = conn.execute("SELECT chunk_id FROM chunks").fetchall()
+    return {row[0] for row in rows}
+
+
+# ---------------------------------------------------------------------------
+# Batch insert
+# ---------------------------------------------------------------------------
+
+
+def _insert_batch(conn, rows: list[tuple]) -> int:
+    """Insert a batch of rows, using ON CONFLICT to upsert.
+
+    Each row is wrapped in a savepoint so a single failure doesn't
+    roll back previously-committed rows in the same batch.
+    """
+    count = 0
+    for row in rows:
+        try:
+            conn.execute("SAVEPOINT insert_row")
+            conn.execute(
+                """
+                INSERT INTO chunks (chunk_id, embedding, text, source_url, title, metadata)
+                VALUES (%s, %s::vector, %s, %s, %s, %s::jsonb)
+                ON CONFLICT (chunk_id) DO UPDATE SET
+                    embedding  = EXCLUDED.embedding,
+                    text       = EXCLUDED.text,
+                    source_url = EXCLUDED.source_url,
+                    title      = EXCLUDED.title,
+                    metadata   = EXCLUDED.metadata
+                """,
+                row,
+            )
+            conn.execute("RELEASE SAVEPOINT insert_row")
+            count += 1
+        except Exception as exc:
+            logger.warning("Insert failed for chunk %s: %s", row[0], exc)
+            conn.execute("ROLLBACK TO SAVEPOINT insert_row")
+            continue
+    conn.commit()
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -213,58 +226,6 @@ def _embed_with_retry(oai, texts: list[str], retries: int = 3) -> list | None:
 
 
 # ---------------------------------------------------------------------------
-# Upsert with retry
-# ---------------------------------------------------------------------------
-
-
-def _upsert_with_retry(index, vectors: list, retries: int = 3) -> bool:
-    for attempt in range(retries):
-        try:
-            index.upsert(vectors=vectors)
-            return True
-        except Exception as exc:
-            logger.warning(
-                "Upsert attempt %d/%d failed: %s", attempt + 1, retries, exc
-            )
-            if attempt < retries - 1:
-                time.sleep(RETRY_DELAY * (attempt + 1))
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Metadata sanitization
-# ---------------------------------------------------------------------------
-
-
-def _sanitize_metadata(meta: dict) -> dict:
-    """
-    Convert a chunk metadata dict to Pinecone-compatible types.
-
-    Pinecone metadata values must be: str, int, float, bool, or list[str].
-    None values, nested dicts, and mixed-type lists are all rejected.
-    """
-    result = {}
-    for k, v in meta.items():
-        if v is None:
-            result[k] = ""
-        elif isinstance(v, bool):
-            result[k] = v
-        elif isinstance(v, (int, float)):
-            result[k] = v
-        elif isinstance(v, str):
-            result[k] = v
-        elif isinstance(v, list):
-            # Pinecone requires list[str] — coerce all items
-            result[k] = [str(item) for item in v if item is not None]
-        elif isinstance(v, dict):
-            # Flatten nested dicts to a JSON string so they're retrievable
-            result[k] = json.dumps(v, ensure_ascii=False)
-        else:
-            result[k] = str(v)
-    return result
-
-
-# ---------------------------------------------------------------------------
 # JSONL I/O
 # ---------------------------------------------------------------------------
 
@@ -277,30 +238,6 @@ def _load_chunks(path: str) -> list[dict]:
             if line:
                 chunks.append(json.loads(line))
     return chunks
-
-
-# ---------------------------------------------------------------------------
-# Checkpoint (resume support)
-# ---------------------------------------------------------------------------
-
-
-def _checkpoint_path(chunks_path: str) -> str:
-    return str(Path(chunks_path).with_suffix(".checkpoint"))
-
-
-def _load_checkpoint(chunks_path: str) -> set[str]:
-    path = _checkpoint_path(chunks_path)
-    if not os.path.exists(path):
-        return set()
-    with open(path, encoding="utf-8") as f:
-        return {line.strip() for line in f if line.strip()}
-
-
-def _save_checkpoint(chunks_path: str, done_ids: set[str]):
-    path = _checkpoint_path(chunks_path)
-    with open(path, "w", encoding="utf-8") as f:
-        for chunk_id in done_ids:
-            f.write(chunk_id + "\n")
 
 
 # ---------------------------------------------------------------------------

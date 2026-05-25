@@ -7,6 +7,8 @@ requests>=2.31.0
 pdfplumber>=0.10.0
 PyMuPDF>=1.23.0
 python-docx>=1.1.0
+openpyxl>=3.1.0
+xlrd>=2.0.1
 
 # Pass 2 - OCR (optional, for image-only PDFs)
 pytesseract>=0.3.10
@@ -17,7 +19,8 @@ Pillow>=10.0.0
 # langchain-experimental>=0.0.47
 # langchain-openai>=0.0.5
 
-# Pass 3 - Embed and Upsert
+# Pass 3 - Embed and Insert (pgvector)
 openai>=1.30.0
-pinecone>=8.0
+psycopg[binary]>=3.1
+pgvector>=0.3
 python-dotenv>=1.0
