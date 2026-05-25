@@ -199,12 +199,20 @@ class BoxFile:
     decision:    str   # FILTER_INCLUDE | FILTER_EXCLUDE | FILTER_REVIEW
 
 
-def _walk_folder(folder_id: str, folder_path: str, access_token: str, results: list[BoxFile]) -> None:
+def _is_2026_folder(name: str, depth: int) -> bool:
+    """At the top level (depth=0), only enter folders whose name starts with '2026-'."""
+    return depth != 0 or name.startswith("2026-")
+
+
+def _walk_folder(folder_id: str, folder_path: str, access_token: str, results: list[BoxFile], depth: int = 0) -> None:
     for item in _list_folder(folder_id, access_token):
         name = item["name"]
         if item["type"] == "folder":
+            if not _is_2026_folder(name, depth):
+                logger.debug("Skipping non-2026 folder: %s", name)
+                continue
             sub = f"{folder_path}/{name}".lstrip("/")
-            _walk_folder(item["id"], sub, access_token, results)
+            _walk_folder(item["id"], sub, access_token, results, depth + 1)
         elif item["type"] == "file":
             results.append(BoxFile(
                 file_id=item["id"],
