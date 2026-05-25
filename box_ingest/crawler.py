@@ -1,8 +1,14 @@
 """
-Box API crawler for State Board of Elections materials.
+Box crawler for State Board of Elections materials.
 
-Connects to the Box shared hub, lists all files, classifies each filename
-using filter.py rules, and returns structured results for the orchestrator.
+Strategy:
+  1. Playwright scrapes the public Box Hub page to find all folder share-link
+     URLs (no auth needed — the hub is public).
+  2. For each folder share-link, the Box API resolves it to a folder ID and
+     lists its contents (files + subfolders) recursively.
+  3. Each file is classified by filter.py rules.
+
+OAuth is only needed for step 2 (API calls). The hub page itself is public.
 
 Requires environment variables:
     BOX_CLIENT_ID      — from your Box developer app
@@ -36,9 +42,9 @@ PROJECT_ROOT    = Path(__file__).parent.parent
 TOKEN_CACHE     = PROJECT_ROOT / ".box_token"
 
 # The public shared hub URL
-HUB_SHARED_LINK = "https://mdsbe.app.box.com/hubs/263564910?s=ly67mqf875239kr4otek9phuueqzxw3r"
-# Shared link token extracted from the URL above (the `s=` param)
+HUB_SHARED_LINK   = "https://mdsbe.app.box.com/hubs/263564910?s=ly67mqf875239kr4otek9phuueqzxw3r"
 SHARED_LINK_TOKEN = "ly67mqf875239kr4otek9phuueqzxw3r"
+SHARED_LINK_BASE  = f"https://mdsbe.app.box.com/s/{SHARED_LINK_TOKEN}"
 
 OAUTH_REDIRECT_URI = "http://localhost:8080"
 
@@ -193,24 +199,49 @@ def _list_folder(folder_id: str, access_token: str, shared_link: str) -> list[di
     return items
 
 
-def _get_shared_item(access_token: str, shared_link: str) -> dict:
-    """Resolve the Box item (folder, file, or hub) from a shared link."""
-    return _api_get("shared_items", access_token, shared_link)
+def _get_folder_id_from_shared_link(shared_link: str, access_token: str) -> str:
+    """Resolve a Box folder shared-link URL to its folder ID via the API."""
+    data = _api_get("shared_items", access_token, shared_link)
+    return data["id"]
 
 
-def _get_hub_folder_ids(hub_id: str, access_token: str) -> list[str]:
+def scrape_hub_folder_links() -> list[str]:
     """
-    A Box Hub is a collection of sections, each section points to a folder.
-    Returns the list of folder IDs that make up the hub's content.
+    Use Playwright to load the public Box Hub page and collect every
+    folder share-link URL listed in it. Returns a list of URLs like:
+        https://mdsbe.app.box.com/s/<token>/folder/<id>
+    No auth required — the hub is publicly accessible.
     """
-    data = _api_get(f"hubs/{hub_id}/sections?limit=1000&fields=id,name,folder", access_token)
-    folder_ids = []
-    for section in data.get("entries", []):
-        folder = section.get("folder")
-        if folder and folder.get("id"):
-            logger.debug("Hub section '%s' → folder %s", section.get("name"), folder["id"])
-            folder_ids.append(folder["id"])
-    return folder_ids
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise ImportError(
+            "playwright is required for hub scraping. "
+            "Run: pip install playwright && playwright install chromium"
+        )
+
+    folder_links: list[str] = []
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        page = browser.new_page()
+        logger.info("Loading Box Hub page ...")
+        page.goto(HUB_SHARED_LINK, wait_until="networkidle", timeout=30000)
+
+        # Collect all <a> hrefs that look like Box folder share links
+        anchors = page.eval_on_selector_all(
+            "a[href]",
+            "els => els.map(e => e.href)"
+        )
+        for href in anchors:
+            if "/s/" in href and ("/folder/" in href or "?s=" in href):
+                if href not in folder_links:
+                    folder_links.append(href)
+                    logger.debug("Found folder link: %s", href)
+
+        browser.close()
+
+    logger.info("Scraped %d folder link(s) from hub", len(folder_links))
+    return folder_links
 
 
 def _make_file_url(file_id: str) -> str:
@@ -241,24 +272,21 @@ def crawl_hub(access_token: str | None = None) -> list[BoxFile]:
     if access_token is None:
         access_token = get_access_token()
 
-    shared_link = HUB_SHARED_LINK
-    logger.info("Resolving shared hub ...")
-    item = _get_shared_item(access_token, shared_link)
-    item_type = item.get("type")
-    item_id   = item["id"]
-    logger.info("Shared item type=%s id=%s", item_type, item_id)
+    # Step 1: scrape the hub page to find folder share-link URLs
+    folder_links = scrape_hub_folder_links()
+    if not folder_links:
+        raise RuntimeError("No folder links found on the Box Hub page — the hub layout may have changed")
 
     results: list[BoxFile] = []
 
-    if item_type == "folder":
-        # Simple case: shared link points directly to a folder
-        _walk_folder(item_id, "", access_token, shared_link, results)
-    else:
-        # Hub: resolve sections → folders, then walk each folder
-        folder_ids = _get_hub_folder_ids(item_id, access_token)
-        logger.info("Hub has %d section folder(s)", len(folder_ids))
-        for folder_id in folder_ids:
-            _walk_folder(folder_id, "", access_token, shared_link, results)
+    # Step 2: for each folder link, resolve to a folder ID and walk it
+    for link in folder_links:
+        try:
+            folder_id = _get_folder_id_from_shared_link(link, access_token)
+            logger.info("Walking folder %s (%s)", folder_id, link)
+            _walk_folder(folder_id, "", access_token, link, results)
+        except Exception as exc:
+            logger.warning("Could not walk folder %s: %s", link, exc)
 
     logger.info("Crawl complete: %d files found", len(results))
     return results
