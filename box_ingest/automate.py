@@ -53,10 +53,11 @@ def download_file(box_file: BoxFile, access_token: str, dry_run: bool = False) -
 
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    # Box content download endpoint
+    from box_ingest.crawler import SHARED_LINK
     download_url = f"https://api.box.com/2.0/files/{box_file.file_id}/content"
     req = urllib.request.Request(download_url)
     req.add_header("Authorization", f"Bearer {access_token}")
+    req.add_header("BoxApi", f"shared_link={SHARED_LINK}")
 
     logger.info("Downloading: %s", box_file.name)
     with urllib.request.urlopen(req) as resp:
