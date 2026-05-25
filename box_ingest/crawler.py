@@ -201,7 +201,9 @@ def _list_folder(folder_id: str, access_token: str, shared_link: str) -> list[di
 
 def _get_folder_id_from_shared_link(shared_link: str, access_token: str) -> str:
     """Resolve a Box folder shared-link URL to its folder ID via the API."""
-    data = _api_get("shared_items", access_token, shared_link)
+    # Strip query params — Box API wants just the base share URL
+    base = shared_link.split("?")[0]
+    data = _api_get("shared_items", access_token, base)
     return data["id"]
 
 
@@ -280,13 +282,15 @@ def crawl_hub(access_token: str | None = None) -> list[BoxFile]:
     results: list[BoxFile] = []
 
     # Step 2: for each folder link, resolve to a folder ID and walk it
+    # Use the base shared link (no query params) as the BoxApi header
     for link in folder_links:
+        base_link = link.split("?")[0]
         try:
-            folder_id = _get_folder_id_from_shared_link(link, access_token)
-            logger.info("Walking folder %s (%s)", folder_id, link)
-            _walk_folder(folder_id, "", access_token, link, results)
+            folder_id = _get_folder_id_from_shared_link(base_link, access_token)
+            logger.info("Walking folder %s (%s)", folder_id, base_link)
+            _walk_folder(folder_id, "", access_token, base_link, results)
         except Exception as exc:
-            logger.warning("Could not walk folder %s: %s", link, exc)
+            logger.warning("Could not walk folder %s: %s", base_link, exc)
 
     logger.info("Crawl complete: %d files found", len(results))
     return results
