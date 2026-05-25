@@ -193,10 +193,24 @@ def _list_folder(folder_id: str, access_token: str, shared_link: str) -> list[di
     return items
 
 
-def _get_shared_folder_id(access_token: str, shared_link: str) -> str:
-    """Resolve the root folder ID from a Box shared link."""
-    data = _api_get("shared_items", access_token, shared_link)
-    return data["id"]
+def _get_shared_item(access_token: str, shared_link: str) -> dict:
+    """Resolve the Box item (folder, file, or hub) from a shared link."""
+    return _api_get("shared_items", access_token, shared_link)
+
+
+def _get_hub_folder_ids(hub_id: str, access_token: str) -> list[str]:
+    """
+    A Box Hub is a collection of sections, each section points to a folder.
+    Returns the list of folder IDs that make up the hub's content.
+    """
+    data = _api_get(f"hubs/{hub_id}/sections?limit=1000&fields=id,name,folder", access_token)
+    folder_ids = []
+    for section in data.get("entries", []):
+        folder = section.get("folder")
+        if folder and folder.get("id"):
+            logger.debug("Hub section '%s' → folder %s", section.get("name"), folder["id"])
+            folder_ids.append(folder["id"])
+    return folder_ids
 
 
 def _make_file_url(file_id: str) -> str:
@@ -228,12 +242,24 @@ def crawl_hub(access_token: str | None = None) -> list[BoxFile]:
         access_token = get_access_token()
 
     shared_link = HUB_SHARED_LINK
-    logger.info("Resolving shared hub root folder ...")
-    root_id = _get_shared_folder_id(access_token, shared_link)
-    logger.info("Root folder ID: %s", root_id)
+    logger.info("Resolving shared hub ...")
+    item = _get_shared_item(access_token, shared_link)
+    item_type = item.get("type")
+    item_id   = item["id"]
+    logger.info("Shared item type=%s id=%s", item_type, item_id)
 
     results: list[BoxFile] = []
-    _walk_folder(root_id, "", access_token, shared_link, results)
+
+    if item_type == "folder":
+        # Simple case: shared link points directly to a folder
+        _walk_folder(item_id, "", access_token, shared_link, results)
+    else:
+        # Hub: resolve sections → folders, then walk each folder
+        folder_ids = _get_hub_folder_ids(item_id, access_token)
+        logger.info("Hub has %d section folder(s)", len(folder_ids))
+        for folder_id in folder_ids:
+            _walk_folder(folder_id, "", access_token, shared_link, results)
+
     logger.info("Crawl complete: %d files found", len(results))
     return results
 
