@@ -216,6 +216,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Box OAuth token cache (contains access/refresh tokens — never commit)
+.box_token
+
 # Maryland RAG pipeline artifacts
 data/cache/
 data/manifest.db
