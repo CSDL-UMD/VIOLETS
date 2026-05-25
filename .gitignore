@@ -219,6 +219,12 @@ __marimo__/
 # Box OAuth token cache (contains access/refresh tokens — never commit)
 .box_token
 
+# Downloaded Box documents — fetched by box_ingest.automate, not stored in git
+needtochunk/**/*.pdf
+needtochunk/**/*.docx
+needtochunk/**/*.doc
+needtochunk/**/*.pptx
+
 # Maryland RAG pipeline artifacts
 data/cache/
 data/manifest.db
