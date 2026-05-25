@@ -15,6 +15,7 @@ INCLUDE_TERMS = [
     "aag",
     "assistant attorney general",
     "state administrator",
+    "administrator's report",
 ]
 
 EXCLUDE_TERMS = [
