@@ -16,6 +16,15 @@ INCLUDE_TERMS = [
     "assistant attorney general",
     "state administrator",
     "administrator's report",
+    "election law",
+    "security",
+    "integrity",
+    "certification",
+    "accessibility",
+    "provisional",
+    "poll worker",
+    "absentee",
+    "mail-in",
 ]
 
 EXCLUDE_TERMS = [
@@ -27,6 +36,12 @@ EXCLUDE_TERMS = [
     "title",
     "memorandum",
     "election plan",
+    "budget",
+    "financial",
+    "contract",
+    "bylaws",
+    "transmittal",
+    "appointment",
 ]
 
 FILTER_INCLUDE = "include"
