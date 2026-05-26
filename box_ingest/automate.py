@@ -1,17 +1,25 @@
 """
-Full automation pipeline for Box SBE materials.
+Crawl the Maryland SBE Box hub, download relevant files, and update the manifest.
+
+This script is Step 1 of the Box ingestion pipeline. It does NOT chunk files —
+chunking happens later when you run: python -m maryland_rag all
 
 Steps:
-  1. Crawl the Box hub → classify every file (include/exclude/review)
-  2. Download INCLUDE files into needtochunk/<folder>/
-  3. Update url_manifest.json with their Box URLs
-  4. Run box_ingest.ingest to produce data/box_chunks.jsonl
-  5. Print a report of REVIEW files that need manual triage
+  1. Scrape the Box Hub page to find folder IDs, then walk each folder via
+     the Box API to get a full list of files (2026 folders only).
+  2. Classify each file as include / exclude / review using keyword rules
+     defined in box_ingest/filter.py.
+  3. Download INCLUDE files into needtochunk/<folder>/<filename>.
+     Files already present locally are skipped.
+  4. Update needtochunk/url_manifest.json with the Box share URL for each
+     downloaded file. The manifest is used later by the chunking pipeline
+     to attach a source URL to every chunk.
+  5. Print a list of REVIEW files — files that matched neither include nor
+     exclude rules — so you can manually decide whether to add them.
 
 Usage:
-    python -m box_ingest.automate              # full run
-    python -m box_ingest.automate --dry-run    # show what would happen, no downloads
-    python -m box_ingest.automate --no-ingest  # skip the final ingest step
+    python -m box_ingest.automate            # full run
+    python -m box_ingest.automate --dry-run  # preview only, no downloads or file writes
 """
 from __future__ import annotations
 
@@ -21,13 +29,27 @@ import urllib.request
 from pathlib import Path
 
 from box_ingest.crawler import crawl_hub, BoxFile, get_access_token
-from box_ingest.filter  import FILTER_INCLUDE, FILTER_EXCLUDE, FILTER_REVIEW
+from box_ingest.filter import FILTER_INCLUDE, FILTER_EXCLUDE, FILTER_REVIEW
 from box_ingest.manifest import update_manifest
 
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT    = Path(__file__).parent.parent
 NEEDTOCHUNK_DIR = PROJECT_ROOT / "needtochunk"
+REVIEW_LOG      = NEEDTOCHUNK_DIR / "review_files.txt"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _local_path(box_file: BoxFile) -> Path:
+    base = NEEDTOCHUNK_DIR / box_file.folder_path if box_file.folder_path else NEEDTOCHUNK_DIR
+    return base / box_file.name
+
+
+def _already_downloaded(box_file: BoxFile) -> bool:
+    return _local_path(box_file).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -40,18 +62,17 @@ def download_file(box_file: BoxFile, access_token: str, dry_run: bool = False) -
     Skips if the file already exists locally.
     Returns the local path.
     """
-    dest_dir  = NEEDTOCHUNK_DIR / box_file.folder_path if box_file.folder_path else NEEDTOCHUNK_DIR
-    dest_path = dest_dir / box_file.name
+    dest_path = _local_path(box_file)
 
     if dest_path.exists():
-        logger.debug("Already exists locally, skipping download: %s", dest_path)
+        logger.debug("Already exists locally, skipping: %s", dest_path)
         return dest_path
 
     if dry_run:
         logger.info("[dry-run] Would download: %s → %s", box_file.box_url, dest_path)
         return dest_path
 
-    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
 
     from box_ingest.crawler import SHARED_LINK
     download_url = f"https://api.box.com/2.0/files/{box_file.file_id}/content"
@@ -68,10 +89,45 @@ def download_file(box_file: BoxFile, access_token: str, dry_run: bool = False) -
 
 
 # ---------------------------------------------------------------------------
+# Review log
+# ---------------------------------------------------------------------------
+
+def _write_review_log(review: list[BoxFile], dry_run: bool = False) -> None:
+    """Write needtochunk/review_files.txt listing every REVIEW file."""
+    lines = [
+        "Files requiring manual review",
+        "These matched neither INCLUDE_TERMS nor EXCLUDE_TERMS in box_ingest/filter.py.",
+        "For each file, open it on Box and decide:",
+        "  - Add a keyword to INCLUDE_TERMS  → file will be downloaded on next run",
+        "  - Add a keyword to EXCLUDE_TERMS  → file will be ignored on next run",
+        "  - Manually add to url_manifest.json if it's a one-off inclusion",
+        "",
+        f"Total: {len(review)} file(s)",
+        "=" * 60,
+        "",
+    ]
+    for f in review:
+        lines.append(f"Name:     {f.name}")
+        lines.append(f"Folder:   {f.folder_path or '(root)'}")
+        lines.append(f"Box URL:  {f.box_url}")
+        lines.append("")
+
+    content = "\n".join(lines)
+
+    if dry_run:
+        logger.info("[dry-run] Would write review log with %d entries", len(review))
+        return
+
+    NEEDTOCHUNK_DIR.mkdir(parents=True, exist_ok=True)
+    REVIEW_LOG.write_text(content, encoding="utf-8")
+    logger.info("Review log written: %s (%d files)", REVIEW_LOG, len(review))
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def run(dry_run: bool = False, no_ingest: bool = False) -> None:
+def run(dry_run: bool = False) -> None:
     # Step 1: crawl
     logger.info("=== Step 1: Crawling Box hub ===")
     access_token = get_access_token()
@@ -83,9 +139,11 @@ def run(dry_run: bool = False, no_ingest: bool = False) -> None:
 
     logger.info("Found %d include / %d exclude / %d review", len(include), len(exclude), len(review))
 
-    # Step 2: download INCLUDE files
-    logger.info("=== Step 2: Downloading %d included files ===", len(include))
-    for box_file in include:
+    # Step 2: download INCLUDE files (skip already-downloaded ones)
+    to_download = [f for f in include if not _already_downloaded(f)]
+    logger.info("=== Step 2: Downloading %d new file(s) (%d already local) ===",
+                len(to_download), len(include) - len(to_download))
+    for box_file in to_download:
         download_file(box_file, access_token, dry_run=dry_run)
 
     # Step 3: update manifest
@@ -96,35 +154,17 @@ def run(dry_run: bool = False, no_ingest: bool = False) -> None:
         summary["added"], summary["already_present"], summary["skipped_non_include"],
     )
 
-    # Step 4: run ingest
-    if not no_ingest and not dry_run:
-        logger.info("=== Step 4: Running box_ingest.ingest ===")
-        from box_ingest.ingest import run_ingest
-        chunks = run_ingest()
-        logger.info("Ingest produced %d chunks", len(chunks))
-    else:
-        logger.info("=== Step 4: Skipped (--dry-run or --no-ingest) ===")
-
-    # Step 5: report REVIEW files
+    # Step 4: write review log
+    logger.info("=== Step 4: Writing review log ===")
+    _write_review_log(review, dry_run=dry_run)
     if review:
-        print("\n" + "=" * 60)
-        print(f"MANUAL REVIEW NEEDED ({len(review)} files)")
-        print("These matched neither include nor exclude rules.")
-        print("=" * 60)
-        for f in review:
-            print(f"  [{f.folder_path}] {f.name}")
-            print(f"    {f.box_url}")
-        print()
-        print("For each file above, decide:")
-        print("  - Add its name keyword to INCLUDE_TERMS in box_ingest/filter.py, OR")
-        print("  - Add its name keyword to EXCLUDE_TERMS in box_ingest/filter.py, OR")
-        print("  - Manually add it to url_manifest.json if it's a one-off")
+        print(f"\nReview log written to: {REVIEW_LOG}")
+        print(f"{len(review)} file(s) need manual triage — open the log for details.")
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description="Automate Box SBE materials ingestion")
-    parser.add_argument("--dry-run",   action="store_true", help="Preview only, no downloads or file writes")
-    parser.add_argument("--no-ingest", action="store_true", help="Skip running box_ingest.ingest at the end")
+    parser.add_argument("--dry-run", action="store_true", help="Preview only, no downloads or file writes")
     args = parser.parse_args()
-    run(dry_run=args.dry_run, no_ingest=args.no_ingest)
+    run(dry_run=args.dry_run)
