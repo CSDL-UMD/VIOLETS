@@ -219,7 +219,8 @@ __marimo__/
 # Box OAuth token cache (contains access/refresh tokens — never commit)
 .box_token
 
-# Downloaded Box documents — fetched by box_ingest.automate, not stored in git
+# Downloaded Box documents and generated review log — fetched/written by box_ingest.automate
+needtochunk/review_files.txt
 needtochunk/**/*.pdf
 needtochunk/**/*.docx
 needtochunk/**/*.doc
