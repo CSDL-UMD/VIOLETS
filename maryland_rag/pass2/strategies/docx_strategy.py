@@ -12,38 +12,48 @@ import tempfile
 logger = logging.getLogger(__name__)
 
 
-def extract_docx(url: str) -> dict:
-    """
-    Extract text from a DOCX file, split by heading hierarchy.
+_EMPTY_DOCX = {'sections': [], 'tables': [], 'full_text': ''}
 
-    Args:
-        url: DOCX URL.
+
+def extract_docx_from_path(path: str) -> dict:
+    """
+    Extract text from a DOCX file already on local disk, split by heading
+    hierarchy.
 
     Returns:
-        Dict with 'sections' (list of heading-aware sections) and 'full_text'.
+        Dict with 'sections', 'tables', and 'full_text' keys.
     """
-    from ..cache import get_bytes
-    docx_bytes = get_bytes(url)
-    if not docx_bytes:
-        return {'sections': [], 'full_text': ''}
-
     try:
         import docx
     except ImportError:
         logger.warning("python-docx not installed")
-        return {'sections': [], 'full_text': ''}
+        return dict(_EMPTY_DOCX)
+
+    try:
+        doc = docx.Document(path)
+    except Exception as exc:
+        logger.error("Failed to parse DOCX %s: %s", path, exc)
+        return dict(_EMPTY_DOCX)
+
+    return _walk_headings(doc)
+
+
+def extract_docx(url: str) -> dict:
+    """
+    Extract text from a DOCX file fetched via the Pass 2 disk cache.
+
+    Returns:
+        Dict with 'sections', 'tables', and 'full_text' keys.
+    """
+    from ..cache import get_bytes
+    docx_bytes = get_bytes(url)
+    if not docx_bytes:
+        return dict(_EMPTY_DOCX)
 
     with tempfile.NamedTemporaryFile(suffix='.docx', delete=True) as tmp:
         tmp.write(docx_bytes)
         tmp.flush()
-
-        try:
-            doc = docx.Document(tmp.name)
-        except Exception as exc:
-            logger.error("Failed to parse DOCX: %s", exc)
-            return {'sections': [], 'full_text': ''}
-
-        return _walk_headings(doc)
+        return extract_docx_from_path(tmp.name)
 
 
 def _walk_headings(doc) -> dict:

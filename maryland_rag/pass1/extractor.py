@@ -9,6 +9,7 @@ Key improvements over the original design:
 import hashlib
 import logging
 import re
+from urllib.parse import urlparse
 
 import requests
 import trafilatura
@@ -155,7 +156,6 @@ def _extract_breadcrumb(soup: BeautifulSoup, url: str) -> list[str]:
                 return crumbs
 
     # Fallback: derive from URL path segments
-    from urllib.parse import urlparse
     path = urlparse(url).path
     parts = [
         p.replace('-', ' ').replace('_', ' ').title()
@@ -192,7 +192,6 @@ def _extract_document_metadata(url: str, ctype: str) -> dict | None:
         title = title.rsplit('.', 1)[0]
 
     # Derive section hierarchy from URL path (excluding filename)
-    from urllib.parse import urlparse
     path = urlparse(url).path
     parts = path.strip('/').split('/')
     hierarchy = [

@@ -27,19 +27,17 @@ import re
 import urllib.request
 import webbrowser
 from dataclasses import dataclass
-from pathlib import Path
 from urllib.parse import urlencode, urlparse, parse_qs
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from dotenv import load_dotenv
 
 from box_ingest.filter import classify_filename, FILTER_INCLUDE, FILTER_EXCLUDE, FILTER_REVIEW
+from box_ingest.paths import TOKEN_CACHE
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT      = Path(__file__).parent.parent
-TOKEN_CACHE       = PROJECT_ROOT / ".box_token"
 HUB_URL           = "https://mdsbe.app.box.com/hubs/263564910?s=ly67mqf875239kr4otek9phuueqzxw3r"
 SHARED_LINK_TOKEN = "ly67mqf875239kr4otek9phuueqzxw3r"
 # This is the ONE valid shared link used as context for all Box API calls

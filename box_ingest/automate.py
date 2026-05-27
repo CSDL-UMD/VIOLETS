@@ -28,15 +28,12 @@ import logging
 import urllib.request
 from pathlib import Path
 
-from box_ingest.crawler import crawl_hub, BoxFile, get_access_token
+from box_ingest.crawler import crawl_hub, BoxFile, SHARED_LINK, get_access_token
 from box_ingest.filter import FILTER_INCLUDE, FILTER_EXCLUDE, FILTER_REVIEW
 from box_ingest.manifest import update_manifest
+from box_ingest.paths import NEEDTOCHUNK_DIR, REVIEW_LOG
 
 logger = logging.getLogger(__name__)
-
-PROJECT_ROOT    = Path(__file__).parent.parent
-NEEDTOCHUNK_DIR = PROJECT_ROOT / "needtochunk"
-REVIEW_LOG      = NEEDTOCHUNK_DIR / "review_files.txt"
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +71,6 @@ def download_file(box_file: BoxFile, access_token: str, dry_run: bool = False) -
 
     dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-    from box_ingest.crawler import SHARED_LINK
     download_url = f"https://api.box.com/2.0/files/{box_file.file_id}/content"
     req = urllib.request.Request(download_url)
     req.add_header("Authorization", f"Bearer {access_token}")

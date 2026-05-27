@@ -13,8 +13,20 @@ import tempfile
 logger = logging.getLogger(__name__)
 
 
+def extract_xls_from_path(path: str) -> dict:
+    """Return {'rows': [str, ...], 'sheets': [...]} for a spreadsheet on disk.
+
+    Format (.xls vs .xlsx/.xlsm) is detected from the path suffix.
+    """
+    suffix = path.lower()
+    if suffix.endswith('.xlsx') or suffix.endswith('.xlsm'):
+        return _extract_xlsx(path)
+    return _extract_xls(path)
+
+
 def extract_xls(url: str) -> dict:
-    """Return {'rows': [str, ...], 'sheets': [...]} for the spreadsheet."""
+    """Return {'rows': [str, ...], 'sheets': [...]} for the spreadsheet,
+    fetched via the Pass 2 disk cache."""
     from ..cache import get_bytes
     data = get_bytes(url)
     if not data:
@@ -26,9 +38,7 @@ def extract_xls(url: str) -> dict:
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
         tmp.write(data)
         tmp.flush()
-        if is_xlsx:
-            return _extract_xlsx(tmp.name)
-        return _extract_xls(tmp.name)
+        return extract_xls_from_path(tmp.name)
 
 
 def _extract_xls(path: str) -> dict:

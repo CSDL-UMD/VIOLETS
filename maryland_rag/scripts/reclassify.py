@@ -16,9 +16,10 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+from maryland_rag.pass1.config import DB_PATH as _DB_PATH
 from maryland_rag.pass1.rules import classify_html
 
-DB_PATH = Path(__file__).parent.parent.parent / "data" / "manifest.db"
+DB_PATH = Path(_DB_PATH)
 
 
 def run_reclassify(dry_run: bool = False):

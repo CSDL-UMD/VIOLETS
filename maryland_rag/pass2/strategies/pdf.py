@@ -16,9 +16,44 @@ import tempfile
 logger = logging.getLogger(__name__)
 
 
+_EMPTY_RESULT = {'text': '', 'pages': [], 'tables': [], 'structure_type': 'empty'}
+
+
+def extract_pdf_from_path(path: str, needs_ocr: bool = False, ocr_fallback: bool = False) -> dict:
+    """
+    Extract text and structure from a PDF already on local disk.
+
+    Args:
+        path: Local file path to the PDF.
+        needs_ocr: If True, skip text extraction and go straight to OCR
+                   (used when Pass 1 flagged the PDF as image-only).
+        ocr_fallback: If True and text extraction yields no text, fall back
+                      to OCR. Used by Box ingest which doesn't pre-probe.
+
+    Returns:
+        Dict with 'text', 'pages', 'tables', 'structure_type' keys.
+    """
+    if needs_ocr:
+        return _extract_with_ocr(path)
+
+    result = _extract_with_pdfplumber(path)
+    if result and result.get('text', '').strip():
+        return result
+
+    result = _extract_with_pymupdf(path)
+    if result and result.get('text', '').strip():
+        return result
+
+    if ocr_fallback:
+        logger.info("No embedded text in %s; falling back to OCR", path)
+        return _extract_with_ocr(path)
+
+    return dict(_EMPTY_RESULT)
+
+
 def extract_pdf(url: str, needs_ocr: bool = False) -> dict:
     """
-    Extract text and structure from a PDF.
+    Extract text and structure from a PDF, fetched via the Pass 2 disk cache.
 
     Args:
         url: PDF URL.
@@ -30,26 +65,12 @@ def extract_pdf(url: str, needs_ocr: bool = False) -> dict:
     from ..cache import get_bytes
     pdf_bytes = get_bytes(url)
     if not pdf_bytes:
-        return {'text': '', 'pages': [], 'tables': [], 'structure_type': 'empty'}
+        return dict(_EMPTY_RESULT)
 
     with tempfile.NamedTemporaryFile(suffix='.pdf', delete=True) as tmp:
         tmp.write(pdf_bytes)
         tmp.flush()
-
-        if needs_ocr:
-            return _extract_with_ocr(tmp.name)
-
-        # Try pdfplumber first
-        result = _extract_with_pdfplumber(tmp.name)
-        if result and result.get('text', '').strip():
-            return result
-
-        # Fallback to pymupdf
-        result = _extract_with_pymupdf(tmp.name)
-        if result and result.get('text', '').strip():
-            return result
-
-        return {'text': '', 'pages': [], 'tables': [], 'structure_type': 'empty'}
+        return extract_pdf_from_path(tmp.name, needs_ocr=needs_ocr)
 
 
 def _extract_with_pdfplumber(path: str) -> dict | None:

@@ -218,10 +218,13 @@ def build_chain(pool):
             }, run_config)
             return {"answer": answer, "sources": []}
 
-        # Step 1: rephrase follow-ups into standalone questions
-        #For concerns queries we strip the survey tag before rephrasing so the LLM doesn't get confused by the "__User concerns:__" prefix.
+        # Strip the survey tag from concerns queries so the LLM doesn't get
+        # confused by the "__User concerns:__" prefix. Only used by the concerns
+        # branch below; the rephrase step still sees the raw user input so it
+        # has the full original phrasing available.
         clean_input = user_input.replace("__User concerns:__", "").strip()
 
+        # Step 1: rephrase follow-ups into standalone questions
         if chat_history:
             standalone_q = await rephrase_chain.ainvoke({
                 "input": user_input,
@@ -246,9 +249,8 @@ def build_chain(pool):
                 "score": round(doc.metadata.get("score", 0), 4),
             })
 
-        # Step 4: generate answer with citations user concerns prompt if category is concern
-        #Otherwise use the standard QA prompt
-
+        # Step 4: generate answer with citations. Concerns queries use the
+        # Rumor Control system prompt; everything else uses the standard QA prompt.
         if query_category == "concerns":
             logger.info("Concerns query — using Rumor Control system prompt")
             answer = await concerns_chain.ainvoke({
@@ -257,11 +259,11 @@ def build_chain(pool):
                 "chat_history": chat_history,
             }, run_config)
         else:
-          answer = await qa_chain.ainvoke({
-              "context": _format_docs(docs),
-              "input": user_input,
-              "chat_history": chat_history,
-          }, run_config)
+            answer = await qa_chain.ainvoke({
+                "context": _format_docs(docs),
+                "input": user_input,
+                "chat_history": chat_history,
+            }, run_config)
 
         answer = _replace_source_refs(answer, sources)
 

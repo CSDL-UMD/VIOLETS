@@ -11,15 +11,12 @@ from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
 
 from box_ingest.crawler import BoxFile
 from box_ingest.filter import FILTER_INCLUDE
+from box_ingest.paths import MANIFEST_PATH
 
 logger = logging.getLogger(__name__)
-
-PROJECT_ROOT   = Path(__file__).parent.parent
-MANIFEST_PATH  = PROJECT_ROOT / "needtochunk" / "url_manifest.json"
 
 
 def _load_raw() -> dict:

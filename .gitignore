@@ -216,6 +216,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# macOS
+.DS_Store
+
 # Box OAuth token cache (contains access/refresh tokens — never commit)
 .box_token
 
