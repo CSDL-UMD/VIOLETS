@@ -174,15 +174,12 @@ class DB:
 
     def add_link(self, source: str, target: str, text: str,
                  context: str, is_internal: int, is_document: int):
-        try:
-            self.conn.execute("""
-                INSERT OR IGNORE INTO links
-                (source_url, target_url, link_text, link_context, is_internal, is_document)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (source, target, text, context, is_internal, is_document))
-            self.conn.commit()
-        except sqlite3.IntegrityError:
-            pass
+        self.conn.execute("""
+            INSERT OR IGNORE INTO links
+            (source_url, target_url, link_text, link_context, is_internal, is_document)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (source, target, text, context, is_internal, is_document))
+        self.conn.commit()
 
     # ---- Crawl run operations ----
 

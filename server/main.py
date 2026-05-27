@@ -98,11 +98,6 @@ class _RateLimiter:
                 t for t in self._requests[key]
                 if now - t < self._window
             ]
-            if not timestamps:
-                # Remove empty entries to prevent unbounded growth
-                self._requests.pop(key, None)
-                self._requests[key] = [now]
-                return True
             if len(timestamps) >= self._max:
                 self._requests[key] = timestamps
                 return False

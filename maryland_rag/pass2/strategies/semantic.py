@@ -8,7 +8,10 @@ with ~20% overlap between consecutive chunks.
 This is a self-contained implementation that doesn't require langchain or
 llama-index, but can be swapped for SemanticChunker if embeddings are available.
 """
+import logging
 import re
+
+logger = logging.getLogger(__name__)
 
 # Target chunk sizes (in words, roughly equivalent to 1.3x tokens)
 TARGET_CHUNK_WORDS = 300

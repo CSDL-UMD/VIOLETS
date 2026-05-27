@@ -2,67 +2,19 @@
 RAG logging — LLM prompts, responses, token usage, cost estimates,
 per-step latency, and request-level history.
 
-Changes made to main.py
------------------------
-1. Added `import time` at the top — needed to measure how long each
-   request takes end-to-end.
+Two exports:
+  - RAGCallbackHandler: a LangChain BaseCallbackHandler attached per request
+    via ``chain.ainvoke(..., config={"callbacks": [handler]})``. Logs every
+    LLM call (prompt, response, tokens, cost, latency) and retriever invocation
+    that the chain triggers.
+  - log_request(user_id, query, response, elapsed): one-line request summary
+    called from the /chat endpoint after the chain completes. Captures the
+    user, query, response size, and end-to-end wall-clock time — context the
+    in-chain callback handler can't see.
 
-2. Added to the imports:
-       from .rag_logger import RAGCallbackHandler, log_request
-
-3. Changed the chain construction in lifespan() from:
-       chain = build_chain()
-   to:
-       chain = build_chain().with_config({"callbacks": [RAGCallbackHandler()]})
-
-   build_chain() is unchanged. .with_config() attaches RAGCallbackHandler
-   to the already-built chain so LangChain fires its logging events
-   automatically on every call. RAGCallbackHandler is defined in this file.
-
-4. In the /chat endpoint, added a start timestamp before the chain call
-   and a log_request() call immediately after:
-       start = time.time()
-       result = await chain.ainvoke({...})
-       answer = result
-       log_request(req.user_id, req.query, answer, elapsed=time.time() - start)
-
-   log_request() is defined in this file. It writes one log line per
-   request capturing the user, their query, response size, and total time.
-   This is separate from the callback handler because the handler only
-   sees what happens inside the chain — it has no visibility into which
-   user triggered the request or the total server-side time.
-
-Coverage note
--------------
-RAGCallbackHandler covers the final QA step fully: full prompt, full
-response, token counts, cost, and latency.
-
-The rephrase step and retriever call inside contextualize_and_retrieve()
-in rag_chain.py are invoked via plain synchronous .invoke() calls with
-no config passed through, so the callback system cannot reach them
-automatically. Their logging is handled by the existing manual
-logger.info() calls already in rag_chain.py. Full callback coverage of
-those steps would require making contextualize_and_retrieve() async and
-using .ainvoke() throughout.
-
-TEST
---------------
-To test this, create a virtual environment
-    python -m venv venv (one time)
-    venv\Scripts\activate (RUN THIS everytime you want to start the venv)
-    pip install -r maryland_rag/requirements.txt (one time)
-    pip install -r server/requirements.txt (one time)
-
-Then start a local server
-    uvicorn server.main:app --host 0.0.0.0 --port 8000
-
-In Git Bash:
-    curl -X POST http://localhost:8000/chat \
-    -H "Content-Type: application/json" \
-    -d '{"user_id": "test", "query": "When is the voter registration deadline?"}'
-
-And check the uvicorn terminal to see the logs
-
+Set LOG_PROMPTS / LOG_RESPONSES / LOG_QUERIES below to False in production
+to avoid writing user content to logs. Tokens, cost, and latency are always
+logged.
 """
 
 import logging
@@ -294,14 +246,8 @@ def log_request(
     """
     Log a completed /chat exchange at the request level.
 
-    Captures: user_id, the query (truncated for log readability),
-    response length in characters, and total wall-clock time if provided.
-
-    Call this in main.py after chain.ainvoke() returns, e.g.:
-
-        start = time.time()
-        result = await chain.ainvoke({...})
-        log_request(req.user_id, req.query, result, elapsed=time.time() - start)
+    Captures user_id, the query (truncated for log readability), response
+    length in characters, and total wall-clock time if provided.
     """
     timing = f" elapsed={elapsed:.2f}s" if elapsed is not None else ""
     query_field = repr(query[:120]) if LOG_QUERIES else f"len={len(query)}"

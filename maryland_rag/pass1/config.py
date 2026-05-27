@@ -26,11 +26,9 @@ SEED_URLS = [
     "https://mcg.montgomerycountymd.gov/Elections/Accessibility/voting-assistance.html",
     "https://mcg.montgomerycountymd.gov/Elections/EarlyVoting/EarlyVotingCenters.html",
 ]
-SEED_URL = SEED_URLS[0]  # backward compat
 
 # --- Domains ---
 DOMAINS = ['elections.maryland.gov', 'mcg.montgomerycountymd.gov']
-DOMAIN = DOMAINS[0]  # backward compat
 
 # --- Crawl Limits ---
 MAX_DEPTH = 6

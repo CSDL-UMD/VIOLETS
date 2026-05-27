@@ -1,307 +1,316 @@
 """
-Box materials ingestion pipeline.
+Box materials ingestion — Step 2 of 2.
 
-Everything in needtochunk/ is assumed pre-selected. This script:
-  1. Walks all files in needtochunk/ (recursively)
-  2. Looks up the Box share URL from url_manifest.json
-  3. Extracts text:
-       PDF  → pdfplumber → pymupdf → OCR (tesseract, for scanned PDFs)
-       DOCX → heading-aware section extraction
-       TXT  → plain read
-  4. Chunks the text:
-       DOCX with headings → each section chunked independently, heading chain
-                            stored in section_hierarchy
-       Short docs (≤150 words) → ingest_as_single
-       Long docs              → semantic_chunk with paragraph fallback
-  5. Assigns deterministic SHA256 chunk IDs (stable across re-runs)
-  6. Writes data/box_chunks.jsonl in pass2-compatible format for pass3
+Reads every file in needtochunk/, extracts the text using the shared Pass 2
+extractors, chunks it, and writes data/box_chunks.jsonl in the schema Pass 3
+(embedding) expects.
 
-Files with no Box URL in the manifest are skipped with a warning.
-Re-running is safe: same content produces the same chunk_id, so pass3
-upserts are no-ops for unchanged files.
+Two efficiency features:
 
-Usage:
-    python -m box_ingest.ingest
-    python -m box_ingest.ingest --dry-run        # preview manifest mappings
-    python -m box_ingest.ingest --output data/box_chunks.jsonl
+  - Skip-if-unchanged. A per-file state cache (data/box_ingest.state.json)
+    records each file's size+mtime fingerprint and its produced chunks.
+    On re-run, unchanged files reuse their cached chunks instead of being
+    re-extracted (OCR is the expensive path we most want to avoid).
+
+  - Parallel extraction. Files are extracted in a ProcessPoolExecutor so
+    PDF text extraction and OCR run across CPU cores.
+
+The consolidated JSONL is the union of all cached chunks, so downstream
+Pass 3 always sees the full corpus regardless of which files were
+re-extracted this run.
+
+Run:
+    python -m box_ingest.automate     # download files from Box (Step 1)
+    python -m box_ingest.ingest       # extract + chunk (Step 2)
+
+Called automatically by `python -m maryland_rag all`.
 """
+from __future__ import annotations
+
 import argparse
-import hashlib
-import io
 import json
 import logging
-import sys
-from datetime import datetime, timezone
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-OCR_DPI = 250
-SHORT_DOC_WORDS = 150
+from box_ingest.paths import (
+    NEEDTOCHUNK_DIR,
+    MANIFEST_PATH,
+    STATE_PATH,
+    DEFAULT_OUTPUT,
+)
+from maryland_rag.pass2.metadata import build_chunk_metadata
+from maryland_rag.pass2.strategies.docx_strategy import extract_docx_from_path
+from maryland_rag.pass2.strategies.pdf import extract_pdf_from_path
+from maryland_rag.pass2.strategies.semantic import semantic_chunk
+from maryland_rag.pass2.strategies.single import ingest_as_single
+from maryland_rag.pass2.strategies.xls_strategy import extract_xls_from_path
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).parent.parent
-NEEDTOCHUNK_DIR = PROJECT_ROOT / 'needtochunk'
-MANIFEST_PATH = NEEDTOCHUNK_DIR / 'url_manifest.json'
-DEFAULT_OUTPUT = PROJECT_ROOT / 'data' / 'box_chunks.jsonl'
+SHORT_DOC_WORDS      = 150
+FALLBACK_CHUNK_WORDS = 400
+SKIP_NAMES           = {"url_manifest.json", "review_files.txt", ".DS_Store"}
 
 
-def load_manifest() -> dict[str, str]:
-    """Load relative path → Box URL mapping from url_manifest.json."""
+# ---------------------------------------------------------------------------
+# Manifest + state
+# ---------------------------------------------------------------------------
+
+def _load_manifest() -> dict[str, str]:
     if not MANIFEST_PATH.exists():
         logger.warning("url_manifest.json not found at %s", MANIFEST_PATH)
         return {}
-    with open(MANIFEST_PATH, encoding='utf-8') as f:
+    with open(MANIFEST_PATH, encoding="utf-8") as f:
         data = json.load(f)
-    return {k: v for k, v in data.items() if not k.startswith('_')}
+    return {k: v for k, v in data.items() if not k.startswith("_")}
 
 
-def _ocr_pdf(path: Path) -> str:
-    """Rasterize each page and OCR with tesseract. Used for scanned PDFs."""
+def _load_state() -> dict:
+    if not STATE_PATH.exists():
+        return {}
     try:
-        import fitz
-        import pytesseract
-        from PIL import Image
-    except ImportError as exc:
-        logger.error("OCR dependencies missing (%s); skipping %s", exc, path.name)
-        return ''
-    try:
-        doc = fitz.open(path)
+        with open(STATE_PATH, encoding="utf-8") as f:
+            return json.load(f)
     except Exception as exc:
-        logger.error("OCR open failed on %s: %s", path.name, exc)
-        return ''
-    parts = []
-    for i, page in enumerate(doc):
-        try:
-            pix = page.get_pixmap(dpi=OCR_DPI)
-            img = Image.open(io.BytesIO(pix.tobytes('png')))
-            parts.append(pytesseract.image_to_string(img) or '')
-        except Exception as exc:
-            logger.warning("OCR failed on %s page %d: %s", path.name, i + 1, exc)
-    doc.close()
-    return '\n\n'.join(parts)
+        logger.warning("Failed to read state file (%s); rebuilding from scratch", exc)
+        return {}
 
 
-def _extract_docx_sections(path: Path) -> list[dict]:
-    """Extract heading-aware sections from a DOCX. Returns [] on failure."""
-    try:
-        from docx import Document
-    except ImportError:
-        logger.error("python-docx not installed")
-        return []
-    try:
-        doc = Document(str(path))
-    except Exception as exc:
-        logger.error("Failed to parse %s: %s", path.name, exc)
-        return []
-
-    heading_levels = {f'Heading {i}': i for i in range(1, 7)}
-    heading_levels['Title'] = 0
-
-    sections, heading_stack, current = [], [], []
-    for para in doc.paragraphs:
-        text = para.text.strip()
-        if not text:
-            continue
-        style = para.style.name if para.style else ''
-        level = heading_levels.get(style)
-        if level is not None:
-            if current:
-                sections.append({
-                    'heading_chain': [h[1] for h in heading_stack],
-                    'text': '\n\n'.join(current),
-                })
-            while heading_stack and heading_stack[-1][0] >= level:
-                heading_stack.pop()
-            heading_stack.append((level, text))
-            current = []
-        else:
-            current.append(text)
-
-    if current:
-        sections.append({
-            'heading_chain': [h[1] for h in heading_stack],
-            'text': '\n\n'.join(current),
-        })
-    return sections
+def _save_state(state: dict) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_PATH.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False)
+    tmp.replace(STATE_PATH)
 
 
-def extract_text(path: Path) -> str:
-    suffix = path.suffix.lower()
-
-    if suffix == '.pdf':
-        try:
-            import pdfplumber
-            with pdfplumber.open(str(path)) as pdf:
-                text = '\n\n'.join(p.extract_text() or '' for p in pdf.pages).strip()
-            if len(text.split()) >= 30:
-                return text
-        except Exception as e:
-            logger.debug("pdfplumber failed for %s: %s", path.name, e)
-        try:
-            import fitz
-            doc = fitz.open(str(path))
-            text = '\n\n'.join(page.get_text() for page in doc).strip()
-            doc.close()
-            if text.strip():
-                return text
-        except Exception as e:
-            logger.warning("pymupdf failed for %s: %s", path.name, e)
-        logger.info("No embedded text in %s; falling back to OCR", path.name)
-        return _ocr_pdf(path)
-
-    if suffix in ('.docx', '.doc'):
-        try:
-            from docx import Document
-            doc = Document(str(path))
-            return '\n\n'.join(p.text for p in doc.paragraphs if p.text.strip())
-        except Exception as e:
-            logger.warning("DOCX extraction failed for %s: %s", path.name, e)
-            return ''
-
-    if suffix == '.txt':
-        return path.read_text(encoding='utf-8', errors='replace')
-
-    logger.warning("Unsupported file type: %s", path.name)
-    return ''
+def _fingerprint(path: Path) -> str:
+    st = path.stat()
+    return f"{st.st_size}:{st.st_mtime_ns}"
 
 
-def chunk_text(text: str, max_words: int = 400) -> list[str]:
+# ---------------------------------------------------------------------------
+# Chunking
+# ---------------------------------------------------------------------------
+
+def _chunk_text(text: str) -> list[str]:
+    """Route text to single/semantic/paragraph-fallback chunking by length."""
     if not text or not text.strip():
         return []
     if len(text.split()) <= SHORT_DOC_WORDS:
-        from maryland_rag.pass2.strategies.single import ingest_as_single
         return ingest_as_single(text)
     try:
-        from maryland_rag.pass2.strategies.semantic import semantic_chunk
         chunks = semantic_chunk(text)
         if chunks:
             return chunks
-    except Exception:
-        pass
-    # Paragraph-boundary fallback
-    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
-    chunks, current, current_words = [], [], 0
+    except Exception as exc:
+        logger.debug("semantic_chunk failed (%s); using paragraph fallback", exc)
+
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    chunks: list[str] = []
+    cur: list[str] = []
+    cur_words = 0
     for para in paragraphs:
-        words = len(para.split())
-        if current_words + words > max_words and current:
-            chunks.append('\n\n'.join(current))
-            current, current_words = [], 0
-        current.append(para)
-        current_words += words
-    if current:
-        chunks.append('\n\n'.join(current))
+        w = len(para.split())
+        if cur_words + w > FALLBACK_CHUNK_WORDS and cur:
+            chunks.append("\n\n".join(cur))
+            cur, cur_words = [], 0
+        cur.append(para)
+        cur_words += w
+    if cur:
+        chunks.append("\n\n".join(cur))
     return chunks
 
 
-def build_chunk(text: str, source_url: str, title: str,
-                chunk_index: int, chunk_total: int,
-                section_hierarchy: list[str] | None = None) -> dict:
-    raw = f"{source_url}:{chunk_index}"
-    chunk_id = hashlib.sha256(raw.encode()).hexdigest()[:32]
-    return {
-        'chunk_id': chunk_id,
-        'source_url': source_url,
-        'title': title,
-        'section_hierarchy': section_hierarchy or [],
-        'page_classification': 'document',
-        'chunking_strategy': 'box_ingest',
-        'chunk_index': chunk_index,
-        'chunk_total': chunk_total,
-        'word_count': len(text.split()),
-        'text': text,
-        'date_extracted': datetime.now(timezone.utc).isoformat(),
-    }
+def _build(text: str, source_url: str, title: str,
+           chunk_index: int, chunk_total: int,
+           section_hierarchy: list[str]) -> dict:
+    return build_chunk_metadata(
+        source_url=source_url,
+        title=title,
+        section_hierarchy=section_hierarchy,
+        page_classification="document",
+        chunking_strategy="box_ingest",
+        chunk_index=chunk_index,
+        chunk_total=chunk_total,
+        text=text,
+    )
 
 
-def run_ingest(dry_run: bool = False, output_path: Path | None = None) -> list[dict]:
-    manifest = load_manifest()
-    all_chunks: list[dict] = []
-    missing_urls: list[str] = []
+# ---------------------------------------------------------------------------
+# Per-file worker (must be top-level so ProcessPoolExecutor can pickle it)
+# ---------------------------------------------------------------------------
 
-    for file_path in sorted(NEEDTOCHUNK_DIR.rglob('*')):
-        if not file_path.is_file():
-            continue
-        if file_path.name == 'url_manifest.json':
-            continue
+def _process_file(rel_key: str, abs_path_str: str, box_url: str) -> list[dict]:
+    abs_path = Path(abs_path_str)
+    folder_chain = list(abs_path.relative_to(NEEDTOCHUNK_DIR).parts[:-1])
+    title = abs_path.stem
+    suffix = abs_path.suffix.lower()
 
-        rel_key = str(file_path.relative_to(NEEDTOCHUNK_DIR))
-        folder_chain = list(file_path.relative_to(NEEDTOCHUNK_DIR).parts[:-1])
-        box_url = manifest.get(rel_key, '').strip()
-
-        if not box_url:
-            missing_urls.append(rel_key)
-            logger.warning("No Box URL in manifest: %s", rel_key)
-            continue
-
-        if dry_run:
-            print(f"  {rel_key}\n    → {box_url}")
-            continue
-
-        logger.info("Processing: %s", rel_key)
-        suffix = file_path.suffix.lower()
-
-        if suffix in ('.docx', '.doc'):
-            sections = _extract_docx_sections(file_path)
-            if sections:
-                section_chunks = []
-                for section in sections:
-                    s_text = section['text'].strip()
-                    if not s_text:
-                        continue
-                    for c in chunk_text(s_text):
-                        section_chunks.append((folder_chain + section['heading_chain'], c))
-                if not section_chunks:
-                    logger.warning("No chunks produced for %s", rel_key)
-                    continue
-                for i, (heading_chain, c) in enumerate(section_chunks):
-                    all_chunks.append(build_chunk(
-                        text=c,
-                        source_url=box_url,
-                        title=file_path.stem,
-                        chunk_index=i,
-                        chunk_total=len(section_chunks),
-                        section_hierarchy=heading_chain,
-                    ))
-                continue
-
-        text = extract_text(file_path)
+    if suffix == ".pdf":
+        result = extract_pdf_from_path(str(abs_path), ocr_fallback=True)
+        text = result.get("text", "")
         if not text.strip():
-            logger.warning("No text extracted from %s", rel_key)
+            return []
+        pieces = _chunk_text(text)
+        return [_build(c, box_url, title, i, len(pieces), folder_chain)
+                for i, c in enumerate(pieces)]
+
+    if suffix in (".docx", ".doc"):
+        result = extract_docx_from_path(str(abs_path))
+        sections = result.get("sections", [])
+        if sections:
+            records: list[tuple[list[str], str]] = []
+            for sec in sections:
+                for c in _chunk_text(sec.get("text", "")):
+                    records.append((folder_chain + sec.get("heading_chain", []), c))
+            return [_build(c, box_url, title, i, len(records), chain)
+                    for i, (chain, c) in enumerate(records)]
+        text = result.get("full_text", "")
+        if not text.strip():
+            return []
+        pieces = _chunk_text(text)
+        return [_build(c, box_url, title, i, len(pieces), folder_chain)
+                for i, c in enumerate(pieces)]
+
+    if suffix in (".xlsx", ".xlsm"):
+        rows = extract_xls_from_path(str(abs_path)).get("rows", [])
+        return [_build(r, box_url, title, i, len(rows), folder_chain)
+                for i, r in enumerate(rows)]
+
+    if suffix == ".txt":
+        text = abs_path.read_text(encoding="utf-8", errors="replace")
+        if not text.strip():
+            return []
+        pieces = _chunk_text(text)
+        return [_build(c, box_url, title, i, len(pieces), folder_chain)
+                for i, c in enumerate(pieces)]
+
+    logger.warning("Unsupported file type: %s", abs_path.name)
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Driver
+# ---------------------------------------------------------------------------
+
+def run_ingest(
+    dry_run: bool = False,
+    output_path: Path | None = None,
+    workers: int | None = None,
+) -> list[dict]:
+    if workers is None:
+        workers = max(2, os.cpu_count() or 4)
+
+    manifest = _load_manifest()
+    state = _load_state() if not dry_run else {}
+
+    on_disk: list[tuple[str, Path, str]] = []
+    missing_url: list[str] = []
+    for fp in sorted(NEEDTOCHUNK_DIR.rglob("*")):
+        if not fp.is_file():
             continue
+        if fp.name in SKIP_NAMES:
+            continue
+        rel_key = str(fp.relative_to(NEEDTOCHUNK_DIR))
+        box_url = (manifest.get(rel_key) or "").strip()
+        if not box_url:
+            missing_url.append(rel_key)
+            continue
+        on_disk.append((rel_key, fp, box_url))
 
-        chunks = chunk_text(text)
-        for i, chunk_text_str in enumerate(chunks):
-            all_chunks.append(build_chunk(
-                text=chunk_text_str,
-                source_url=box_url,
-                title=file_path.stem,
-                chunk_index=i,
-                chunk_total=len(chunks),
-                section_hierarchy=folder_chain,
-            ))
+    on_disk_keys = {k for k, _, _ in on_disk}
+    stale_keys = [k for k in state if k not in on_disk_keys]
+    if stale_keys:
+        logger.info("Dropping %d state entries for files no longer on disk", len(stale_keys))
+        for k in stale_keys:
+            state.pop(k, None)
 
-    if missing_urls:
-        logger.info("%d file(s) skipped — add Box URLs to url_manifest.json:", len(missing_urls))
-        for p in missing_urls:
-            logger.info("  %s", p)
+    todo: list[tuple[str, Path, str]] = []
+    reused = 0
+    for rel_key, fp, box_url in on_disk:
+        fp_print = _fingerprint(fp)
+        cached = state.get(rel_key)
+        if cached and cached.get("fingerprint") == fp_print and cached.get("box_url") == box_url:
+            reused += 1
+            continue
+        todo.append((rel_key, fp, box_url))
 
-    if not dry_run:
-        logger.info("Total chunks produced: %d", len(all_chunks))
-        if all_chunks:
-            out = output_path or DEFAULT_OUTPUT
-            out.parent.mkdir(parents=True, exist_ok=True)
-            with open(out, 'w', encoding='utf-8') as f:
-                for chunk in all_chunks:
-                    f.write(json.dumps(chunk, ensure_ascii=False) + '\n')
-            logger.info("Written to %s", out)
+    logger.info(
+        "Box ingest plan: %d on disk, %d cached, %d to (re)extract, %d missing URL",
+        len(on_disk), reused, len(todo), len(missing_url),
+    )
+    for p in missing_url:
+        logger.warning("No Box URL in manifest: %s", p)
+
+    if dry_run:
+        for rel_key, _, box_url in todo:
+            print(f"  [extract] {rel_key} -> {box_url}")
+        todo_keys = {k for k, _, _ in todo}
+        for rel_key, _, _ in on_disk:
+            if rel_key not in todo_keys:
+                print(f"  [cached]  {rel_key}")
+        return []
+
+    if todo:
+        effective_workers = min(workers, len(todo))
+        logger.info("Extracting %d file(s) with %d worker(s)", len(todo), effective_workers)
+        if effective_workers <= 1:
+            for rel_key, fp, box_url in todo:
+                try:
+                    chunks = _process_file(rel_key, str(fp), box_url)
+                except Exception as exc:
+                    logger.error("Failed to process %s: %s", rel_key, exc, exc_info=True)
+                    continue
+                state[rel_key] = {
+                    "fingerprint": _fingerprint(fp),
+                    "box_url": box_url,
+                    "chunks": chunks,
+                }
+                logger.info("Processed %s (%d chunks)", rel_key, len(chunks))
+        else:
+            with ProcessPoolExecutor(max_workers=effective_workers) as pool:
+                futures = {
+                    pool.submit(_process_file, rel_key, str(fp), box_url): (rel_key, fp, box_url)
+                    for rel_key, fp, box_url in todo
+                }
+                for fut in as_completed(futures):
+                    rel_key, fp, box_url = futures[fut]
+                    try:
+                        chunks = fut.result()
+                    except Exception as exc:
+                        logger.error("Failed to process %s: %s", rel_key, exc, exc_info=True)
+                        continue
+                    state[rel_key] = {
+                        "fingerprint": _fingerprint(fp),
+                        "box_url": box_url,
+                        "chunks": chunks,
+                    }
+                    logger.info("Processed %s (%d chunks)", rel_key, len(chunks))
+
+    _save_state(state)
+
+    all_chunks: list[dict] = []
+    for rel_key in sorted(state):
+        all_chunks.extend(state[rel_key].get("chunks", []))
+
+    out = output_path or DEFAULT_OUTPUT
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w", encoding="utf-8") as f:
+        for chunk in all_chunks:
+            f.write(json.dumps(chunk, ensure_ascii=False) + "\n")
+    logger.info("Wrote %d chunks -> %s", len(all_chunks), out)
 
     return all_chunks
 
 
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--dry-run', action='store_true')
-    parser.add_argument('--output', type=Path, default=None)
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    parser = argparse.ArgumentParser(description="Chunk files in needtochunk/ for Pass 3")
+    parser.add_argument("--dry-run", action="store_true", help="List planned actions, write nothing")
+    parser.add_argument("--output", type=Path, default=None, help="Override output JSONL path")
+    parser.add_argument("--workers", type=int, default=None, help="Parallel worker count (default: CPU count)")
     args = parser.parse_args()
-    run_ingest(dry_run=args.dry_run, output_path=args.output)
+    run_ingest(dry_run=args.dry_run, output_path=args.output, workers=args.workers)
