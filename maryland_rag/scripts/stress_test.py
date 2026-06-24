@@ -9,7 +9,7 @@ import json
 import os
 import time
 import httpx
-BASE = "http://localhost:8000"
+BASE = os.environ.get("VIOLETS_BASE_URL", "http://localhost:6000")
 TIMEOUT = 30.0
 API_KEY = os.environ.get("VIOLETS_API_KEY", "")
 AUTH_HEADERS = {"X-API-Key": API_KEY}
@@ -31,12 +31,12 @@ async def chat(client, user_id, query):
     )
     return resp.status_code, resp.json()
 async def test_concurrent_rag_queries():
-    """10 different users, same question, all at once."""
-    print("\n[1] Concurrent RAG queries (10 users, same question)")
+    """25 different users, same question, all at once — saturates the connection pool (max_size=25)."""
+    print("\n[1] Concurrent RAG queries (25 users, same question)")
     async with httpx.AsyncClient() as client:
         tasks = [
             chat(client, f"concurrent-{i}", "How do I register to vote in Maryland?")
-            for i in range(10)
+            for i in range(25)
         ]
         start = time.time()
         responses = await asyncio.gather(*tasks, return_exceptions=True)
@@ -45,10 +45,33 @@ async def test_concurrent_rag_queries():
     successes = [r for r in responses if not isinstance(r, Exception)]
     ok_count = sum(1 for s, body in successes if s == 200 and "response" in body)
     record(
-        f"10 concurrent RAG queries in {elapsed:.1f}s",
-        ok_count == 10 and len(errors) == 0,
-        f"{ok_count}/10 succeeded, {len(errors)} exceptions"
+        f"25 concurrent RAG queries in {elapsed:.1f}s",
+        ok_count == 25 and len(errors) == 0,
+        f"{ok_count}/25 succeeded, {len(errors)} exceptions"
         + (f": {errors[0]}" if errors else ""),
+    )
+    # Verify source_urls field is present and non-empty in sources (new in rag_chain refactor)
+    bad_sources = []
+    for s, body in successes:
+        if s == 200:
+            for src in body.get("sources", []):
+                if not src.get("source_urls"):
+                    bad_sources.append(src.get("source_url", "?"))
+    record(
+        "source_urls populated in all source references",
+        len(bad_sources) == 0,
+        f"missing source_urls in: {bad_sources[:3]}",
+    )
+    # Verify no response is the silent error fallback (would mean fail-closed triggered on a normal query)
+    error_fallback = "couldn't process your question"
+    fallback_count = sum(
+        1 for s, body in successes
+        if s == 200 and error_fallback in body.get("response", "")
+    )
+    record(
+        "No silent error fallbacks on normal RAG queries",
+        fallback_count == 0,
+        f"{fallback_count}/25 responses returned the error fallback",
     )
 async def test_same_user_concurrent():
     """Same user_id, 5 concurrent requests — tests session store race."""
@@ -161,6 +184,7 @@ async def test_mixed_guardrail_paths():
         start = time.time()
         responses = await asyncio.gather(*tasks, return_exceptions=True)
         elapsed = time.time() - start
+    error_fallback = "couldn't process your question"
     for (uid, q, label), resp in zip(queries, responses):
         if isinstance(resp, Exception):
             record(f"{label} ({uid})", False, str(resp))
@@ -168,6 +192,13 @@ async def test_mixed_guardrail_paths():
             s, body = resp
             has_response = isinstance(body, dict) and "response" in body
             record(f"{label} ({uid})", s == 200 and has_response, f"status={s}")
+            # Normal RAG paths should never hit the silent error fallback
+            if label == "normal RAG" and has_response:
+                record(
+                    f"No silent error fallback ({uid})",
+                    error_fallback not in body.get("response", ""),
+                    "got error fallback on a normal RAG query",
+                )
     print(f"  All 5 mixed queries completed in {elapsed:.1f}s")
 async def test_session_reset_under_load():
     """Reset a session while another request is in-flight for that user."""
@@ -200,12 +231,12 @@ async def test_health_during_load():
     """Health endpoint should respond quickly even when RAG is busy."""
     print("\n[6] Health endpoint responsiveness under load")
     async with httpx.AsyncClient() as client:
-        # Fire 5 RAG queries
+        # Fire 20 RAG queries to put real pressure on the threadpool
         rag_tasks = [
             asyncio.create_task(
                 chat(client, f"health-load-{i}", "How do I vote early in Maryland?")
             )
-            for i in range(5)
+            for i in range(20)
         ]
         await asyncio.sleep(0.5)
         # Health should respond fast even with 5 RAG queries in-flight
