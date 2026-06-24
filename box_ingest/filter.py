@@ -25,6 +25,20 @@ INCLUDE_TERMS = [
     "poll worker",
     "absentee",
     "mail-in",
+    # Added from manual triage of REVIEW files (2026-06-24):
+    "voter guide",        # MoCo Voter Guide for the 2026 Primary
+    "canvass",            # canvass overview / instructions / precanvass / scenario chart
+    "final regulations",  # Final Regulations COMAR (not the superseded "Proposed Regs")
+    "usability",          # ExpressVote 3 Usability Report
+    "testing report",     # ES&S EVS 6.5.0.0 Testing Report
+    "election judge",     # Election Judge Parity Reporting policy
+    # Mail-in-ballot legislative Q&A batch (2026-06/25), kept per request:
+    "question and answer",  # Delegate/Senator Q&A files (Fisher, Korman, Long, Miller, Szeliga, Hester)
+    "delegate",             # delegate Q&As + Mail Message to Delegate Mangione
+    "caucus",               # House Republican Caucus Question/Response/Attachment
+    "lwv",                  # Letter From/To LWV (League of Women Voters)
+    "del long",             # Del Long response pt 2
+    "house_admin",          # House_Admin_Response_06122026
 ]
 
 EXCLUDE_TERMS = [

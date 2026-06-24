@@ -41,8 +41,16 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _local_path(box_file: BoxFile) -> Path:
+    # Reject Box-supplied names that try to escape the download root.
+    for component in (*Path(box_file.folder_path).parts, box_file.name):
+        if component == ".." or "/" in component or "\\" in component:
+            raise ValueError(f"Unsafe Box path component: {component!r}")
     base = NEEDTOCHUNK_DIR / box_file.folder_path if box_file.folder_path else NEEDTOCHUNK_DIR
-    return base / box_file.name
+    candidate = base / box_file.name
+    root = NEEDTOCHUNK_DIR.resolve()
+    if not candidate.resolve().is_relative_to(root):
+        raise ValueError(f"Path escapes download root: {candidate}")
+    return candidate
 
 
 def _already_downloaded(box_file: BoxFile) -> bool:
@@ -77,7 +85,7 @@ def download_file(box_file: BoxFile, access_token: str, dry_run: bool = False) -
     req.add_header("BoxApi", f"shared_link={SHARED_LINK}")
 
     logger.info("Downloading: %s", box_file.name)
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=30) as resp:
         dest_path.write_bytes(resp.read())
 
     logger.info("Saved to: %s", dest_path)

@@ -31,6 +31,7 @@ QUERY CATEGORIES AND WHAT HAPPENS TO THEM:
     - partisan         → blocked entirely, fallback message returned
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Literal
@@ -43,6 +44,15 @@ from presidio_analyzer import AnalyzerEngine
 from . import config
 
 logger = logging.getLogger(__name__)
+
+# Hard ceiling on the small guardrail LLM calls so a hung upstream can't
+# stall the request pipeline. A timeout is treated exactly like any other
+# exception by the existing fail-open except blocks.
+GUARDRAIL_LLM_TIMEOUT = 30  # seconds
+
+# The partisan retry re-invokes the full RAG chain, so it gets the larger
+# chain-sized ceiling rather than the small-LLM one.
+PARTISAN_RETRY_TIMEOUT = 60  # seconds
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +146,11 @@ FALLBACK_RESPONSES = {
         "Maryland Primary Election here: "
         "https://elections.maryland.gov/elections/2026/primary_candidates/index.html"
     ),
+    "error": (
+        "Sorry, I couldn't process your question right now. Please try "
+        "rephrasing it, and I'll do my best to help with Maryland election "
+        "information."
+    ),
 }
 
 
@@ -188,11 +203,24 @@ def detect_pii(query: str, ctx : QueryContext) -> str | None:
     """
 
     query = str(query)
-    results = _analyzer.analyze(
-        text=query,
-        language="en",
-        entities=_PII_ENTITIES,
-    )
+    try:
+        results = _analyzer.analyze(
+            text=query,
+            language="en",
+            entities=_PII_ENTITIES,
+        )
+    except Exception as exc:
+        # Fail closed: if the analyzer errors we can't confirm the input is
+        # clean, so treat it as if PII were detected and block the request
+        # rather than letting unscanned input through.
+        logger.error(
+            "detect_pii failed [user=%s error=%s] — blocking (fail closed).",
+            ctx.user_id,
+            exc,
+        )
+        ctx.pii_detected = True
+        ctx.pii_type = "unknown"
+        return FALLBACK_RESPONSES["pii"]
 
     # Filter to detections above confidence threshold
     hits = [r for r in results if r.score >= _PII_SCORE_THRESHOLD]
@@ -314,8 +342,9 @@ async def classify_query(query: str, ctx: QueryContext) -> str | None:
     the concerns category causes the system prompt to be overwritten
     with a Rumor Control directive.
  
-    Fails open: if the classifier LLM errors, logs and returns None
-    so the user still gets an answer.
+    Fails closed: if the classifier LLM errors, logs and returns a safe
+    canned fallback asking the user to rephrase, so an unclassified query
+    never reaches the RAG chain unfiltered.
     """
     # Check for hardcoded survey tag first — no LLM call needed
     # The survey system prefixes concern queries with "__User concerns:__"
@@ -326,10 +355,13 @@ async def classify_query(query: str, ctx: QueryContext) -> str | None:
         return None  # pass through to RAG chain with concerns prompt
  
     try:
-        result: ClassificationResult = await _classifier_llm.ainvoke([
-            SystemMessage(content=_CLASSIFIER_SYSTEM_PROMPT),
-            HumanMessage(content=query),
-        ])
+        result: ClassificationResult = await asyncio.wait_for(
+            _classifier_llm.ainvoke([
+                SystemMessage(content=_CLASSIFIER_SYSTEM_PROMPT),
+                HumanMessage(content=query),
+            ]),
+            timeout=GUARDRAIL_LLM_TIMEOUT,
+        )
  
         ctx.query_category = result.category
         ctx.safety_flag = result.category == "partisan"
@@ -352,11 +384,15 @@ async def classify_query(query: str, ctx: QueryContext) -> str | None:
  
     except Exception as exc:
         logger.error(
-            "classify_query failed [user=%s error=%s] — allowing query through.",
+            "classify_query failed [user=%s error=%s] — blocking query (fail closed).",
             ctx.user_id,
             exc,
         )
-        return None  # fail open
+        # Fail closed: do NOT let an unclassified query reach the RAG chain
+        # unfiltered. Return a safe canned fallback so the user is asked to
+        # rephrase instead of receiving an unvetted answer.
+        ctx.safety_flag = True
+        return FALLBACK_RESPONSES["error"]  # fail closed
  
 
 
@@ -441,18 +477,22 @@ async def check_partisan_response(
     fired (main.py keeps the original sources), or the retry's sources
     if a retry produced a clean response.
  
-    Also fails open on exceptions: if the checker itself errors, the
-    current response is returned as-is.
+    Fails closed on exceptions: if the checker itself errors, the unchecked
+    response is discarded and the safe canned nonpartisan fallback is
+    returned instead.
     """
     current_response = response
     current_sources = None
 
     for attempt in range(MAX_PARTISAN_RETRIES + 1):  # 0 = original, 1-2 = retries
         try:
-            result = await _partisan_checker_llm.ainvoke([
-                SystemMessage(content=_PARTISAN_CHECKER_SYSTEM_PROMPT),
-                HumanMessage(content=current_response),
-            ])
+            result = await asyncio.wait_for(
+                _partisan_checker_llm.ainvoke([
+                    SystemMessage(content=_PARTISAN_CHECKER_SYSTEM_PROMPT),
+                    HumanMessage(content=current_response),
+                ]),
+                timeout=GUARDRAIL_LLM_TIMEOUT,
+            )
 
             logger.info(
                 "Partisan check [user=%s attempt=%d is_partisan=%s reason=%s]",
@@ -472,13 +512,20 @@ async def check_partisan_response(
                     ctx.user_id,
                     attempt,
                 )
-                retry_result = await chain.ainvoke(
-                    {
-                        "input": query + "\n\n" + _STRICT_NONPARTISAN_RETRY_PROMPT,
-                        "chat_history": chat_history,
-                        "query_category": ctx.query_category,
-                    },
-                    config={"callbacks": callbacks} if callbacks else None,
+                retry_result = await asyncio.wait_for(
+                    chain.ainvoke(
+                        {
+                            "input": query + "\n\n" + _STRICT_NONPARTISAN_RETRY_PROMPT,
+                            "chat_history": chat_history,
+                            # Force the standard RAG-with-retrieval path so the
+                            # strict-nonpartisan rewrite always runs grounded in
+                            # retrieved context, never the conversational
+                            # (no-retrieval) branch.
+                            "query_category": "normal",
+                        },
+                        config={"callbacks": callbacks} if callbacks else None,
+                    ),
+                    timeout=PARTISAN_RETRY_TIMEOUT,
                 )
                 if isinstance(retry_result, dict):
                     current_response = str(retry_result.get("answer", retry_result))
@@ -500,9 +547,12 @@ async def check_partisan_response(
         except Exception as exc:
             logger.error(
                 "check_partisan_response failed [user=%s attempt=%d error=%s] "
-                "— returning current response.",
+                "— returning safe nonpartisan fallback (fail closed).",
                 ctx.user_id,
                 attempt,
                 exc,
             )
-            return current_response, current_sources  # fail open
+            # Fail closed: the response was never verified, so never show the
+            # unchecked LLM output. Return the canned nonpartisan fallback and
+            # drop any retry sources tied to the unverified answer.
+            return FALLBACK_RESPONSES["partisan"], None  # fail closed

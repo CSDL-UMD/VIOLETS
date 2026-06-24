@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 
 from box_ingest.crawler import BoxFile
 from box_ingest.filter import FILTER_INCLUDE
@@ -23,8 +24,12 @@ def _load_raw() -> dict:
     """Load manifest as-is (preserving comment keys)."""
     if not MANIFEST_PATH.exists():
         return {}
-    with open(MANIFEST_PATH, encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(MANIFEST_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError as exc:
+        logger.warning("Manifest is corrupt (%s); starting from empty manifest", exc)
+        return {}
 
 
 def update_manifest(files: list[BoxFile], dry_run: bool = False) -> dict[str, int]:
@@ -60,8 +65,10 @@ def update_manifest(files: list[BoxFile], dry_run: bool = False) -> dict[str, in
             added += 1
 
     if not dry_run and added > 0:
-        with open(MANIFEST_PATH, "w", encoding="utf-8") as f:
+        tmp = MANIFEST_PATH.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(raw, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, MANIFEST_PATH)
         logger.info("Manifest written: %d new/updated entries", added)
     elif dry_run:
         logger.info("[dry-run] Would add/update %d entries", added)

@@ -25,6 +25,7 @@ from langchain_core.runnables import RunnableConfig, RunnableLambda
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 from . import config
+from .rag_logger import LOG_QUERIES
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,10 @@ class PgVectorRetriever(BaseRetriever):
         query_embedding = self.embeddings.embed_query(query)
 
         with self.pool.connection() as conn:
+            # Bound query time so a slow/hung pgvector scan can't pin a
+            # threadpool worker indefinitely. SET LOCAL applies within the
+            # implicit transaction of this (non-autocommit) connection.
+            conn.execute("SET LOCAL statement_timeout = '30s'")
             rows = conn.execute(
                 """
                 SELECT chunk_id, text, source_url, title, metadata,
@@ -134,6 +139,17 @@ class PgVectorRetriever(BaseRetriever):
             meta["source_url"] = source_url or "unknown"
             meta["title"] = title or ""
             meta["score"] = round(score, 4)
+            # Deduplicated chunks carry a `source_urls` list in the JSONB
+            # metadata (all URLs the content appears at). Surface the full,
+            # deduped list so citations can include every source. Fall back to
+            # the scalar source_url for chunks that only have one.
+            raw_urls = meta.get("source_urls") or [meta["source_url"]]
+            seen, urls = set(), []
+            for u in raw_urls:
+                if u and u != "unknown" and u not in seen:
+                    seen.add(u)
+                    urls.append(u)
+            meta["source_urls"] = urls or [meta["source_url"]]
             logger.debug(
                 "  Retrieved [%.4f] %s — %s",
                 score, source_url, (text or "")[:80].replace("\n", " ")
@@ -154,10 +170,12 @@ class PgVectorRetriever(BaseRetriever):
 def _format_docs(docs: list[Document]) -> str:
     parts = []
     for i, doc in enumerate(docs, 1):
-        source = doc.metadata.get("source_url", "unknown")
+        primary = doc.metadata.get("source_url", "unknown")
+        urls = doc.metadata.get("source_urls") or [primary]
         title = doc.metadata.get("title", "")
         header = f"[Source {i}]: {title}" if title else f"[Source {i}]"
-        parts.append(f"{header}\nURL: {source}\n{doc.page_content}")
+        url_line = "URL: " + " ; ".join(urls)
+        parts.append(f"{header}\n{url_line}\n{doc.page_content}")
     return "\n\n---\n\n".join(parts)
 
 
@@ -172,8 +190,15 @@ def _replace_source_refs(answer: str, sources: list[dict]) -> str:
         src = source_map.get(num)
         if not src or src["source_url"] == "unknown":
             return m.group(0)
+        urls = src.get("source_urls") or [src["source_url"]]
         title = src.get("title") or src["source_url"]
-        return f"[{title}]({src['source_url']})"
+        if len(urls) == 1:
+            return f"[{title}]({urls[0]})"
+        # Multi-source chunk: render the title link to the primary URL plus
+        # the remaining URLs as numbered links so all citations are surfaced.
+        links = [f"[{title}]({urls[0]})"]
+        links += [f"[{j}]({u})" for j, u in enumerate(urls[1:], 2)]
+        return " ".join(links)
 
     return re.sub(r"\[Source\s+(\d+)\]", _sub, answer, flags=re.IGNORECASE)
 
@@ -230,10 +255,12 @@ def build_chain(pool):
                 "input": user_input,
                 "chat_history": chat_history,
             }, run_config)
-            logger.info("Rephrased: '%s' → '%s'", user_input, standalone_q)
+            if LOG_QUERIES:
+                logger.info("Rephrased: '%s' → '%s'", user_input, standalone_q)
         else:
             standalone_q = user_input
-            logger.info("Query: '%s'", standalone_q)
+            if LOG_QUERIES:
+                logger.info("Query: '%s'", standalone_q)
 
         # Step 2: retrieve from pgvector
         logger.info("Retrieving top-%d from pgvector...", retriever.k)
@@ -242,9 +269,12 @@ def build_chain(pool):
         # Step 3: extract source metadata for the response
         sources = []
         for i, doc in enumerate(docs, 1):
+            primary = doc.metadata.get("source_url", "unknown")
+            source_urls = doc.metadata.get("source_urls") or [primary]
             sources.append({
                 "source_number": i,
-                "source_url": doc.metadata.get("source_url", "unknown"),
+                "source_url": primary,
+                "source_urls": source_urls,
                 "title": doc.metadata.get("title", ""),
                 "score": round(doc.metadata.get("score", 0), 4),
             })

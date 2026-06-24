@@ -12,16 +12,43 @@ import tempfile
 
 logger = logging.getLogger(__name__)
 
+# Guardrail: a spreadsheet is emitted one chunk per row. Bulk statistical
+# tables (precinct register counts, "Eligible Active Voters by ...") run to
+# hundreds or tens of thousands of rows of raw numbers that are useless for
+# semantic retrieval and drown out real content in the vector store. Any
+# spreadsheet that exceeds this row-chunk count is treated as bulk tabular
+# data and skipped entirely, with a loud warning so a genuinely useful file
+# caught here gets noticed and the threshold revisited. Narrative/reference
+# spreadsheets are far smaller than this.
+MAX_XLS_ROW_CHUNKS = 200
 
-def extract_xls_from_path(path: str) -> dict:
+
+def extract_xls_from_path(path: str, label: str | None = None) -> dict:
     """Return {'rows': [str, ...], 'sheets': [...]} for a spreadsheet on disk.
 
-    Format (.xls vs .xlsx/.xlsm) is detected from the path suffix.
+    Format (.xls vs .xlsx/.xlsm) is detected from the path suffix. Spreadsheets
+    that exceed MAX_XLS_ROW_CHUNKS rows are skipped (see guardrail note above).
     """
     suffix = path.lower()
     if suffix.endswith('.xlsx') or suffix.endswith('.xlsm'):
-        return _extract_xlsx(path)
-    return _extract_xls(path)
+        result = _extract_xlsx(path)
+    else:
+        result = _extract_xls(path)
+    return _apply_row_guardrail(result, label or path)
+
+
+def _apply_row_guardrail(result: dict, label: str) -> dict:
+    """Drop bulk spreadsheets whose row count exceeds the guardrail."""
+    n = len(result.get('rows', []))
+    if n > MAX_XLS_ROW_CHUNKS:
+        logger.warning(
+            "Skipping bulk spreadsheet %s: %d rows exceeds guardrail of %d "
+            "(treated as raw tabular data, not chunked). Raise "
+            "MAX_XLS_ROW_CHUNKS if this file is actually useful.",
+            label, n, MAX_XLS_ROW_CHUNKS,
+        )
+        return {'rows': [], 'sheets': result.get('sheets', [])}
+    return result
 
 
 def extract_xls(url: str) -> dict:
@@ -38,7 +65,7 @@ def extract_xls(url: str) -> dict:
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
         tmp.write(data)
         tmp.flush()
-        return extract_xls_from_path(tmp.name)
+        return extract_xls_from_path(tmp.name, label=url)
 
 
 def _extract_xls(path: str) -> dict:

@@ -528,8 +528,14 @@ CREATE TABLE chunks (
 
 **Run it:**
 ```bash
-uvicorn server.main:app --host 0.0.0.0 --port 8000
+python -m server.main            # host/port via HOST/PORT env (default 0.0.0.0:8000)
 ```
+
+> The server keeps rate-limit and session state in process memory, so it **must
+> run as a single worker**. `python -m server.main` pins `workers=1` for you
+> (overriding `WEB_CONCURRENCY`). If you invoke uvicorn directly
+> (`uvicorn server.main:app --host 0.0.0.0 --port 8000`), do **not** pass
+> `--workers >1` or set `WEB_CONCURRENCY`.
 
 ### Endpoints
 

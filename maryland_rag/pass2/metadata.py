@@ -4,7 +4,34 @@ Every chunk carries full provenance regardless of strategy.
 """
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
+
+
+def _normalize_text(text: str) -> str:
+    """Collapse whitespace so trivially-different encodings of the same
+    content hash to the same value (stable across re-ingests)."""
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _content_chunk_id(
+    text: str,
+    section_hierarchy: list[str] | None,
+    chunk_index: int,
+) -> str:
+    """Compute a stable chunk_id from the chunk's CONTENT.
+
+    The id depends only on the normalized chunk text plus a stable
+    doc/section disambiguator (the section hierarchy + chunk position).
+    It deliberately does NOT depend on the set of source URLs, so the
+    same content keeps the same id across re-ingests even when the number
+    or order of URLs referencing it changes. This lets pass3's
+    ON CONFLICT (chunk_id) upsert replace the existing vector instead of
+    orphaning it.
+    """
+    section_key = "/".join(section_hierarchy) if section_hierarchy else ""
+    raw = f"{_normalize_text(text)}\x00{section_key}\x00{chunk_index}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
 def build_chunk_metadata(
@@ -41,8 +68,7 @@ def build_chunk_metadata(
         except (json.JSONDecodeError, TypeError):
             section_hierarchy = []
 
-    raw = f"{source_url}:{chunk_index}"
-    chunk_id = hashlib.sha256(raw.encode()).hexdigest()[:32]
+    chunk_id = _content_chunk_id(text, section_hierarchy, chunk_index)
 
     chunk = {
         'chunk_id': chunk_id,
@@ -83,10 +109,15 @@ def build_chunk_metadata_multi_source(
 ) -> dict:
     """
     Build chunk metadata for deduplicated content that exists at multiple URLs.
-    The source_url field becomes a JSON array of all source URLs.
+    The primary source_url is the first URL; the full list is preserved in
+    source_urls (a JSON array surfaced to the retriever for multi-citation).
 
-    chunk_id is derived from the sorted URL set so it remains stable even if
-    the URL list order changes or a secondary URL disappears between runs.
+    chunk_id is computed by build_chunk_metadata from the chunk CONTENT, NOT
+    from the source-URL set, so the id stays stable across re-ingests even if
+    the number or order of URLs referencing this content changes. (Previously
+    the id was derived from the sorted URL set, which caused the same content
+    to be re-embedded under a new id — orphaning the old vector — whenever its
+    duplicate set shifted.)
     """
     chunk = build_chunk_metadata(
         source_url=source_urls[0],
@@ -98,9 +129,12 @@ def build_chunk_metadata_multi_source(
         chunk_total=chunk_total,
         text=text,
     )
-    # Override chunk_id with one derived from the full sorted URL set
-    stable_key = ':'.join(sorted(source_urls))
-    raw = f"{stable_key}:{chunk_index}"
-    chunk['chunk_id'] = hashlib.sha256(raw.encode()).hexdigest()[:32]
-    chunk['source_urls'] = source_urls
+    # Preserve the full, deduped source list (order-stable) for citations.
+    seen = set()
+    deduped = []
+    for u in source_urls:
+        if u not in seen:
+            seen.add(u)
+            deduped.append(u)
+    chunk['source_urls'] = deduped
     return chunk

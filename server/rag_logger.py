@@ -18,6 +18,7 @@ logged.
 """
 
 import logging
+import os
 import threading
 import time
 from typing import Any
@@ -36,9 +37,14 @@ logger = logging.getLogger(__name__)
 # Token counts, cost, and latency are always logged regardless of these flags.
 # ---------------------------------------------------------------------------
 
-LOG_PROMPTS: bool = True   # log full prompt sent to the LLM
-LOG_RESPONSES: bool = True  # log full response from the LLM
-LOG_QUERIES: bool = True    # log raw user query in log_request()
+# Default OFF (production-safe) — opt in per environment by setting the
+# matching env var to a truthy value ("1", "true", "yes").
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+LOG_PROMPTS: bool = _env_flag("LOG_PROMPTS")     # log full prompt sent to the LLM
+LOG_RESPONSES: bool = _env_flag("LOG_RESPONSES")  # log full response from the LLM
+LOG_QUERIES: bool = _env_flag("LOG_QUERIES")      # log raw user query in log_request()
 
 # ---------------------------------------------------------------------------
 # Cost table (USD per million tokens)

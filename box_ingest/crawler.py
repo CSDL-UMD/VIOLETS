@@ -33,7 +33,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
 
 from box_ingest.filter import classify_filename, FILTER_INCLUDE, FILTER_EXCLUDE, FILTER_REVIEW
-from box_ingest.paths import TOKEN_CACHE
+from box_ingest.paths import NEEDTOCHUNK_DIR, TOKEN_CACHE
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -50,7 +50,12 @@ OAUTH_REDIRECT    = "http://localhost:8080"
 # ---------------------------------------------------------------------------
 
 def _save_tokens(access: str, refresh: str) -> None:
-    TOKEN_CACHE.write_text(json.dumps({"access_token": access, "refresh_token": refresh}), encoding="utf-8")
+    # Tokens include a long-lived refresh token; create the file 0o600 so it is
+    # never briefly world-readable on a shared host.
+    data = json.dumps({"access_token": access, "refresh_token": refresh})
+    fd = os.open(TOKEN_CACHE, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(data)
 
 
 def _load_tokens() -> dict | None:
@@ -73,7 +78,7 @@ def _exchange_code(code: str, client_id: str, client_secret: str) -> tuple[str, 
                       "redirect_uri": OAUTH_REDIRECT}).encode()
     with urllib.request.urlopen(urllib.request.Request(
         "https://api.box.com/oauth2/token", data=body, method="POST"
-    )) as r:
+    ), timeout=30) as r:
         d = json.loads(r.read())
     return d["access_token"], d["refresh_token"]
 
@@ -83,7 +88,7 @@ def _refresh(client_id: str, client_secret: str, refresh_token: str) -> tuple[st
                       "client_id": client_id, "client_secret": client_secret}).encode()
     with urllib.request.urlopen(urllib.request.Request(
         "https://api.box.com/oauth2/token", data=body, method="POST"
-    )) as r:
+    ), timeout=30) as r:
         d = json.loads(r.read())
     return d["access_token"], d["refresh_token"]
 
@@ -127,7 +132,7 @@ def _api_get(path: str, access_token: str) -> dict:
     req = urllib.request.Request(url)
     req.add_header("Authorization", f"Bearer {access_token}")
     req.add_header("BoxApi", f"shared_link={SHARED_LINK}")
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read())
 
 
@@ -205,11 +210,20 @@ def _is_2026_folder(name: str, depth: int) -> bool:
 def _walk_folder(folder_id: str, folder_path: str, access_token: str, results: list[BoxFile], depth: int = 0) -> None:
     for item in _list_folder(folder_id, access_token):
         name = item["name"]
+        # Box names are externally writable; reject ones that could escape the
+        # download root once joined onto NEEDTOCHUNK_DIR downstream.
+        if name == ".." or "/" in name or "\\" in name:
+            logger.warning("Skipping Box item with unsafe name: %r", name)
+            continue
         if item["type"] == "folder":
             if not _is_2026_folder(name, depth):
                 logger.debug("Skipping non-2026 folder: %s", name)
                 continue
             sub = f"{folder_path}/{name}".lstrip("/")
+            candidate = (NEEDTOCHUNK_DIR / sub).resolve()
+            if not candidate.is_relative_to(NEEDTOCHUNK_DIR.resolve()):
+                logger.warning("Skipping folder whose path escapes download root: %s", sub)
+                continue
             _walk_folder(item["id"], sub, access_token, results, depth + 1)
         elif item["type"] == "file":
             results.append(BoxFile(

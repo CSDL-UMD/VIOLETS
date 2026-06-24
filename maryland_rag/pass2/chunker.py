@@ -288,6 +288,18 @@ def _build_dedup_map(db: DB) -> dict[str, list[str]]:
     dedup_map = {}
     for row in dupes:
         urls = row['urls'].split(',')
+        # SQLite GROUP_CONCAT is unbounded by default (only capped by
+        # SQLITE_MAX_LENGTH, ~1GB), so truncation is not a real risk for the
+        # small duplicate sets seen here. Defensively flag any mismatch between
+        # the COUNT(*) and the number of concatenated URLs, which would signal
+        # a dropped/empty URL or (theoretically) a truncated field.
+        expected = row['dupes']
+        if expected is not None and len(urls) != expected:
+            logger.warning(
+                "Dedup URL count mismatch for hash %s: expected %d, parsed %d "
+                "(possible GROUP_CONCAT truncation or empty URL)",
+                row['content_hash'], expected, len(urls),
+            )
         dedup_map[row['content_hash']] = urls
     return dedup_map
 

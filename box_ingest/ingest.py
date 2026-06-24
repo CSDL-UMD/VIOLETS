@@ -290,18 +290,26 @@ def run_ingest(
                     }
                     logger.info("Processed %s (%d chunks)", rel_key, len(chunks))
 
-    _save_state(state)
-
     all_chunks: list[dict] = []
     for rel_key in sorted(state):
         all_chunks.extend(state[rel_key].get("chunks", []))
 
+    # Write the JSONL output FIRST and durably (atomic tmp+rename, fsync'd) so
+    # the success state is never recorded while the chunks file is missing or
+    # truncated. If the disk fills here, state is not updated and the next run
+    # re-extracts and recovers instead of trusting a stale cache.
     out = output_path or DEFAULT_OUTPUT
     out.parent.mkdir(parents=True, exist_ok=True)
-    with open(out, "w", encoding="utf-8") as f:
+    tmp_out = out.with_suffix(out.suffix + ".tmp")
+    with open(tmp_out, "w", encoding="utf-8") as f:
         for chunk in all_chunks:
             f.write(json.dumps(chunk, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_out, out)
     logger.info("Wrote %d chunks -> %s", len(all_chunks), out)
+
+    _save_state(state)
 
     return all_chunks
 

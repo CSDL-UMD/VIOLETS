@@ -11,7 +11,13 @@ MIDDLEWARE PIPELINE (inside /chat, in order):
     [4] check_partisan_response()   — small LLM, ~100 tokens
 
 HOW TO RUN:
-    uvicorn server.main:app --host 0.0.0.0 --port 8000
+    python -m server.main            # preferred: pins workers=1 (see below)
+
+    # The app keeps rate-limit + session state in-process, so it MUST run as a
+    # single worker. Launching via `python -m server.main` enforces workers=1
+    # regardless of WEB_CONCURRENCY / --workers. If you launch uvicorn directly
+    # (uvicorn server.main:app --host 0.0.0.0 --port 8000) do NOT pass
+    # --workers >1 and do NOT set WEB_CONCURRENCY.
 
 HOW TO TEST:
     # Health check
@@ -54,7 +60,12 @@ from pydantic import BaseModel, Field
 
 from . import config
 from .rag_chain import build_chain, to_langchain_messages
-from .rag_logger import RAGCallbackHandler, log_request
+from .rag_logger import (
+    RAGCallbackHandler,
+    log_request,
+    LOG_PROMPTS,
+    LOG_RESPONSES,
+)
 from .session import SessionStore
 from .middleware import (
     QueryContext,
@@ -64,6 +75,10 @@ from .middleware import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Hard ceiling on the main RAG chain so a hung upstream LLM/DB call can't
+# pin the request (and its threadpool worker) indefinitely.
+RAG_CHAIN_TIMEOUT = 60  # seconds
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +109,15 @@ class _RateLimiter:
     def check(self, key: str) -> bool:
         now = time.time()
         with self._lock:
+            # Evict idle keys whose most recent request is outside the window
+            # so the dict stays bounded (it is never otherwise pruned).
+            stale = [
+                k for k, ts in self._requests.items()
+                if k != key and (not ts or now - ts[-1] >= self._window)
+            ]
+            for k in stale:
+                del self._requests[k]
+
             timestamps = [
                 t for t in self._requests[key]
                 if now - t < self._window
@@ -128,8 +152,12 @@ async def _periodic_session_cleanup():
     """Remove expired sessions every 5 minutes."""
     while True:
         await asyncio.sleep(300)
-        if store:
-            store.cleanup_expired()
+        try:
+            if store:
+                store.cleanup_expired()
+        except Exception:
+            # Never let a transient error kill the task permanently.
+            logger.exception("Periodic session cleanup failed; continuing.")
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +180,19 @@ async def lifespan(app: FastAPI):
         config.SESSION_TTL_MINUTES,
     )
 
+    if LOG_PROMPTS or LOG_RESPONSES:
+        logger.warning("Verbose prompt/response logging enabled — disable for production.")
+
+    # Raise the default threadpool capacity so up to ~70 concurrent sync
+    # retrievals (PgVectorRetriever runs in the threadpool via ainvoke) and
+    # other to_thread offloads don't queue behind the default 40-token limit.
+    try:
+        import anyio
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        limiter.total_tokens = 100
+    except Exception:
+        logger.warning("Could not raise anyio thread limiter; using default.")
+
     from psycopg_pool import ConnectionPool
     from pgvector.psycopg import register_vector
 
@@ -162,7 +203,8 @@ async def lifespan(app: FastAPI):
         configure=lambda conn: register_vector(conn),
         open=False,
     )
-    _pool.open()
+    # Block until the pool is ready so the first request doesn't race startup.
+    _pool.open(wait=True, timeout=10)
 
     store = SessionStore(
         ttl_minutes=config.SESSION_TTL_MINUTES,
@@ -209,6 +251,9 @@ class ChatRequest(BaseModel):
 class SourceReference(BaseModel):
     source_number: int
     source_url: str
+    # All URLs this chunk's content appears at (deduplicated content surfaces
+    # multiple sources). Defaults to [source_url] for single-source chunks.
+    source_urls: list[str] = []
     title: str
     score: float
 
@@ -231,6 +276,10 @@ async def chat(req: ChatRequest):
     # Shared context object — travels through all guardrails
     ctx = QueryContext(user_id=req.user_id)
 
+    # Guard against requests arriving before lifespan startup finished.
+    if store is None or chain is None:
+        raise HTTPException(status_code=503, detail="Service starting, retry shortly")
+
     # Rate limit check (before any LLM calls)
     if not _rate_limiter.check(req.user_id):
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
@@ -240,7 +289,8 @@ async def chat(req: ChatRequest):
     # Runs first because it costs nothing. If PII is found we never
     # spend tokens on classification or the RAG chain.
     # ------------------------------------------------------------------
-    pii_response = detect_pii(req.query, ctx)
+    # Presidio analysis is CPU-bound and blocks the event loop; offload it.
+    pii_response = await asyncio.to_thread(detect_pii, req.query, ctx)
     if pii_response:
         logger.warning(
             "Request blocked — PII detected [user=%s type=%s]",
@@ -276,11 +326,17 @@ async def chat(req: ChatRequest):
     # ------------------------------------------------------------------
     start = time.time()
     try:
-        result = await chain.ainvoke(
-            {"input": req.query, "chat_history": chat_history,
-             "query_category": ctx.query_category},
-            config={"callbacks": [_rag_callback]},
+        result = await asyncio.wait_for(
+            chain.ainvoke(
+                {"input": req.query, "chat_history": chat_history,
+                 "query_category": ctx.query_category},
+                config={"callbacks": [_rag_callback]},
+            ),
+            timeout=RAG_CHAIN_TIMEOUT,
         )
+    except asyncio.TimeoutError:
+        logger.error("RAG chain timed out after %ds [user=%s]", RAG_CHAIN_TIMEOUT, req.user_id)
+        raise HTTPException(status_code=502, detail="Failed to generate response.")
     except Exception as exc:
         logger.error("RAG chain error [user=%s]: %s", req.user_id, exc)
         raise HTTPException(status_code=502, detail="Failed to generate response.")
@@ -314,6 +370,8 @@ async def chat(req: ChatRequest):
 
 @app.post("/reset", dependencies=[Depends(_verify_api_key)])
 async def reset_session(req: ResetRequest):
+    if store is None:
+        raise HTTPException(status_code=503, detail="Service starting, retry shortly")
     store.reset(req.user_id)
     return {"status": "session cleared"}
 
@@ -324,3 +382,18 @@ async def health():
         "status": "ok",
         "model": config.LLM_MODEL,
     }
+
+
+if __name__ == "__main__":
+    # Canonical entrypoint. The app holds rate-limit and session state in
+    # process memory, so it must run as exactly one worker. We hardcode
+    # workers=1 here so single-worker is the default without anyone having to
+    # remember the --workers flag (and it overrides WEB_CONCURRENCY).
+    import uvicorn
+
+    uvicorn.run(
+        "server.main:app",
+        host=os.environ.get("HOST", "0.0.0.0"),
+        port=int(os.environ.get("PORT", "8000")),
+        workers=1,
+    )
