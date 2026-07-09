@@ -8,9 +8,11 @@ extractors, chunks it, and writes data/box_chunks.jsonl in the schema Pass 3
 Two efficiency features:
 
   - Skip-if-unchanged. A per-file state cache (data/box_ingest.state.json)
-    records each file's size+mtime fingerprint and its produced chunks.
-    On re-run, unchanged files reuse their cached chunks instead of being
-    re-extracted (OCR is the expensive path we most want to avoid).
+    records each file's size+mtime fingerprint, its produced chunks, and a
+    status ('ok' | 'empty' | 'failed'). On re-run, unchanged 'ok' files reuse
+    their cached chunks instead of being re-extracted (OCR is the expensive
+    path we most want to avoid); 'empty'/'failed' files are retried every run
+    and reported in a warning summary so they never vanish silently.
 
   - Parallel extraction. Files are extracted in a ProcessPoolExecutor so
     PDF text extraction and OCR run across CPU cores.
@@ -91,6 +93,37 @@ def _fingerprint(path: Path) -> str:
     return f"{st.st_size}:{st.st_mtime_ns}"
 
 
+def _record(state: dict, rel_key: str, fp: Path, box_url: str,
+            chunks: list[dict], status: str, reason: str = "") -> None:
+    """Record a file's outcome in the state cache.
+
+    status is 'ok' | 'empty' | 'failed'. Non-ok entries carry an empty chunk
+    list plus a reason, and are re-attempted on every run — the fingerprint
+    check only trusts 'ok' entries, so a failure can never be cached as
+    success. (Pre-status entries in old state files lack the field and are
+    treated as 'ok'.)
+    """
+    try:
+        fingerprint = _fingerprint(fp)
+    except OSError as exc:
+        # A plausible cause of a 'failed' status is the file vanishing
+        # mid-run — fingerprinting it again inside the failure handler must
+        # not raise. An empty fingerprint never matches a real one, so the
+        # entry is retried (or dropped as stale) on the next run.
+        logger.warning("Could not fingerprint %s while recording %s status: %s",
+                       fp, status, exc)
+        fingerprint = ""
+    entry = {
+        "fingerprint": fingerprint,
+        "box_url": box_url,
+        "status": status,
+        "chunks": chunks,
+    }
+    if reason:
+        entry["reason"] = reason
+    state[rel_key] = entry
+
+
 # ---------------------------------------------------------------------------
 # Chunking
 # ---------------------------------------------------------------------------
@@ -143,7 +176,13 @@ def _build(text: str, source_url: str, title: str,
 # Per-file worker (must be top-level so ProcessPoolExecutor can pickle it)
 # ---------------------------------------------------------------------------
 
-def _process_file(rel_key: str, abs_path_str: str, box_url: str) -> list[dict]:
+def _process_file(rel_key: str, abs_path_str: str, box_url: str) -> tuple[list[dict], str]:
+    """Extract + chunk one file.
+
+    Returns (chunks, empty_reason). empty_reason is set only when chunks is
+    empty and explains why — it is surfaced in the end-of-run warning summary
+    so zero-chunk files never disappear silently.
+    """
     abs_path = Path(abs_path_str)
     folder_chain = list(abs_path.relative_to(NEEDTOCHUNK_DIR).parts[:-1])
     title = abs_path.stem
@@ -153,10 +192,10 @@ def _process_file(rel_key: str, abs_path_str: str, box_url: str) -> list[dict]:
         result = extract_pdf_from_path(str(abs_path), ocr_fallback=True)
         text = result.get("text", "")
         if not text.strip():
-            return []
+            return [], "no extractable text in PDF (even with OCR fallback)"
         pieces = _chunk_text(text)
         return [_build(c, box_url, title, i, len(pieces), folder_chain)
-                for i, c in enumerate(pieces)]
+                for i, c in enumerate(pieces)], ""
 
     if suffix in (".docx", ".doc"):
         result = extract_docx_from_path(str(abs_path))
@@ -167,29 +206,32 @@ def _process_file(rel_key: str, abs_path_str: str, box_url: str) -> list[dict]:
                 for c in _chunk_text(sec.get("text", "")):
                     records.append((folder_chain + sec.get("heading_chain", []), c))
             return [_build(c, box_url, title, i, len(records), chain)
-                    for i, (chain, c) in enumerate(records)]
+                    for i, (chain, c) in enumerate(records)], \
+                   "" if records else "DOCX sections contained no chunkable text"
         text = result.get("full_text", "")
         if not text.strip():
-            return []
+            return [], "no extractable text in DOCX/DOC"
         pieces = _chunk_text(text)
         return [_build(c, box_url, title, i, len(pieces), folder_chain)
-                for i, c in enumerate(pieces)]
+                for i, c in enumerate(pieces)], ""
 
     if suffix in (".xlsx", ".xlsm"):
         rows = extract_xls_from_path(str(abs_path)).get("rows", [])
+        if not rows:
+            return [], "no rows extracted (empty workbook, or openpyxl missing)"
         return [_build(r, box_url, title, i, len(rows), folder_chain)
-                for i, r in enumerate(rows)]
+                for i, r in enumerate(rows)], ""
 
     if suffix == ".txt":
         text = abs_path.read_text(encoding="utf-8", errors="replace")
         if not text.strip():
-            return []
+            return [], "file contains no text"
         pieces = _chunk_text(text)
         return [_build(c, box_url, title, i, len(pieces), folder_chain)
-                for i, c in enumerate(pieces)]
+                for i, c in enumerate(pieces)], ""
 
     logger.warning("Unsupported file type: %s", abs_path.name)
-    return []
+    return [], f"unsupported file type: {suffix or abs_path.name}"
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +275,16 @@ def run_ingest(
     for rel_key, fp, box_url in on_disk:
         fp_print = _fingerprint(fp)
         cached = state.get(rel_key)
-        if cached and cached.get("fingerprint") == fp_print and cached.get("box_url") == box_url:
+        # Only status 'ok' satisfies the cache: 'failed'/'empty' files are
+        # cheap to retry at this corpus size and must stay visible until
+        # they produce chunks. Entries written before status tracking lack
+        # the field — treat missing status as 'ok'.
+        if (
+            cached
+            and cached.get("fingerprint") == fp_print
+            and cached.get("box_url") == box_url
+            and cached.get("status", "ok") == "ok"
+        ):
             reused += 1
             continue
         todo.append((rel_key, fp, box_url))
@@ -260,15 +311,16 @@ def run_ingest(
         if effective_workers <= 1:
             for rel_key, fp, box_url in todo:
                 try:
-                    chunks = _process_file(rel_key, str(fp), box_url)
+                    chunks, empty_reason = _process_file(rel_key, str(fp), box_url)
                 except Exception as exc:
                     logger.error("Failed to process %s: %s", rel_key, exc, exc_info=True)
+                    _record(state, rel_key, fp, box_url, [], "failed", str(exc))
                     continue
-                state[rel_key] = {
-                    "fingerprint": _fingerprint(fp),
-                    "box_url": box_url,
-                    "chunks": chunks,
-                }
+                if chunks:
+                    _record(state, rel_key, fp, box_url, chunks, "ok")
+                else:
+                    _record(state, rel_key, fp, box_url, [], "empty",
+                            empty_reason or "extractor produced 0 chunks")
                 logger.info("Processed %s (%d chunks)", rel_key, len(chunks))
         else:
             with ProcessPoolExecutor(max_workers=effective_workers) as pool:
@@ -279,15 +331,16 @@ def run_ingest(
                 for fut in as_completed(futures):
                     rel_key, fp, box_url = futures[fut]
                     try:
-                        chunks = fut.result()
+                        chunks, empty_reason = fut.result()
                     except Exception as exc:
                         logger.error("Failed to process %s: %s", rel_key, exc, exc_info=True)
+                        _record(state, rel_key, fp, box_url, [], "failed", str(exc))
                         continue
-                    state[rel_key] = {
-                        "fingerprint": _fingerprint(fp),
-                        "box_url": box_url,
-                        "chunks": chunks,
-                    }
+                    if chunks:
+                        _record(state, rel_key, fp, box_url, chunks, "ok")
+                    else:
+                        _record(state, rel_key, fp, box_url, [], "empty",
+                                empty_reason or "extractor produced 0 chunks")
                     logger.info("Processed %s (%d chunks)", rel_key, len(chunks))
 
     all_chunks: list[dict] = []
@@ -310,6 +363,22 @@ def run_ingest(
     logger.info("Wrote %d chunks -> %s", len(all_chunks), out)
 
     _save_state(state)
+
+    # Loud end-of-run summary: every file currently contributing zero chunks.
+    # These entries are re-attempted on every run, so this warning repeats
+    # until the file extracts cleanly or is removed.
+    problems = [
+        (rel_key, entry.get("status"), entry.get("reason", ""))
+        for rel_key, entry in sorted(state.items())
+        if entry.get("status", "ok") != "ok"
+    ]
+    if problems:
+        logger.warning(
+            "Box ingest: %d file(s) contributed NO chunks to the corpus:",
+            len(problems),
+        )
+        for rel_key, status, reason in problems:
+            logger.warning("  [%s] %s: %s", status, rel_key, reason or "unknown reason")
 
     return all_chunks
 
