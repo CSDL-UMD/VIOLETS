@@ -9,10 +9,27 @@ Detects question patterns via:
 - Numbered or bulleted Q/A patterns
 
 Each Q+A pair becomes a single chunk. Questions are never split from answers.
+
+Navigation chrome is aggressively excluded: both state and MoCo templates
+build sidebar menus out of <dl>/<details>, so nav/aside/header/footer are
+stripped before extraction and every dt/summary must actually look like a
+question. An acceptance gate rejects extractions that only captured menu
+scraps, so the chunker falls back to plain text chunking instead.
 """
 import re
 
 from bs4 import BeautifulSoup, Tag
+
+from .semantic import MAX_CHUNK_CHARS, MAX_CHUNK_WORDS, enforce_chunk_caps
+
+# Acceptance gate: a Q/A extraction is only trusted when it found at least
+# this many pairs AND covered at least this fraction of the page's own
+# main-content words. Nav-menu false positives extract a handful of tiny
+# "pairs" covering a few percent of the page; genuine FAQ pages are
+# dominated by their Q/A content, so 0.2 leaves generous margin for intro
+# paragraphs and other non-Q/A prose.
+MIN_QA_PAIRS = 2
+MIN_QA_COVERAGE = 0.2
 
 
 def extract_qa_pairs(url: str, raw_html: str | None = None) -> list[dict]:
@@ -25,6 +42,8 @@ def extract_qa_pairs(url: str, raw_html: str | None = None) -> list[dict]:
 
     Returns:
         List of dicts with 'question', 'answer', and 'text' keys.
+        Returns [] when extraction fails the acceptance gate, so the
+        caller can fall back to plain text chunking.
     """
     if not raw_html:
         from ...pass2.cache import get_html
@@ -34,25 +53,37 @@ def extract_qa_pairs(url: str, raw_html: str | None = None) -> list[dict]:
 
     soup = BeautifulSoup(raw_html, 'html.parser')
 
+    # Strip non-content elements before any extraction: script/style would
+    # leak JS/CSS into answers, and nav/aside/header/footer hold the
+    # sidebar menus that masquerade as <dl>/<details> FAQ structures.
+    for junk in soup(['script', 'style', 'noscript', 'nav', 'aside', 'header', 'footer']):
+        junk.decompose()
+
+    # Page word count for the coverage gate, computed from the page's own
+    # remaining (main-content) text. Must be measured before extraction:
+    # _extract_from_details_summary mutates the soup.
+    page_words = len(_text(soup).split())
+
     # Try each detection method in order of reliability
     pairs = _extract_from_definition_lists(soup)
-    if pairs:
-        return pairs
+    if not pairs:
+        pairs = _extract_from_details_summary(soup)
+    if not pairs:
+        pairs = _extract_from_heading_patterns(soup)
+    if not pairs:
+        pairs = _extract_from_bold_patterns(soup)
 
-    pairs = _extract_from_details_summary(soup)
-    if pairs:
-        return pairs
+    # Acceptance gate: reject sparse extractions (e.g. residual menu
+    # scraps) so the chunker falls through to text chunking.
+    if len(pairs) < MIN_QA_PAIRS:
+        return []
+    extracted_words = sum(
+        len(p['question'].split()) + len(p['answer'].split()) for p in pairs
+    )
+    if extracted_words / max(page_words, 1) < MIN_QA_COVERAGE:
+        return []
 
-    pairs = _extract_from_heading_patterns(soup)
-    if pairs:
-        return pairs
-
-    pairs = _extract_from_bold_patterns(soup)
-    if pairs:
-        return pairs
-
-    # Fallback: treat entire content as a single chunk
-    return []
+    return _cap_long_answers(pairs)
 
 
 def _extract_from_definition_lists(soup: BeautifulSoup) -> list[dict]:
@@ -61,20 +92,20 @@ def _extract_from_definition_lists(soup: BeautifulSoup) -> list[dict]:
     for dl in soup.find_all('dl'):
         dts = dl.find_all('dt')
         for dt in dts:
-            question = dt.get_text(strip=True)
+            question = _text(dt)
+            # Only accept dt entries that actually read as questions:
+            # both site templates also use <dl> for navigation menus.
+            if not _looks_like_question(question):
+                continue
             # Collect all dd siblings until next dt
             answer_parts = []
             sibling = dt.find_next_sibling()
             while sibling and sibling.name == 'dd':
-                answer_parts.append(sibling.get_text(strip=True))
+                answer_parts.append(_text(sibling))
                 sibling = sibling.find_next_sibling()
             if question and answer_parts:
                 answer = ' '.join(answer_parts)
-                pairs.append({
-                    'question': question,
-                    'answer': answer,
-                    'text': f"Q: {question}\nA: {answer}",
-                })
+                pairs.append(_make_pair(question, answer))
     return pairs
 
 
@@ -85,16 +116,16 @@ def _extract_from_details_summary(soup: BeautifulSoup) -> list[dict]:
         summary = details.find('summary')
         if not summary:
             continue
-        question = summary.get_text(strip=True)
+        question = _text(summary)
+        # Same nav-menu guard as definition lists: accordions are also
+        # used for collapsible navigation, so require a question.
+        if not _looks_like_question(question):
+            continue
         # Answer is everything in details except the summary
         summary.decompose()
-        answer = details.get_text(strip=True)
+        answer = _text(details)
         if question and answer:
-            pairs.append({
-                'question': question,
-                'answer': answer,
-                'text': f"Q: {question}\nA: {answer}",
-            })
+            pairs.append(_make_pair(question, answer))
     return pairs
 
 
@@ -107,7 +138,7 @@ def _extract_from_heading_patterns(soup: BeautifulSoup) -> list[dict]:
     headings = soup.find_all(['h2', 'h3', 'h4'])
 
     for heading in headings:
-        question = heading.get_text(strip=True)
+        question = _text(heading)
         # Only treat as FAQ if the heading looks like a question
         if not _looks_like_question(question):
             continue
@@ -123,18 +154,14 @@ def _extract_from_heading_patterns(soup: BeautifulSoup) -> list[dict]:
                 if sib_level <= heading_level:
                     break
             if isinstance(sibling, Tag):
-                text = sibling.get_text(strip=True)
+                text = _text(sibling)
                 if text:
                     answer_parts.append(text)
             sibling = sibling.find_next_sibling()
 
         if question and answer_parts:
             answer = ' '.join(answer_parts)
-            pairs.append({
-                'question': question,
-                'answer': answer,
-                'text': f"Q: {question}\nA: {answer}",
-            })
+            pairs.append(_make_pair(question, answer))
 
     return pairs
 
@@ -148,7 +175,7 @@ def _extract_from_bold_patterns(soup: BeautifulSoup) -> list[dict]:
     strongs = soup.find_all(['strong', 'b'])
 
     for strong in strongs:
-        question = strong.get_text(strip=True)
+        question = _text(strong)
         if not _looks_like_question(question):
             continue
 
@@ -162,7 +189,7 @@ def _extract_from_bold_patterns(soup: BeautifulSoup) -> list[dict]:
         for sibling in strong.next_siblings:
             if isinstance(sibling, Tag) and sibling.name in ('strong', 'b'):
                 break
-            text = sibling.get_text(strip=True) if isinstance(sibling, Tag) else str(sibling).strip()
+            text = _text(sibling) if isinstance(sibling, Tag) else _normalize_ws(str(sibling))
             if text:
                 answer_parts.append(text)
 
@@ -171,20 +198,53 @@ def _extract_from_bold_patterns(soup: BeautifulSoup) -> list[dict]:
         while next_el and isinstance(next_el, Tag):
             if next_el.find(['strong', 'b']):
                 break
-            text = next_el.get_text(strip=True)
+            text = _text(next_el)
             if text:
                 answer_parts.append(text)
             next_el = next_el.find_next_sibling()
 
         if question and answer_parts:
             answer = ' '.join(answer_parts)
-            pairs.append({
-                'question': question,
-                'answer': answer,
-                'text': f"Q: {question}\nA: {answer}",
-            })
+            pairs.append(_make_pair(question, answer))
 
     return pairs
+
+
+def _make_pair(question: str, answer: str) -> dict:
+    return {
+        'question': question,
+        'answer': answer,
+        'text': f"Q: {question}\nA: {answer}",
+    }
+
+
+def _cap_long_answers(pairs: list[dict]) -> list[dict]:
+    """
+    Enforce the embedding-safe chunk caps on Q/A pairs.
+
+    A pair with a very long answer is split into multiple pairs that each
+    repeat the question, so every chunk stays self-contained and under cap.
+    """
+    capped = []
+    for pair in pairs:
+        text = pair['text']
+        if len(text.split()) <= MAX_CHUNK_WORDS and len(text) <= MAX_CHUNK_CHARS:
+            capped.append(pair)
+            continue
+        for part in enforce_chunk_caps([pair['answer']]):
+            capped.append(_make_pair(pair['question'], part))
+    return capped
+
+
+def _text(el) -> str:
+    """Whitespace-normalized text: space-separated so words never glue
+    across inline tags ('register online or by mail', not
+    'registeronlineor by mail')."""
+    return _normalize_ws(el.get_text(separator=' ', strip=True))
+
+
+def _normalize_ws(text: str) -> str:
+    return re.sub(r'\s+', ' ', text).strip()
 
 
 def _looks_like_question(text: str) -> bool:

@@ -8,13 +8,15 @@ but all source URLs are preserved in chunk metadata.
 import json
 import logging
 import os
+import re
 from collections import defaultdict
 
 from ..pass1.config import DB_PATH, REQUEST_TIMEOUT
 from ..pass1.db import DB
+from .langfilter import is_non_english
 from .metadata import build_chunk_metadata, build_chunk_metadata_multi_source
 from .strategies.faq import extract_qa_pairs
-from .strategies.semantic import semantic_chunk
+from .strategies.semantic import enforce_chunk_caps, semantic_chunk
 from .strategies.single import ingest_as_single
 from .strategies.simple_split import simple_split
 from .strategies.table_rows import extract_table_chunks
@@ -79,6 +81,17 @@ def run_pass2(
         except Exception as exc:
             logger.error("Failed to chunk %s: %s", url, exc, exc_info=True)
             continue
+
+        # Content-based net for mixed-script extraction salad — translated
+        # documents themselves are already excluded by URL in pass1.
+        kept = []
+        for chunk in chunks:
+            text = chunk if isinstance(chunk, str) else chunk.get('text', '')
+            if is_non_english(text):
+                logger.info("Dropped non-English chunk from %s: %.60r", url, text)
+            else:
+                kept.append(chunk)
+        chunks = kept
 
         if not chunks:
             logger.warning("No chunks produced for %s", url)
@@ -163,19 +176,26 @@ def _route_to_strategy(page) -> list:
         return [{'text': t} for t in chunks]
 
     if strategy == 'table_rows':
-        return extract_table_chunks(url)
+        chunks = extract_table_chunks(url)
+        if chunks:
+            return chunks
+        # Fallback: misrouted page with no <table>, use simple split
+        text = _fetch_text(url)
+        return [{'text': t} for t in simple_split(text)] if text else []
 
     if strategy == 'document_extraction':
-        return _extract_document(url, content_type, page['needs_ocr'] or 0)
+        return _extract_document(url, content_type)
 
     logger.warning("Unknown strategy '%s' for %s, skipping", strategy, url)
     return []
 
 
-def _extract_document(url: str, content_type: str, needs_ocr: int) -> list:
+def _extract_document(url: str, content_type: str) -> list:
     """Extract and chunk a document (PDF or DOCX)."""
     if content_type == 'pdf':
-        result = extract_pdf(url, needs_ocr=bool(needs_ocr))
+        # Digital extraction first, OCR fallback for image-only PDFs.
+        # The manifest's stale needs_ocr flag is deliberately ignored.
+        result = extract_pdf(url, ocr_fallback=True)
         text = result.get('text', '')
         if not text.strip():
             return []
@@ -188,17 +208,19 @@ def _extract_document(url: str, content_type: str, needs_ocr: int) -> list:
             # Fall through to semantic chunking since we have plain text
             chunks = semantic_chunk(text)
         elif structure == 'table_heavy' and result.get('tables'):
-            # Format tables as chunks
-            chunks_list = []
+            # Emit table-row chunks AND the narrative prose: report PDFs
+            # often mix a couple of summary tables with pages of text, and
+            # the prose would otherwise be dropped entirely.
+            row_chunks = []
             for table in result['tables']:
-                headers = table.get('headers', [])
+                headers = table.get('headers') or []
                 for row in table.get('rows', []):
-                    if headers and len(row) == len(headers):
-                        pairs = [f"{h}: {v}" for h, v in zip(headers, row) if v]
-                        chunks_list.append(' | '.join(pairs))
-                    else:
-                        chunks_list.append(' | '.join(str(c) for c in row if c))
-            return [{'text': t} for t in chunks_list if t.strip()]
+                    row_text = _format_table_row(headers, row)
+                    if row_text.strip():
+                        row_chunks.append(row_text)
+            row_chunks = enforce_chunk_caps(row_chunks)
+            prose_chunks = _dedupe_against_rows(semantic_chunk(text), row_chunks)
+            return [{'text': t} for t in row_chunks + prose_chunks]
         elif structure == 'short':
             chunks = ingest_as_single(text)
         else:
@@ -226,10 +248,11 @@ def _extract_document(url: str, content_type: str, needs_ocr: int) -> list:
             heading_chain = section.get('heading_chain', [])
 
             if word_count <= 300:
-                all_chunks.append({
-                    'text': text,
-                    'heading_chain': heading_chain,
-                })
+                for part in enforce_chunk_caps([text]):
+                    all_chunks.append({
+                        'text': part,
+                        'heading_chain': heading_chain,
+                    })
             else:
                 sub_chunks = semantic_chunk(text)
                 for sc in sub_chunks:
@@ -240,13 +263,9 @@ def _extract_document(url: str, content_type: str, needs_ocr: int) -> list:
 
         # Also chunk any tables extracted from the DOCX
         for table in result.get('tables', []):
-            headers = table.get('headers', [])
+            headers = table.get('headers') or []
             for row in table.get('rows', []):
-                if headers and len(row) == len(headers):
-                    pairs = [f"{h}: {v}" for h, v in zip(headers, row) if v]
-                    row_text = ' | '.join(pairs)
-                else:
-                    row_text = ' | '.join(str(c) for c in row if c)
+                row_text = _format_table_row(headers, row)
                 if row_text.strip():
                     all_chunks.append({'text': row_text})
 
@@ -254,12 +273,58 @@ def _extract_document(url: str, content_type: str, needs_ocr: int) -> list:
 
     elif content_type in ('xls', 'xlsx', 'csv'):
         result = extract_xls(url)
-        rows = result.get('rows', [])
-        return [{'text': r} for r in rows if r.strip()]
+        rows = [r for r in result.get('rows', []) if r.strip()]
+        return [{'text': t} for t in enforce_chunk_caps(rows)]
 
     else:
         logger.warning("Unsupported document type: %s", content_type)
         return []
+
+
+def _format_table_row(headers: list, row: list) -> str:
+    """
+    Format one extracted table row as 'Header: value | ...' text.
+
+    pdfplumber/docx header cells can be None or hold embedded newlines, so
+    headers are coerced to stripped single-line strings and a 'Header:'
+    prefix is only emitted when the header is truthy — values under a
+    missing header are kept bare instead of prefixed with literal 'None:'.
+    """
+    if headers and len(row) == len(headers):
+        pairs = []
+        for h, v in zip(headers, row):
+            h_txt = ' '.join(str(h).split()) if h else ''
+            v_txt = str(v).strip() if v else ''
+            if not v_txt:
+                continue
+            pairs.append(f"{h_txt}: {v_txt}" if h_txt else v_txt)
+        return ' | '.join(pairs)
+    return ' | '.join(str(c).strip() for c in row if c)
+
+
+def _dedupe_against_rows(prose_chunks: list[str], row_chunks: list[str]) -> list[str]:
+    """
+    Cheap dedupe for table_heavy PDFs: drop prose chunks whose tokens are
+    >80% contained in the emitted table rows. pdfplumber's page text
+    includes the table cells, so a pure-table page would otherwise be
+    emitted twice (once as rows, once as 'prose').
+    """
+    row_tokens = set()
+    for r in row_chunks:
+        for tok in r.lower().split():
+            tok = re.sub(r'\W+', '', tok)
+            if tok:
+                row_tokens.add(tok)
+
+    kept = []
+    for chunk in prose_chunks:
+        tokens = [t for t in (re.sub(r'\W+', '', w) for w in chunk.lower().split()) if t]
+        if tokens:
+            contained = sum(1 for t in tokens if t in row_tokens)
+            if contained / len(tokens) > 0.8:
+                continue
+        kept.append(chunk)
+    return kept
 
 
 def _fetch_text(url: str) -> str:

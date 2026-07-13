@@ -3,7 +3,10 @@ PDF document extraction strategy.
 
 Primary: pdfplumber for clean digital PDFs (tables, structured text).
 Fallback: pymupdf (fitz) for complex layouts.
-OCR path: pytesseract via pymupdf for image-only PDFs (flagged by needs_ocr in Pass 1).
+OCR path: pytesseract via pymupdf when digital extraction finds no text.
+
+Digital extraction is always attempted first: the manifest's needs_ocr
+column holds stale flags from a removed Pass 1 probe and is not trusted.
 
 After text extraction, content is routed to the appropriate text chunking
 strategy based on detected structure (FAQ, table, prose).
@@ -18,6 +21,11 @@ logger = logging.getLogger(__name__)
 
 _EMPTY_RESULT = {'text': '', 'pages': [], 'tables': [], 'structure_type': 'empty'}
 
+# Digital extraction counts as "effectively empty" below this many word
+# characters: image-only PDFs often carry a few stray glyphs of embedded
+# text (page numbers, watermarks) that shouldn't block the OCR fallback.
+MIN_DIGITAL_TEXT_CHARS = 20
+
 
 def extract_pdf_from_path(path: str, needs_ocr: bool = False, ocr_fallback: bool = False) -> dict:
     """
@@ -25,39 +33,47 @@ def extract_pdf_from_path(path: str, needs_ocr: bool = False, ocr_fallback: bool
 
     Args:
         path: Local file path to the PDF.
-        needs_ocr: If True, skip text extraction and go straight to OCR
-                   (used when Pass 1 flagged the PDF as image-only).
-        ocr_fallback: If True and text extraction yields no text, fall back
-                      to OCR. Used by Box ingest which doesn't pre-probe.
+        needs_ocr: Deprecated and ignored. The manifest permanently retains
+                   stale needs_ocr=1 flags from a removed Pass 1 probe, so
+                   digital extraction is always tried first (OCR is slower
+                   and lossier).
+        ocr_fallback: If True and digital extraction yields effectively no
+                      text, fall back to OCR.
 
     Returns:
         Dict with 'text', 'pages', 'tables', 'structure_type' keys.
     """
-    if needs_ocr:
-        return _extract_with_ocr(path)
+    digital = _extract_with_pdfplumber(path)
+    if digital and not _effectively_empty(digital.get('text', '')):
+        return digital
 
-    result = _extract_with_pdfplumber(path)
-    if result and result.get('text', '').strip():
-        return result
-
-    result = _extract_with_pymupdf(path)
-    if result and result.get('text', '').strip():
-        return result
+    fallback = _extract_with_pymupdf(path)
+    if fallback and not _effectively_empty(fallback.get('text', '')):
+        return fallback
 
     if ocr_fallback:
         logger.info("No embedded text in %s; falling back to OCR", path)
-        return _extract_with_ocr(path)
+        ocr = _extract_with_ocr(path)
+        if not _effectively_empty(ocr.get('text', '')):
+            return ocr
 
+    # OCR unavailable or empty too: return whatever scraps digital
+    # extraction found rather than dropping them.
+    for result in (digital, fallback):
+        if result and result.get('text', '').strip():
+            return result
     return dict(_EMPTY_RESULT)
 
 
-def extract_pdf(url: str, needs_ocr: bool = False) -> dict:
+def extract_pdf(url: str, needs_ocr: bool = False, ocr_fallback: bool = True) -> dict:
     """
     Extract text and structure from a PDF, fetched via the Pass 2 disk cache.
 
     Args:
         url: PDF URL.
-        needs_ocr: If True, attempt OCR extraction.
+        needs_ocr: Deprecated and ignored (see extract_pdf_from_path).
+        ocr_fallback: If True (default) and digital extraction yields
+                      effectively no text, fall back to OCR.
 
     Returns:
         Dict with 'text', 'pages', 'tables', 'structure_type' keys.
@@ -70,7 +86,12 @@ def extract_pdf(url: str, needs_ocr: bool = False) -> dict:
     with tempfile.NamedTemporaryFile(suffix='.pdf', delete=True) as tmp:
         tmp.write(pdf_bytes)
         tmp.flush()
-        return extract_pdf_from_path(tmp.name, needs_ocr=needs_ocr)
+        return extract_pdf_from_path(tmp.name, ocr_fallback=ocr_fallback)
+
+
+def _effectively_empty(text: str) -> bool:
+    """True when extracted text has too few word characters to be usable."""
+    return len(re.findall(r'\w', text or '')) < MIN_DIGITAL_TEXT_CHARS
 
 
 def _extract_with_pdfplumber(path: str) -> dict | None:

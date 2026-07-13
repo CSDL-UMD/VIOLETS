@@ -110,6 +110,41 @@ def semantic_chunk(text: str) -> list[str]:
     return safe
 
 
+def enforce_chunk_caps(chunks: list[str]) -> list[str]:
+    """
+    Guarantee no chunk exceeds MAX_CHUNK_WORDS / MAX_CHUNK_CHARS.
+
+    Shared safety net for the non-semantic strategies (single, simple_split,
+    faq, table rows): one oversized chunk 400s an entire embedding batch
+    downstream, so every strategy funnels its output through this. Oversized
+    chunks are re-split via semantic_chunk, which enforces the caps
+    internally (including the character-level hard split for
+    whitespace-free junk).
+    """
+    safe = []
+    for c in chunks:
+        c = c.strip()
+        if not c:
+            continue
+        if len(c.split()) <= MAX_CHUNK_WORDS and len(c) <= MAX_CHUNK_CHARS:
+            safe.append(c)
+            continue
+        parts = semantic_chunk(c)
+        if not parts:
+            # semantic_chunk can return [] for pathological non-empty text
+            # (e.g. every sentence fragment is <=2 chars and gets filtered
+            # by _split_sentences). A size cap must never silently drop
+            # content, so hard-split the original chunk instead.
+            logger.warning(
+                "enforce_chunk_caps: semantic_chunk returned no chunks for a "
+                "%d-char oversized chunk — hard-splitting to avoid content loss",
+                len(c),
+            )
+            parts = _enforce_sentence_cap([c], MAX_CHUNK_WORDS)
+        safe.extend(parts)
+    return safe
+
+
 def _enforce_sentence_cap(sentences: list[str], cap_words: int) -> list[str]:
     """Hard-split any sentence exceeding cap_words or MAX_CHUNK_CHARS.
 

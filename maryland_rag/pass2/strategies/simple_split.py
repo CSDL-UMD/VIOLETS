@@ -5,6 +5,8 @@ Used for press releases, forms, and other mid-length content.
 """
 import re
 
+from .semantic import enforce_chunk_caps
+
 TARGET_CHUNK_WORDS = 250
 MIN_CHUNK_WORDS = 30
 
@@ -22,8 +24,10 @@ def simple_split(text: str) -> list[str]:
     if not text or not text.strip():
         return []
 
-    # Split on double newlines (paragraph boundaries)
-    paragraphs = re.split(r'\n\s*\n', text.strip())
+    # Split on newlines. trafilatura (v2) separates blocks with a SINGLE
+    # \n, so splitting on blank lines only would leave whole pages as one
+    # chunk. Each newline-delimited block is treated as a paragraph.
+    paragraphs = re.split(r'\n+', text.strip())
     paragraphs = [p.strip() for p in paragraphs if p.strip()]
 
     if not paragraphs:
@@ -32,7 +36,7 @@ def simple_split(text: str) -> list[str]:
     # If total text is short, return as single chunk
     total_words = sum(len(p.split()) for p in paragraphs)
     if total_words <= TARGET_CHUNK_WORDS:
-        return [text.strip()]
+        return enforce_chunk_caps([text.strip()])
 
     # Group paragraphs into chunks up to target word count
     chunks = []
@@ -60,4 +64,6 @@ def simple_split(text: str) -> list[str]:
         else:
             chunks.append(chunk_text)
 
-    return chunks
+    # Safety net: any chunk still over the embedding caps (e.g. one giant
+    # newline-free block) is re-split via semantic chunking.
+    return enforce_chunk_caps(chunks)

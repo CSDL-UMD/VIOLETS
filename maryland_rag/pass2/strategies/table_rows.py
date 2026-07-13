@@ -4,7 +4,11 @@ Table-rows chunking strategy for pages classified as 'table_data'.
 Each table row (or logical row group) becomes one chunk, with
 column headers prepended for context so each chunk is self-contained.
 """
+import re
+
 from bs4 import BeautifulSoup
+
+from .semantic import enforce_chunk_caps
 
 
 def extract_table_chunks(url: str, raw_html: str | None = None) -> list[dict]:
@@ -25,6 +29,11 @@ def extract_table_chunks(url: str, raw_html: str | None = None) -> list[dict]:
             return []
 
     soup = BeautifulSoup(raw_html, 'html.parser')
+
+    # Strip script/style so embedded JS/CSS never leaks into cell text.
+    for junk in soup(['script', 'style', 'noscript']):
+        junk.decompose()
+
     tables = soup.find_all('table')
 
     if not tables:
@@ -37,7 +46,7 @@ def extract_table_chunks(url: str, raw_html: str | None = None) -> list[dict]:
         caption = ''
         cap_tag = table.find('caption')
         if cap_tag:
-            caption = cap_tag.get_text(strip=True)
+            caption = _text(cap_tag)
 
         # Extract headers
         headers = []
@@ -46,7 +55,7 @@ def extract_table_chunks(url: str, raw_html: str | None = None) -> list[dict]:
             header_row = thead.find('tr')
             if header_row:
                 headers = [
-                    th.get_text(strip=True)
+                    _text(th)
                     for th in header_row.find_all(['th', 'td'])
                 ]
 
@@ -56,14 +65,14 @@ def extract_table_chunks(url: str, raw_html: str | None = None) -> list[dict]:
             if first_row:
                 ths = first_row.find_all('th')
                 if ths:
-                    headers = [th.get_text(strip=True) for th in ths]
+                    headers = [_text(th) for th in ths]
 
         # Extract body rows
         rows = []
         tbody = table.find('tbody')
         row_source = tbody if tbody else table
         for tr in row_source.find_all('tr'):
-            cells = [td.get_text(strip=True) for td in tr.find_all(['td', 'th'])]
+            cells = [_text(td) for td in tr.find_all(['td', 'th'])]
             if cells and any(c for c in cells):  # skip empty rows
                 rows.append(cells)
 
@@ -74,8 +83,9 @@ def extract_table_chunks(url: str, raw_html: str | None = None) -> list[dict]:
         # Build chunks: each row gets headers prepended
         for row_idx, row in enumerate(rows):
             if headers and len(row) == len(headers):
-                # Format as "Header: Value" pairs
-                pairs = [f"{h}: {v}" for h, v in zip(headers, row) if v]
+                # Format as "Header: Value" pairs (bare value if the
+                # header cell is empty, never an empty ': value' prefix)
+                pairs = [f"{h}: {v}" if h else v for h, v in zip(headers, row) if v]
                 text = ' | '.join(pairs)
             else:
                 text = ' | '.join(cell for cell in row if cell)
@@ -83,11 +93,19 @@ def extract_table_chunks(url: str, raw_html: str | None = None) -> list[dict]:
             if caption:
                 text = f"[{caption}] {text}"
 
-            if text.strip():
+            # enforce_chunk_caps splits the (rare) giant row so no chunk
+            # exceeds the embedding-safe caps
+            for part in enforce_chunk_caps([text]):
                 all_chunks.append({
-                    'text': text.strip(),
+                    'text': part,
                     'table_index': table_idx,
                     'row_index': row_idx,
                 })
 
     return all_chunks
+
+
+def _text(el) -> str:
+    """Whitespace-normalized cell text: space-separated so words never
+    glue across inline tags."""
+    return re.sub(r'\s+', ' ', el.get_text(separator=' ', strip=True)).strip()

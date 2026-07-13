@@ -4,7 +4,8 @@ Content extraction for HTML pages and document metadata.
 Key improvements over the original design:
 - Single HTTP fetch (requests) passed to trafilatura — no double-fetch.
 - BeautifulSoup fallback when trafilatura returns suspiciously few words.
-- Lightweight PDF probe to detect image-only PDFs in Pass 1.
+- Fetched HTML is persisted into the Pass 2 disk cache so Pass 2 always
+  chunks exactly the bytes Pass 1 hashed (no stale-cache drift).
 """
 import hashlib
 import logging
@@ -18,9 +19,10 @@ from bs4 import BeautifulSoup
 from .config import (
     REQUEST_TIMEOUT,
     TRAFILATURA_MIN_WORDS,
-    PDF_PROBE_BYTES,
 )
+from .exclusions import TRANSIENT_HTTP_STATUSES, is_excluded_status
 from .utils import get_content_type
+from ..pass2.cache import put_html
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +84,19 @@ def _extract_html(url: str) -> dict | None:
     breadcrumb = _extract_breadcrumb(soup, url)
 
     content_hash = hashlib.sha256((text or '').encode()).hexdigest()
+
+    # Persist the freshly-fetched HTML into the Pass 2 disk cache. Without
+    # this, Pass 2 would keep re-chunking whatever stale copy was cached on
+    # a previous run even after Pass 1 detects the content changed. Only
+    # store pages the crawler will actually persist as 'crawled' — mirror
+    # its condition exactly: any 5xx or transient status (429/408) is treated
+    # as transient (the crawler keeps the prior 'crawled' row, so caching the
+    # error body here would poison Pass 2), and excluded statuses are marked
+    # 'failed'.
+    if (http_status < 500
+            and http_status not in TRANSIENT_HTTP_STATUSES
+            and not is_excluded_status(http_status)):
+        put_html(url, raw_html)
 
     return {
         'url': url,
@@ -170,8 +185,7 @@ def _extract_breadcrumb(soup: BeautifulSoup, url: str) -> list[str]:
 
 def _extract_document_metadata(url: str, ctype: str) -> dict | None:
     """
-    For documents, we only collect metadata in Pass 1:
-    file size from HEAD, and for PDFs a lightweight text-extractability probe.
+    For documents, we only collect metadata in Pass 1: file size from HEAD.
     """
     try:
         resp = requests.head(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
@@ -180,10 +194,6 @@ def _extract_document_metadata(url: str, ctype: str) -> dict | None:
     except requests.RequestException as exc:
         logger.warning("HEAD request failed for %s: %s", url, exc)
         return None
-
-    needs_ocr = False
-    if ctype == 'pdf':
-        needs_ocr = _probe_pdf_text_extractable(url)
 
     # Derive a human-readable title from the filename
     filename = url.split('/')[-1].split('?')[0]
@@ -210,49 +220,9 @@ def _extract_document_metadata(url: str, ctype: str) -> dict | None:
         'links': [],
         'content_hash': None,
         'snippet': None,
-        'needs_ocr': needs_ocr,
+        # The old first-4KB byte probe mis-flagged most modern (compressed)
+        # PDFs as image-only and force-routed them to OCR. Pass 2 now does
+        # digital-first extraction with its own OCR fallback, so the column
+        # is kept for schema compat but always written as 0.
+        'needs_ocr': False,
     }
-
-
-def _probe_pdf_text_extractable(url: str) -> bool:
-    """
-    Download the first few KB of a PDF and check for text stream markers.
-    Returns True if the PDF appears to be image-only (needs OCR).
-    Returns False if text content is detected.
-    """
-    try:
-        resp = requests.get(
-            url,
-            timeout=REQUEST_TIMEOUT,
-            headers={'Range': f'bytes=0-{PDF_PROBE_BYTES}'},
-            stream=True,
-        )
-        try:
-            # If the server honored the Range request we'll see 206 Partial
-            # Content; anything else (200 OK from a CDN that ignores Range,
-            # 4xx/5xx errors) means resp.content would download the full
-            # PDF, so read just one chunk and discard the rest.
-            if resp.status_code == 206:
-                chunk = resp.content
-            else:
-                chunk = next(
-                    resp.iter_content(chunk_size=PDF_PROBE_BYTES),
-                    b'',
-                )
-        finally:
-            resp.close()
-
-        # Look for text stream markers in PDF binary
-        # /Type /Page + stream content with text operators (Tj, TJ, Tf)
-        # or /Font references indicate text-extractable content
-        has_text_markers = (
-            b'/Font' in chunk
-            or b'/Text' in chunk
-            or b'Tj' in chunk
-            or b'TJ' in chunk
-            or b'/ToUnicode' in chunk
-        )
-        return not has_text_markers
-    except Exception:
-        # If probe fails, assume text-extractable (optimistic default)
-        return False
