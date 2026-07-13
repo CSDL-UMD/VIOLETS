@@ -15,7 +15,10 @@ from typing import Any
 
 from pydantic import ConfigDict
 
-from langchain_core.callbacks import CallbackManagerForRetrieverRun
+from langchain_core.callbacks import (
+    AsyncCallbackManagerForRetrieverRun,
+    CallbackManagerForRetrieverRun,
+)
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.output_parsers import StrOutputParser
@@ -108,27 +111,8 @@ class PgVectorRetriever(BaseRetriever):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    def _get_relevant_documents(
-        self, query: str, *, run_manager: CallbackManagerForRetrieverRun
-    ) -> list[Document]:
-        query_embedding = self.embeddings.embed_query(query)
-
-        with self.pool.connection() as conn:
-            # Bound query time so a slow/hung pgvector scan can't pin a
-            # threadpool worker indefinitely. SET LOCAL applies within the
-            # implicit transaction of this (non-autocommit) connection.
-            conn.execute("SET LOCAL statement_timeout = '30s'")
-            rows = conn.execute(
-                """
-                SELECT chunk_id, text, source_url, title, metadata,
-                       1 - (embedding <=> %s::vector) AS score
-                FROM chunks
-                ORDER BY embedding <=> %s::vector
-                LIMIT %s
-                """,
-                (query_embedding, query_embedding, self.k),
-            ).fetchall()
-
+    def _build_docs(self, rows) -> list[Document]:
+        """Turn raw pgvector rows into Documents (shared by sync/async paths)."""
         if not rows:
             logger.warning("pgvector returned no matches for query")
 
@@ -157,10 +141,44 @@ class PgVectorRetriever(BaseRetriever):
             docs.append(Document(page_content=text or "", metadata=meta))
         return docs
 
-    # TODO: implement _aget_relevant_documents using psycopg AsyncConnectionPool
-    # and an async embeddings call. BaseRetriever.ainvoke currently runs the
-    # sync method in a threadpool, which blocks one worker thread per
-    # concurrent request and caps throughput under load.
+    async def _aget_relevant_documents(
+        self, query: str, *, run_manager: AsyncCallbackManagerForRetrieverRun
+    ) -> list[Document]:
+        # Both the embedding call and the pgvector query are genuinely async
+        # (AsyncOpenAI client + AsyncConnectionPool), so a concurrent retrieval
+        # no longer pins an anyio threadpool worker for its full duration; it
+        # only holds a pool connection for the (indexed) vector query itself.
+        query_embedding = await self.embeddings.aembed_query(query)
+
+        async with self.pool.connection() as conn:
+            # Bound query time so a slow/hung pgvector scan can't hold a pool
+            # connection indefinitely. SET LOCAL applies within the implicit
+            # transaction of this (non-autocommit) connection.
+            await conn.execute("SET LOCAL statement_timeout = '30s'")
+            cur = await conn.execute(
+                """
+                SELECT chunk_id, text, source_url, title, metadata,
+                       1 - (embedding <=> %s::vector) AS score
+                FROM chunks
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+                """,
+                (query_embedding, query_embedding, self.k),
+            )
+            rows = await cur.fetchall()
+
+        return self._build_docs(rows)
+
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: CallbackManagerForRetrieverRun
+    ) -> list[Document]:
+        # Async-only: this retriever holds an AsyncConnectionPool and is always
+        # driven via `ainvoke`. A sync call would need a separate sync pool, so
+        # fail loudly rather than silently degrade.
+        raise NotImplementedError(
+            "PgVectorRetriever is async-only; use `ainvoke` / "
+            "`aget_relevant_documents`."
+        )
 
 
 # ---------------------------------------------------------------------------

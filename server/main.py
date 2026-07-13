@@ -183,9 +183,9 @@ async def lifespan(app: FastAPI):
     if LOG_PROMPTS or LOG_RESPONSES:
         logger.warning("Verbose prompt/response logging enabled — disable for production.")
 
-    # Raise the default threadpool capacity so up to ~70 concurrent sync
-    # retrievals (PgVectorRetriever runs in the threadpool via ainvoke) and
-    # other to_thread offloads don't queue behind the default 40-token limit.
+    # PII detection still runs in the threadpool via asyncio.to_thread, so keep
+    # the limiter above the default 40 tokens. (Retrieval no longer uses the
+    # threadpool — PgVectorRetriever is fully async via AsyncConnectionPool.)
     try:
         import anyio
         limiter = anyio.to_thread.current_default_thread_limiter()
@@ -193,18 +193,21 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("Could not raise anyio thread limiter; using default.")
 
-    from psycopg_pool import ConnectionPool
-    from pgvector.psycopg import register_vector
+    from psycopg_pool import AsyncConnectionPool
+    from pgvector.psycopg import register_vector_async
 
-    _pool = ConnectionPool(
+    _pool = AsyncConnectionPool(
         conninfo=config.DATABASE_URL,
         min_size=4,
         max_size=25,
-        configure=lambda conn: register_vector(conn),
+        # Fail fast on connection checkout instead of silently eating the 60s
+        # chain budget if every connection is busy.
+        timeout=10,
+        configure=register_vector_async,
         open=False,
     )
     # Block until the pool is ready so the first request doesn't race startup.
-    _pool.open(wait=True, timeout=10)
+    await _pool.open(wait=True, timeout=10)
 
     store = SessionStore(
         ttl_minutes=config.SESSION_TTL_MINUTES,
@@ -220,7 +223,7 @@ async def lifespan(app: FastAPI):
     yield
 
     cleanup_task.cancel()
-    _pool.close(timeout=30)
+    await _pool.close(timeout=30)
 
 
 # ---------------------------------------------------------------------------

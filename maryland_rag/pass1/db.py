@@ -163,19 +163,21 @@ class DB:
         return {row['url'] for row in rows}
 
     def snapshot_hashes_for_recrawl(self):
-        """Before a re-crawl, copy current content_hash to previous_content_hash."""
+        """Copy current content_hash to previous_content_hash.
+
+        Called AFTER a successful full chunk pass (end of `all`), so
+        previous_content_hash means "the last content reflected in
+        chunks.jsonl". get_changed_pages() then reports pages whose content
+        is new or changed since it was last chunked — the baseline for the
+        standalone `pass2 --changed` incremental path. Snapshotting before
+        the crawl would swallow change events if a run was interrupted
+        between crawl and chunking.
+        """
         self.conn.execute("""
             UPDATE pages SET previous_content_hash = content_hash
             WHERE content_hash IS NOT NULL
         """)
         self.conn.commit()
-    
-    def is_first_run(self) -> bool:
-        """Return True if no pages have been crawled yet (no content hashes exist)."""
-        row = self.conn.execute(
-            "SELECT 1 FROM pages WHERE content_hash IS NOT NULL LIMIT 1"
-        ).fetchone()
-        return row is None
 
     # ---- Link operations ----
 
@@ -233,7 +235,8 @@ class DB:
         ).fetchall()
 
     def get_changed_pages(self) -> list:
-        """Pages that are new or whose content changed since last crawl."""
+        """Pages that are new or whose content changed since the last
+        snapshot — i.e. since they were last reflected in chunks.jsonl."""
         return self.conn.execute("""
             SELECT * FROM pages
             WHERE crawl_status = 'crawled'
@@ -242,6 +245,17 @@ class DB:
                 OR content_hash != previous_content_hash
               )
         """).fetchall()
+
+    def get_expected_chunk_urls(self) -> set[str]:
+        """URLs of crawled pages that Pass 2 should produce chunks for:
+        everything crawled except pages deliberately assigned the 'skip'
+        strategy. Used by the post-pass2 coverage report."""
+        rows = self.conn.execute("""
+            SELECT url FROM pages
+            WHERE crawl_status = 'crawled'
+              AND (chunking_strategy IS NULL OR chunking_strategy != 'skip')
+        """).fetchall()
+        return {row['url'] for row in rows}
 
     def get_duplicate_hashes(self) -> list:
         return self.conn.execute("""

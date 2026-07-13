@@ -21,7 +21,9 @@ BANNER_MARKERS = [
     "The Montgomery County Board of Elections",
 ]
 
-# FAQ keyword variants checked against url + title + text.
+# FAQ keyword variants checked against url + title ONLY. Never matched
+# against page text: the MoCo sidebar contains 'Frequently Asked Questions'
+# on nearly every page, which misrouted unrelated pages to qa_pairs.
 FAQ_SIGNALS = [
     'faq', 'frequently-asked', 'frequently asked',
     'q&a', 'q & a',
@@ -120,14 +122,15 @@ def classify_html(
     title_lower = (title or '').lower()
     clean_text = strip_banner(text)
     text_head = clean_text.lower()[:2000]
-    combined = f"{url_lower} {title_lower} {text_head}"
+    url_title = f"{url_lower} {title_lower}"
+    combined = f"{url_title} {text_head}"
     wc = word_count or 0
     parsed = urlparse(url_lower)
     path = parsed.path
     domain = parsed.netloc
 
     page_class, strategy, confidence = _classify(
-        url_lower, combined, path, domain, wc, raw_html
+        url_lower, url_title, combined, path, domain, wc, raw_html
     )
 
     # Empty extraction => no useful chunks regardless of class.
@@ -139,6 +142,7 @@ def classify_html(
 
 def _classify(
     url_lower: str,
+    url_title: str,
     combined: str,
     path: str,
     domain: str,
@@ -149,8 +153,9 @@ def _classify(
     if 'cdn-cgi' in url_lower:
         return 'junk', 'skip', 'high'
 
-    # 2. FAQ — keyword in combined OR known FAQ path
-    if any(s in combined for s in FAQ_SIGNALS) or any(s in path for s in FAQ_URL_PATHS):
+    # 2. FAQ — keyword in url/title OR known FAQ path (never page text,
+    # which false-matches on sidebar boilerplate)
+    if any(s in url_title for s in FAQ_SIGNALS) or any(s in path for s in FAQ_URL_PATHS):
         return 'faq', 'qa_pairs', 'high'
 
     # 3. Press release / news

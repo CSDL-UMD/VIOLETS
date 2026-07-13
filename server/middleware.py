@@ -280,6 +280,11 @@ _classifier_llm = (
         model=config.LLM_MODEL,
         openai_api_key=config.OPENAI_API_KEY,
         base_url=config.OPENAI_BASE_URL,
+        # Keep medium: classification needs the "when in doubt, normal"
+        # fallthrough judgment. An eval (server/eval_guardrails.py) showed
+        # reasoning_effort="minimal" reproducibly mis-routes registration
+        # queries to voter_lookup. The partisan checker below is a simpler
+        # yes/no task and stays at minimal.
         reasoning_effort="medium",
         verbosity="low",
     )
@@ -422,7 +427,7 @@ _partisan_checker_llm = (
         model=config.LLM_MODEL,
         openai_api_key=config.OPENAI_API_KEY,
         base_url=config.OPENAI_BASE_URL,
-        reasoning_effort="medium",
+        reasoning_effort="minimal",
         verbosity="low",
     )
     .with_structured_output(PartisanCheckResult)

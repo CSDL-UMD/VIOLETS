@@ -11,15 +11,18 @@ Usage:
     python -m maryland_rag audit              # Print manifest audit report
     python -m maryland_rag all                # Full pipeline end-to-end:
                                               #   pass1 → pass2 → box_ingest → pass3 (web) → pass3 (box)
-                                              #   First run: processes everything
-                                              #   Subsequent runs: only changed/new pages re-chunked;
-                                              #   pass3 always upserts (resume=False) so changed
-                                              #   content is never skipped in the vector DB
+                                              #   pass2 ALWAYS re-chunks every crawled page (never
+                                              #   incremental): the operator drops the pgvector DB and
+                                              #   re-ingests from scratch each run, and pass2 truncates
+                                              #   chunks.jsonl, so it must contain the full corpus.
+                                              #   Incremental chunking is only for `pass2 --changed`.
 """
 import argparse
 import logging
 import os
 import sys
+
+logger = logging.getLogger(__name__)
 
 
 def _configure_logging():
@@ -33,6 +36,45 @@ def _configure_logging():
             logging.StreamHandler(),
         ],
     )
+
+
+def _report_chunk_coverage(chunks: list[dict], expected_urls: set[str]):
+    """
+    Compare the pages that actually produced chunks against the pages that
+    should have (crawl_status='crawled', not strategy='skip'). Zero-chunk
+    pages are printed loudly; if more than 20% of expected pages produced
+    nothing, exit non-zero — the operator rebuilds pgvector from
+    chunks.jsonl, so shipping a badly incomplete file would silently drop
+    that content from the vector store.
+    """
+    covered = set()
+    for chunk in chunks:
+        if chunk.get('source_url'):
+            covered.add(chunk['source_url'])
+        # Deduplicated content carries every URL it appeared at
+        covered.update(chunk.get('source_urls', []))
+
+    missing = sorted(expected_urls - covered)
+    n_expected = len(expected_urls)
+    print(f"Chunk coverage: {n_expected - len(missing)}/{n_expected} expected pages produced chunks")
+
+    if missing:
+        logger.warning("%d expected page(s) produced ZERO chunks:", len(missing))
+        print(f"WARNING: {len(missing)} expected page(s) produced ZERO chunks:")
+        for url in missing:
+            logger.warning("  zero chunks: %s", url)
+            print(f"  ZERO CHUNKS: {url}")
+
+    if n_expected and len(missing) > 0.2 * n_expected:
+        msg = (
+            f"FATAL: {len(missing)}/{n_expected} expected pages "
+            f"({len(missing) / n_expected:.0%}) produced zero chunks — aborting "
+            "before embedding so pgvector is not rebuilt from an incomplete "
+            "chunks.jsonl."
+        )
+        logger.error(msg)
+        print(msg, file=sys.stderr)
+        sys.exit(1)
 
 
 def main():
@@ -72,6 +114,13 @@ def main():
         from .pass2.chunker import run_pass2
         chunks = run_pass2(only_changed=args.changed, output_path=args.output)
         print(f"Produced {len(chunks)} chunks → {args.output}")
+        if args.changed:
+            print(
+                "WARNING: --changed wrote ONLY the changed pages' chunks to "
+                f"{args.output} (the file is truncated, not merged). Do not "
+                "embed it into a freshly-dropped database — use the full "
+                "`all` pipeline (or plain `pass2`) for a from-scratch rebuild."
+            )
 
     elif args.command == 'pass3':
         from .pass3.embed import run_embed
@@ -84,21 +133,28 @@ def main():
         from .pass3.embed import run_embed
         from .pass1.db import DB
 
-        db = DB()
-        # INVARIANT: first_run must be captured BEFORE snapshot_hashes_for_recrawl().
-        # is_first_run() returns True only when no content hashes exist; once the
-        # snapshot runs, previous_content_hash is populated and the question
-        # becomes meaningless. The captured value is then passed to pass2 as
-        # only_changed=not first_run so a first-ever run chunks everything and
-        # subsequent runs only re-chunk pages whose content actually changed.
-        first_run = db.is_first_run()
-        db.snapshot_hashes_for_recrawl()
-        db.close()
-
         run_crawl(resume=False)
 
-        chunks = run_pass2(only_changed=not first_run, output_path=args.output)
+        # INVARIANT: 'all' always chunks the FULL corpus (only_changed=False).
+        # The operator drops the pgvector DB and re-ingests from scratch each
+        # run, and pass2 truncates chunks.jsonl — an incremental pass would
+        # silently drop every unchanged page from the rebuilt vector store
+        # (manifest.db persists, so change detection would find almost
+        # nothing "changed"). Incremental chunking remains available via the
+        # standalone `pass2 --changed` subcommand.
+        chunks = run_pass2(only_changed=False, output_path=args.output)
         print(f"Produced {len(chunks)} chunks → {args.output}")
+
+        db = DB()
+        # Coverage gate: exits non-zero if >20% of expected pages got no chunks.
+        _report_chunk_coverage(chunks, db.get_expected_chunk_urls())
+        # Snapshot AFTER a successful full chunk pass: previous_content_hash
+        # now means "this content is reflected in chunks.jsonl", which is the
+        # baseline `pass2 --changed` diffs against. Snapshotting before the
+        # crawl (the old design) permanently swallowed change events whenever
+        # a run was interrupted between crawl and chunking.
+        db.snapshot_hashes_for_recrawl()
+        db.close()
 
         from box_ingest.ingest import run_ingest, DEFAULT_OUTPUT as BOX_OUTPUT
         box_chunks = run_ingest()
