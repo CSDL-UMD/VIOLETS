@@ -64,8 +64,12 @@ def get_content_type(url: str) -> str:
         ext = os.path.splitext(path)[1].lower()
         if ext == '.pdf':
             return 'pdf'
-        if ext in ('.docx', '.doc'):
+        if ext == '.docx':
             return 'docx'
+        if ext == '.doc':
+            # Legacy OLE format — python-docx cannot parse it, so it must
+            # never be labeled 'docx'. Excluded from crawling in exclusions.py.
+            return 'doc'
         if ext in ('.xls', '.xlsx'):
             return 'xls'
         if ext == '.csv':

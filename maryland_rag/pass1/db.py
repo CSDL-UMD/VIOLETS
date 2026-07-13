@@ -143,6 +143,13 @@ class DB:
         )
         self.conn.commit()
 
+    def get_page_status(self, url: str) -> str | None:
+        """Return the crawl_status for a URL, or None if the URL is unknown."""
+        row = self.conn.execute(
+            "SELECT crawl_status FROM pages WHERE url = ?", (url,)
+        ).fetchone()
+        return row['crawl_status'] if row else None
+
     def get_pending(self) -> list:
         return self.conn.execute(
             "SELECT url, parent_url, depth FROM pages WHERE crawl_status = 'pending' ORDER BY depth, id"

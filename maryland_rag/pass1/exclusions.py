@@ -70,6 +70,15 @@ EXCLUDED_PATH_PATTERNS = [
     (r'/elections/using_election_data',      "Election data usage docs"),
     (r'/campaign_finance/',                  "Campaign finance — out of scope"),
     (r'/voting_system/ballot_audit_plan_.*\.html', "Past audit plan archives"),
+    # Translated forms (VRA-Amharic.pdf, Mail_In_Ballot_Application-Korean.pdf,
+    # HowMDVotes_Spanish.pdf, ...): the chatbot serves English, the English
+    # originals are indexed separately, and PDF extraction interleaves the
+    # bilingual layouts into unreadable mixed-script text. pass2 additionally
+    # drops any mixed-script chunk via langfilter as a content-based net.
+    (r'[-_/](amharic|korean|vietnamese|spanish|french|russian|tagalog|urdu|'
+     r'farsi|portuguese|haitian[-_]?creole|(simplified|traditional)[-_]?chinese'
+     r'|chinese)(?![a-z])[^/]*\.(pdf|docx?|xlsx?)$',
+     "non-English translated document — English original is indexed"),
 ]
 
 # Pre-compile patterns for performance
@@ -83,6 +92,13 @@ _COMPILED_EXCLUSIONS = [
 # ---------------------------------------------------------------------------
 
 EXCLUDED_HTTP_STATUSES = {404, 410, 403, 500, 502, 503}
+
+# Statuses that are retryable and must never be persisted as page content or
+# written to the Pass 2 cache (the response body is an error page, not the
+# document). The crawler's retry loop and extractor's cache write both consult
+# this set — keep them in sync through it. 5xx is handled separately via a
+# `>= 500` check.
+TRANSIENT_HTTP_STATUSES = {408, 429}
 
 SKIP_EXTENSIONS = {
     '.jpg', '.jpeg', '.png', '.gif', '.svg', '.ico', '.bmp', '.webp',
@@ -133,6 +149,12 @@ def should_exclude(url: str) -> tuple[bool, str | None]:
         ext = '.' + path_lower.rsplit('.', 1)[-1]
     if ext in SKIP_EXTENSIONS:
         return True, f"Non-content file extension: {ext}"
+
+    # Legacy Word documents: python-docx can never parse pre-2007 OLE .doc
+    # files, so they'd silently yield zero chunks every run. Skip them
+    # visibly instead (reason surfaces in the audit report).
+    if ext == '.doc':
+        return True, "legacy .doc format unsupported — convert to PDF to ingest"
 
     # Skip non-HTTP schemes
     if parsed.scheme in ('mailto', 'tel', 'javascript'):
