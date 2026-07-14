@@ -254,7 +254,7 @@ def build_chain(pool):
         query_category = inputs.get("query_category")
 
         if query_category == "conversational":
-            logger.info("Conversational query — answering without retrieval")
+            logger.debug("Conversational query — answering without retrieval")
             answer = await conversational_chain.ainvoke({
                 "input": user_input,
                 "chat_history": chat_history,
@@ -281,7 +281,7 @@ def build_chain(pool):
                 logger.info("Query: '%s'", standalone_q)
 
         # Step 2: retrieve from pgvector
-        logger.info("Retrieving top-%d from pgvector...", retriever.k)
+        logger.debug("Retrieving top-%d from pgvector...", retriever.k)
         docs = await retriever.ainvoke(standalone_q, run_config)
 
         # Step 3: extract source metadata for the response
@@ -300,7 +300,7 @@ def build_chain(pool):
         # Step 4: generate answer with citations. Concerns queries use the
         # Rumor Control system prompt; everything else uses the standard QA prompt.
         if query_category == "concerns":
-            logger.info("Concerns query — using Rumor Control system prompt")
+            logger.debug("Concerns query — using Rumor Control system prompt")
             answer = await concerns_chain.ainvoke({
                 "context": _format_docs(docs),
                 "input": clean_input,

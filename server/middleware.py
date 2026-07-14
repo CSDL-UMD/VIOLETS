@@ -120,6 +120,15 @@ FALLBACK_RESPONSES = {
         "Maryland — such as registration deadlines, polling locations, and "
         "ballot procedures."
     ),
+    # Distinct from "partisan": this fires only when the post-chain partisan
+    # checker could not produce a clean response after all retries. Kept as a
+    # separate key so the two situations can be worded independently — this one
+    # nudges the participant to rephrase toward election procedures/integrity.
+    "partisan_persist": (
+        "I can only help with non-partisan election information. Could you "
+        "rephrase your question to focus on election procedures, voting "
+        "logistics, or election integrity? I'm happy to help with those."
+    ),
     "pii": (
         "I noticed your message may contain personal information (such as an "
         "email address, credit card number, IP address, or Social Security "
@@ -356,7 +365,7 @@ async def classify_query(query: str, ctx: QueryContext) -> str | None:
     if query.strip().startswith("__User concerns:__"):
         ctx.query_category = "concerns"
         ctx.safety_flag = False
-        logger.info("Query tagged as concerns by survey system [user=%s]", ctx.user_id)
+        logger.debug("Query tagged as concerns by survey system [user=%s]", ctx.user_id)
         return None  # pass through to RAG chain with concerns prompt
  
     try:
@@ -371,7 +380,10 @@ async def classify_query(query: str, ctx: QueryContext) -> str | None:
         ctx.query_category = result.category
         ctx.safety_flag = result.category == "partisan"
  
-        logger.info(
+        # DEBUG — routine per-request detail. When a query is *blocked*, the
+        # /chat endpoint logs a distinct INFO line, so the actionable event
+        # stays visible at the default level without this firing every request.
+        logger.debug(
             "Query classified [user=%s category=%s reason=%s]",
             ctx.user_id,
             result.category,
@@ -411,8 +423,9 @@ async def classify_query(query: str, ctx: QueryContext) -> str | None:
 #
 # Retry logic: up to MAX_PARTISAN_RETRIES (2) additional attempts. The
 # checker re-runs after each retry so we never return partisan content
-# blindly. If all retries are exhausted, the last generated response is
-# returned anyway (fail-open) rather than leaving the user with no answer.
+# blindly. If all retries are exhausted and the response is still partisan,
+# we FAIL CLOSED — the unvetted response is discarded and a canned
+# nonpartisan fallback is returned instead of showing partisan content.
 # ---------------------------------------------------------------------------
 MAX_PARTISAN_RETRIES = 2
 
@@ -475,16 +488,17 @@ async def check_partisan_response(
     response blindly without verifying it first.
 
     If all retries are exhausted and the response is still partisan, a
-    warning is logged and the last generated response is returned anyway
-    (fail-open) rather than leaving the user with no answer.
+    warning is logged and the response is discarded — we FAIL CLOSED and
+    return the canned nonpartisan fallback (which nudges the user to
+    rephrase) rather than showing unvetted partisan content.
 
     Returns a tuple of (answer, sources). Sources is None if no retry
     fired (main.py keeps the original sources), or the retry's sources
     if a retry produced a clean response.
- 
-    Fails closed on exceptions: if the checker itself errors, the unchecked
-    response is discarded and the safe canned nonpartisan fallback is
-    returned instead.
+
+    Fails closed on exceptions too: if the checker itself errors, the
+    unchecked response is discarded and the safe canned nonpartisan
+    fallback is returned instead.
     """
     current_response = response
     current_sources = None
@@ -499,7 +513,9 @@ async def check_partisan_response(
                 timeout=GUARDRAIL_LLM_TIMEOUT,
             )
 
-            logger.info(
+            # DEBUG — fires on every request. A *detected* partisan response
+            # (the actionable case) is logged at WARNING on retry/persist below.
+            logger.debug(
                 "Partisan check [user=%s attempt=%d is_partisan=%s reason=%s]",
                 ctx.user_id,
                 attempt,
@@ -540,14 +556,17 @@ async def check_partisan_response(
                     current_sources = None
 
             else:
-                # All retries exhausted — return last generated response anyway
+                # All retries exhausted and the response is STILL partisan.
+                # Fail closed: never show unvetted partisan content. Discard the
+                # response (and its sources) and return the canned fallback that
+                # nudges the participant to rephrase toward election procedures.
                 logger.warning(
                     "Partisan content persists after %d retries [user=%s] — "
-                    "returning last generated response.",
+                    "returning nonpartisan fallback (fail closed).",
                     MAX_PARTISAN_RETRIES,
                     ctx.user_id,
                 )
-                return current_response, current_sources
+                return FALLBACK_RESPONSES["partisan_persist"], None
 
         except Exception as exc:
             logger.error(

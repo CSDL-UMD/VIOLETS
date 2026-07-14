@@ -9,22 +9,33 @@
 
 ## 1. Executive Summary & Go / No-Go
 
-**Verdict: NO-GO for production in the current state.**
+**Verdict: NO-GO for an open public launch; acceptable for the intended gated pilot once the compliance/correctness items below are closed.**
+
+> **Accepted risks (operator decision — 2026-07-14).** The following are deliberately accepted given the deployment model (single shared key fronted by Qualtrics, ≤5k-chunk corpus, drop-and-reingest workflow, controlled host, API-only access). They are **out of scope** and should not be re-raised:
+> - **P0-1** leaked OpenAI key — **rotated**; the old key is dead. History purge treated as optional hygiene, not required.
+> - **P0-2** rate-limiter / denial-of-wallet — access is gated by Qualtrics with a non-public key; not exposed to hostile callers. (SEC-A1/PERF-B1 downgraded with it.)
+> - **P0-3** stale vectors — the corpus is always **dropped and fully re-ingested**, so no incremental staleness accrues. This also retires **REL-A2** (`apply_keep_filter` purge) and **REL-A3** (`reclassify` desync), which are incremental-update bugs.
+> - **P0-4** `.env` world-readable (0644) — accepted on a controlled, API-only host.
+> - **RET-A1** no ANN index — corpus is capped at ≤5k chunks, so a sequential scan is fine.
+>
+> With these accepted, **no P0 blockers remain**. The live work is the compliance + answer-grounding set in Section 3 (partisan fail-closed, concerns-prefix bypass, similarity floor + honest "I don't know", corpus PII in answers).
 
 The system is a well-organized pilot with genuinely good bones — the request pipeline is coherent, guardrails are thoughtfully ordered, **all SQL is correctly parameterized** (the classic-injection sweep found nothing), embedding model/dimension is **consistent** between ingest and query (cosine metric matches normalized vectors), and most external calls already have per-call timeouts. But it is not safe to expose to real, possibly-hostile users yet. Four issues are hard blockers, and a cluster of P1s around denial-of-wallet, cross-user data access, retrieval grounding, and ops hardening must be closed before a public launch.
 
 The single most important structural problem: **the caller-supplied `user_id` is treated as identity but is never bound to the authenticated principal.** It keys rate limiting *and* session storage, so one leaked shared key yields both unbounded OpenAI spend and cross-user conversation access. That one design flaw drives two of the four P0s and several P1s.
 
-### P0 — must fix before production (4)
+### P0 — original blockers (all ACCEPTED as risks — see note above)
 
-| # | Finding | Where | Why it blocks |
-|---|---------|-------|---------------|
-| **P0-1** | **Live OpenAI key committed to git history** | `Team_B/.env` @ commits `a0896a2`, `0509cfe` (ancestors of HEAD) | A real `sk-proj-…` key (167-char value) is permanently retrievable from repo history. Local `.env` was rotated to a different key, but the old one is **not revoked at OpenAI** unless done explicitly → billable abuse for anyone with clone access. |
-| **P0-2** | **Rate limiter + auth bypass → denial-of-wallet** | `server/main.py:287`, `:250`, `:91` | Limiter keys on client-chosen `user_id`; a holder of the single shared key sends a fresh random `user_id` per request → unlimited `/chat`, each firing 3–13 model/embedding calls. Unbounded OpenAI bill. |
-| **P0-3** | **Stale vectors never deleted → wrong answers served** | `maryland_rag/pass3/embed.py:184`; retrieval `server/rag_chain.py:158` | Edited/removed source content produces new `chunk_id`s that are upserted while the **old vectors are never deleted** (no `DELETE` against `chunks` anywhere). Superseded election facts (e.g. a changed deadline) stay retrievable and get cited with an authoritative URL. Corrupts the core RAG correctness guarantee and worsens monotonically. |
-| **P0-4** | **`.env` with live secrets is world-readable (0644)** | `.env` (mode `-rw-r--r--`) | Holds `OPENAI_API_KEY`, `DATABASE_URL` (inline DB password), `VIOLETS_API_KEY`, `BOX_CLIENT_SECRET`. On a multi-user Ubuntu host any local user can `cat` it. `.box_token` next to it is correctly `0600`, proving this is an oversight. |
+All four original P0s were reviewed and **accepted** given the deployment model; none is treated as a blocker. Retained here for the record, struck through:
 
-**Recommendation:** Close all four P0s, then the P1 security + retrieval-grounding set (Section 3 roadmap), then re-audit before any launch beyond a closed pilot. Even for a closed pilot, P0-1/P0-2/P0-4 must be fixed immediately.
+| # | Finding | Where | Disposition |
+|---|---------|-------|-------------|
+| ~~**P0-1**~~ | ~~Live OpenAI key committed to git history~~ | `Team_B/.env` @ `a0896a2`, `0509cfe` | **ACCEPTED** — key rotated (old one dead); history purge optional. |
+| ~~**P0-2**~~ | ~~Rate limiter + auth bypass → denial-of-wallet~~ | `server/main.py:287`, `:250`, `:91` | **ACCEPTED** — Qualtrics-fronted, non-public key; not exposed to hostile callers. |
+| ~~**P0-3**~~ | ~~Stale vectors never deleted → wrong answers served~~ | `pass3/embed.py:184`; `rag_chain.py:158` | **ACCEPTED** — drop-and-reingest workflow; no incremental staleness. |
+| ~~**P0-4**~~ | ~~`.env` with live secrets world-readable (0644)~~ | `.env` (mode `-rw-r--r--`) | **ACCEPTED** — controlled, API-only host. |
+
+**Recommendation:** With the four P0s accepted, focus the remaining effort on the **compliance + answer-grounding** subset of the P1s: OPS-4 (partisan fail-closed), SEC-C2 (concerns-prefix bypass), RET-B1 (similarity floor + honest "I don't know"), SEC-F1 (corpus PII in answers). These are voter-facing correctness/compliance issues that the deployment model does **not** mitigate.
 
 ### Strengths worth preserving
 - SQL is parameterized end-to-end (`server/rag_chain.py:158`, `pass3/embed.py:186`, `pass1/db.py`) — no SQL injection found.

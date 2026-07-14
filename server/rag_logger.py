@@ -29,6 +29,8 @@ from langchain_core.documents import Document
 from langchain_core.messages import BaseMessage
 from langchain_core.outputs import LLMResult
 
+from .metrics import METRICS
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -190,7 +192,11 @@ class RAGCallbackHandler(BaseCallbackHandler):
             completion_tokens = usage.get("completion_tokens", 0)
             total_tokens      = usage.get("total_tokens", prompt_tokens + completion_tokens)
             cost              = _estimate_cost(model, prompt_tokens, completion_tokens)
-            logger.info(
+            # Accumulate for the periodic heartbeat (overall volume + cost).
+            METRICS.record_llm(total_tokens, cost)
+            # Per-call detail is DEBUG — suppressed at the default INFO level so
+            # the log stays one-line-per-request. Set LOG_LEVEL=DEBUG to see it.
+            logger.debug(
                 "TOKENS [run=%s model=%s]: prompt=%d completion=%d total=%d cost=~$%.5f",
                 key[:8], model, prompt_tokens, completion_tokens, total_tokens, cost,
             )
@@ -220,7 +226,10 @@ class RAGCallbackHandler(BaseCallbackHandler):
         key = str(run_id)
         with self._lock:
             self._ret_starts[key] = time.time()
-        logger.info("RETRIEVER START [run=%s]: %r", key[:8], query)
+        # Raw query is user content — only log it when LOG_QUERIES is enabled,
+        # matching log_request(). Otherwise log its length. DEBUG either way.
+        query_field = repr(query) if LOG_QUERIES else f"len={len(query)}"
+        logger.debug("RETRIEVER START [run=%s]: %s", key[:8], query_field)
 
     def on_retriever_end(
         self,
@@ -233,7 +242,7 @@ class RAGCallbackHandler(BaseCallbackHandler):
         with self._lock:
             start = self._ret_starts.pop(key, time.time())
         elapsed = time.time() - start
-        logger.info(
+        logger.debug(
             "RETRIEVER END [run=%s] (%.2fs): %d docs",
             key[:8], elapsed, len(documents),
         )
@@ -248,18 +257,21 @@ def log_request(
     query: str,
     response: str,
     elapsed: float | None = None,
+    outcome: str = "ok",
 ) -> None:
     """
-    Log a completed /chat exchange at the request level.
+    Log a completed /chat exchange at the request level — one line per request.
 
-    Captures user_id, the query (truncated for log readability), response
-    length in characters, and total wall-clock time if provided.
+    Captures user_id, outcome (ok / blocked:* / error:*), the query length
+    (raw text only if LOG_QUERIES), response length in characters, and total
+    wall-clock time if provided.
     """
     timing = f" elapsed={elapsed:.2f}s" if elapsed is not None else ""
     query_field = repr(query[:120]) if LOG_QUERIES else f"len={len(query)}"
     logger.info(
-        "REQUEST user=%s query=%s response_chars=%d%s",
+        "REQUEST user=%s outcome=%s query=%s response_chars=%d%s",
         user_id,
+        outcome,
         query_field,
         len(response),
         timing,

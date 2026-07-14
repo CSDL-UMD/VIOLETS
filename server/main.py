@@ -55,10 +55,13 @@ from threading import Lock
 
 from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 from . import config
+from .logging_setup import setup_logging, new_request_id
+from .metrics import METRICS
 from .rag_chain import build_chain, to_langchain_messages
 from .rag_logger import (
     RAGCallbackHandler,
@@ -90,6 +93,9 @@ _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 async def _verify_api_key(key: str | None = Security(_api_key_header)):
     if key is None or not hmac.compare_digest(key, config.VIOLETS_API_KEY):
+        # WARNING, not ERROR — a single bad key is routine, but a burst of these
+        # is worth a lead's attention (misconfigured client or probing).
+        logger.warning("Auth failed — missing or invalid API key")
         raise HTTPException(status_code=401, detail="Missing or invalid API key")
 
 
@@ -148,16 +154,62 @@ _pool = None
 # ---------------------------------------------------------------------------
 
 
-async def _periodic_session_cleanup():
-    """Remove expired sessions every 5 minutes."""
+HEARTBEAT_INTERVAL = 300  # seconds
+
+
+def _pool_gauge() -> str:
+    """Best-effort 'in-use/max' pool snapshot for the heartbeat. Never raises.
+
+    Denominator is pool_max (the 25-connection ceiling), not the currently-open
+    count — the pool keeps only min_size (4) connections warm when idle and
+    grows toward max under load, so dividing by the open count would make an
+    idle pool read "0/4" and hide the real headroom. requests_waiting > 0 means
+    every connection is checked out and callers are queuing — the saturation
+    signal worth watching.
+    """
+    try:
+        stats = _pool.get_stats() if _pool is not None else {}
+        maximum = stats.get("pool_max", 0)
+        size = stats.get("pool_size", 0)          # connections currently open
+        available = stats.get("pool_available", 0)  # open and idle
+        waiting = stats.get("requests_waiting", 0)
+        in_use = size - available
+        gauge = f"pool={in_use}/{maximum} in use ({size} open)"
+        if waiting:
+            gauge += f", {waiting} waiting"
+        return gauge
+    except Exception:
+        return "pool=?"
+
+
+async def _periodic_maintenance():
+    """Every interval: expire old sessions and emit a heartbeat summary.
+
+    This is a routine health line, NOT an error channel — errors are logged the
+    instant they occur elsewhere. The heartbeat only answers "how's it doing?"
+    (volume, cost, pool utilization) at a glance.
+    """
     while True:
-        await asyncio.sleep(300)
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
         try:
             if store:
                 store.cleanup_expired()
         except Exception:
             # Never let a transient error kill the task permanently.
             logger.exception("Periodic session cleanup failed; continuing.")
+
+        try:
+            m = METRICS.drain_rolling()
+            logger.info(
+                "HEARTBEAT last %dm — requests=%d errors=%d blocked=%d cost=~$%.4f "
+                "| since boot: requests=%d errors=%d cost=~$%.4f | %s",
+                HEARTBEAT_INTERVAL // 60,
+                m["requests"], m["errors"], m["blocked"], m["cost"],
+                m["total_requests"], m["total_errors"], m["total_cost"],
+                _pool_gauge(),
+            )
+        except Exception:
+            logger.exception("Heartbeat emission failed; continuing.")
 
 
 # ---------------------------------------------------------------------------
@@ -168,10 +220,9 @@ async def _periodic_session_cleanup():
 async def lifespan(app: FastAPI):
     global chain, store, _rag_callback, _pool
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+    # Idempotent — also called from __main__ before uvicorn starts, but configure
+    # here too so launching via `uvicorn server.main:app` still gets file logging.
+    setup_logging()
 
     logger.info(
         "Starting VIOLETS server — model=%s  k=%d  session_ttl=%dm",
@@ -207,7 +258,14 @@ async def lifespan(app: FastAPI):
         open=False,
     )
     # Block until the pool is ready so the first request doesn't race startup.
-    await _pool.open(wait=True, timeout=10)
+    try:
+        await _pool.open(wait=True, timeout=10)
+    except Exception:
+        logger.exception(
+            "Database unreachable at startup — check DATABASE_URL and that "
+            "Postgres/pgvector is running. Server cannot start."
+        )
+        raise
 
     store = SessionStore(
         ttl_minutes=config.SESSION_TTL_MINUTES,
@@ -217,7 +275,7 @@ async def lifespan(app: FastAPI):
     chain = build_chain(_pool)
     _rag_callback = RAGCallbackHandler()
 
-    cleanup_task = asyncio.create_task(_periodic_session_cleanup())
+    cleanup_task = asyncio.create_task(_periodic_maintenance())
 
     logger.info("Server ready.")
     yield
@@ -276,6 +334,10 @@ class ResetRequest(BaseModel):
 
 @app.post("/chat", response_model=ChatResponse, dependencies=[Depends(_verify_api_key)])
 async def chat(req: ChatRequest):
+    # Bind a correlation id for this request — every log line below (across
+    # guardrails, chain, and callbacks) is stamped with it via the log filter.
+    new_request_id()
+
     # Shared context object — travels through all guardrails
     ctx = QueryContext(user_id=req.user_id)
 
@@ -285,6 +347,7 @@ async def chat(req: ChatRequest):
 
     # Rate limit check (before any LLM calls)
     if not _rate_limiter.check(req.user_id):
+        logger.warning("Rate limit exceeded [user=%s]", req.user_id)
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
     # ------------------------------------------------------------------
@@ -300,6 +363,7 @@ async def chat(req: ChatRequest):
             req.user_id,
             ctx.pii_type,
         )
+        METRICS.record_request("blocked:pii")
         return ChatResponse(response=pii_response)
 
     # ------------------------------------------------------------------
@@ -314,6 +378,7 @@ async def chat(req: ChatRequest):
             req.user_id,
             ctx.query_category,
         )
+        METRICS.record_request("blocked:scope")
         return ChatResponse(response=classification_response)
 
     # ------------------------------------------------------------------
@@ -339,9 +404,13 @@ async def chat(req: ChatRequest):
         )
     except asyncio.TimeoutError:
         logger.error("RAG chain timed out after %ds [user=%s]", RAG_CHAIN_TIMEOUT, req.user_id)
+        METRICS.record_request("error:timeout")
         raise HTTPException(status_code=502, detail="Failed to generate response.")
-    except Exception as exc:
-        logger.error("RAG chain error [user=%s]: %s", req.user_id, exc)
+    except Exception:
+        # logger.exception captures the full traceback — this is the line a lead
+        # forwards to a developer, so it must carry more than the message string.
+        logger.exception("RAG chain error [user=%s]", req.user_id)
+        METRICS.record_request("error:chain")
         raise HTTPException(status_code=502, detail="Failed to generate response.")
 
     answer = result["answer"]
@@ -351,8 +420,8 @@ async def chat(req: ChatRequest):
     # GUARDRAIL 3: Partisan response check (~100 tokens)
     # Runs after the chain so it can inspect the output.
     # Retries up to MAX_PARTISAN_RETRIES times with a stricter prompt
-    # if partisan content is detected. If all retries fail, returns the
-    # last generated response anyway (fail-open).
+    # if partisan content is detected. If all retries fail, fails closed —
+    # discards the response and returns a nonpartisan fallback.
     # ------------------------------------------------------------------
     answer, new_sources = await check_partisan_response(
         query=req.query,
@@ -365,7 +434,8 @@ async def chat(req: ChatRequest):
     if new_sources is not None:
         sources = [SourceReference(**s) for s in new_sources]
 
-    log_request(req.user_id, req.query, answer, elapsed=time.time() - start)
+    METRICS.record_request("ok")
+    log_request(req.user_id, req.query, answer, elapsed=time.time() - start, outcome="ok")
     store.add_exchange(req.user_id, req.query, answer)
 
     return ChatResponse(response=answer, sources=sources)
@@ -381,10 +451,26 @@ async def reset_session(req: ResetRequest):
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "ok",
+    # Actually ping the database so an uptime monitor catches a dead pool /
+    # unreachable Postgres instead of a false "ok". Returns 503 when the DB is
+    # down (or the pool hasn't finished starting) so load balancers pull the node.
+    db_ok = False
+    try:
+        if _pool is not None:
+            async with _pool.connection() as conn:
+                await conn.execute("SELECT 1")
+            db_ok = True
+    except Exception as exc:
+        # One concise WARNING (no traceback) — during an outage this may repeat
+        # each probe, which is the intent: it stays visible in the log.
+        logger.warning("Health check — database ping failed: %s", exc)
+
+    body = {
+        "status": "ok" if db_ok else "degraded",
+        "database": "ok" if db_ok else "unreachable",
         "model": config.LLM_MODEL,
     }
+    return JSONResponse(body, status_code=200 if db_ok else 503)
 
 
 if __name__ == "__main__":
@@ -394,9 +480,15 @@ if __name__ == "__main__":
     # remember the --workers flag (and it overrides WEB_CONCURRENCY).
     import uvicorn
 
+    # Configure our rotating-file + console logging before uvicorn boots, and
+    # pass log_config=None so uvicorn doesn't install its own handlers on top
+    # (its loggers propagate to our root config instead).
+    setup_logging()
+
     uvicorn.run(
         "server.main:app",
         host=os.environ.get("HOST", "0.0.0.0"),
         port=int(os.environ.get("PORT", "8000")),
         workers=1,
+        log_config=None,
     )
