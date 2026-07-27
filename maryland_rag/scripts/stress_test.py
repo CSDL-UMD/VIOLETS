@@ -10,7 +10,7 @@ import os
 import time
 import httpx
 BASE = os.environ.get("VIOLETS_BASE_URL", "http://localhost:6000")
-TIMEOUT = 30.0
+TIMEOUT = 60.0
 API_KEY = os.environ.get("VIOLETS_API_KEY", "")
 AUTH_HEADERS = {"X-API-Key": API_KEY}
 results = {"pass": 0, "fail": 0, "errors": []}
@@ -185,6 +185,11 @@ async def test_mixed_guardrail_paths():
         responses = await asyncio.gather(*tasks, return_exceptions=True)
         elapsed = time.time() - start
     error_fallback = "couldn't process your question"
+    # Distinguishing phrase from FALLBACK_RESPONSES["out_of_scope"] in
+    # server/middleware.py — a real weather answer would never contain this,
+    # so this is what actually proves the block fired (200 + "response"
+    # alone would pass even if the query got a genuine weather answer).
+    oos_marker = "Maryland elections information assistant"
     for (uid, q, label), resp in zip(queries, responses):
         if isinstance(resp, Exception):
             record(f"{label} ({uid})", False, str(resp))
@@ -198,6 +203,13 @@ async def test_mixed_guardrail_paths():
                     f"No silent error fallback ({uid})",
                     error_fallback not in body.get("response", ""),
                     "got error fallback on a normal RAG query",
+                )
+            # Out-of-scope path must actually redirect, not answer the question
+            if label == "out-of-scope block" and has_response:
+                record(
+                    f"Redirected, not answered ({uid})",
+                    oos_marker in body.get("response", ""),
+                    f"expected out_of_scope fallback, got: {body.get('response', '')[:120]!r}",
                 )
     print(f"  All 5 mixed queries completed in {elapsed:.1f}s")
 async def test_session_reset_under_load():

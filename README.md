@@ -76,32 +76,42 @@ Default LLM: `gpt-5-nano` (overridable via `LLM_MODEL`).
 
 ## 2. Repository Structure
 
+Each top-level code package (`maryland_rag/`, `server/`, `box_ingest/`) and the
+`needtochunk/` document drop also carry their own `README.md` describing that
+folder's files in detail; this root README is the end-to-end reference.
+
 ```
 VIOLETS/
-├── .env                              ← API keys (NEVER commit to GitHub)
+├── .env                              ← API keys + Box OAuth creds (NEVER commit to GitHub)
+├── .box_token                        ← Cached Box OAuth tokens (gitignored, mode 0600)
 ├── README.md                         ← This file
 │
 ├── data/                             ← All pipeline artifacts (gitignored)
 │   ├── manifest.db                   ← SQLite crawl database (Pass 1 output)
 │   ├── chunks.jsonl                  ← Web chunks (Pass 2 output)
 │   ├── box_chunks.jsonl              ← Box document chunks (Box Ingest output)
-│   └── cache/                        ← Disk cache of fetched pages / binaries
+│   ├── box_ingest.state.json         ← Box ingest skip-if-unchanged cache
+│   └── cache/                        ← Disk cache of fetched pages / binaries (+ .bin.meta sidecars)
 │
 ├── logs/                             ← Runtime logs (gitignored)
-│   └── crawl.log                     ← Crawl activity log
+│   ├── crawl.log                     ← Crawl activity log
+│   └── server.log                    ← Server log (rotating, 10 MB × 5)
 │
-├── needtochunk/                      ← Curated documents from Box (pre-selected)
-│   ├── <year-folder>/<file>.pdf      ← PDFs, DOCX, TXT, etc.
-│   └── url_manifest.json             ← Maps each file's relative path → Box share URL
+├── needtochunk/                      ← Curated documents from Box
+│   ├── README.md                     ← How the document drop + manifest work
+│   ├── <year-folder>/<file>.pdf      ← PDFs, DOCX, XLSX, TXT, etc.
+│   ├── url_manifest.json             ← Maps each file's relative path → Box share URL
+│   └── review_files.txt              ← Triage log of Box files needing a keep/drop decision
 │
 ├── maryland_rag/                     ← Web pipeline Python package
+│   ├── README.md                     ← Package-level guide
 │   ├── __main__.py                   ← CLI entry point (pass1 / pass2 / pass3 / all / audit)
 │   ├── requirements.txt              ← Pipeline Python dependencies
 │   │
 │   ├── pass1/                        ← Phase 1: Crawl the allowlisted sites
-│   │   ├── config.py                 ← Seeds, domains, rate limit, paths
-│   │   ├── crawler.py                ← BFS web crawler (multi-seed, multi-domain)
-│   │   ├── extractor.py              ← Text/link/metadata extraction (HTML + doc HEAD probes)
+│   │   ├── config.py                 ← Seeds, domains, rate limit, retries, paths
+│   │   ├── crawler.py                ← BFS web crawler (robots.txt, transient-failure retry)
+│   │   ├── extractor.py              ← Text/link/metadata extraction (HTML + doc HEAD probe)
 │   │   ├── classifier.py             ← Crawl-time wrapper over rules.py
 │   │   ├── rules.py                  ← Shared classification rules (used by reclassify too)
 │   │   ├── exclusions.py             ← Allowlist + exclusion gate (single source of truth)
@@ -110,12 +120,13 @@ VIOLETS/
 │   │
 │   ├── pass2/                        ← Phase 2: Break pages into chunks
 │   │   ├── chunker.py                ← Orchestrates all chunking
-│   │   ├── metadata.py               ← Builds chunk metadata (incl. multi-source dedup)
-│   │   ├── cache.py                  ← Caches HTTP fetches to disk
+│   │   ├── metadata.py               ← Builds chunk metadata (content-derived chunk_id, dedup)
+│   │   ├── cache.py                  ← Disk cache of HTTP fetches (freshness-aware)
+│   │   ├── langfilter.py             ← Non-English chunk filter (non-Latin ratio)
 │   │   └── strategies/               ← One file per chunking approach
 │   │       ├── single.py             ← Entire page as one chunk
 │   │       ├── simple_split.py       ← Split at paragraph boundaries
-│   │       ├── semantic.py           ← Sentence splits with overlap
+│   │       ├── semantic.py           ← Sentence splits with overlap + shared chunk-cap enforcement
 │   │       ├── faq.py                ← Extract Q&A pairs
 │   │       ├── table_rows.py         ← One chunk per HTML table row
 │   │       ├── pdf.py                ← Extract text from PDFs (pdfplumber → pymupdf → OCR)
@@ -125,22 +136,35 @@ VIOLETS/
 │   ├── pass3/                        ← Phase 3: Embed and upsert
 │   │   └── embed.py                  ← OpenAI embeddings + pgvector upsert
 │   │
-│   └── scripts/                      ← Maintenance utilities
+│   └── scripts/                      ← Maintenance & verification utilities
 │       ├── db_cleanup.py             ← Remove duplicate URL variants from manifest.db
 │       ├── reclassify.py             ← Re-classify pages using stored metadata
 │       ├── apply_keep_filter.py      ← Mark out-of-scope rows as excluded
+│       ├── audit.py                  ← Manifest audit report (backs `maryland_rag audit`)
+│       ├── verify_chunks.py          ← Post-ingest gate: coverage / junk / pgvector parity
 │       └── stress_test.py            ← Server-side concurrency + edge-case test harness
 │
-├── box_ingest/                       ← Parallel pipeline for curated Box documents
-│   └── ingest.py                     ← Reads needtochunk/, writes data/box_chunks.jsonl
+├── box_ingest/                       ← Curated Box document pipeline (download + chunk)
+│   ├── README.md                     ← Box subsystem guide
+│   ├── automate.py                   ← Step 1: crawl Box hub → download → update manifest
+│   ├── crawler.py                    ← Box Hub scraper (Playwright) + Box OAuth/API client
+│   ├── filter.py                     ← Keyword include/exclude/review rules for filenames
+│   ├── manifest.py                   ← Merge new files into url_manifest.json
+│   ├── paths.py                      ← Shared filesystem path constants
+│   ├── ingest.py                     ← Step 2: extract needtochunk/ → data/box_chunks.jsonl
+│   └── requirements.txt              ← Box subsystem dependencies (incl. playwright)
 │
 └── server/                           ← FastAPI chatbot server
+    ├── README.md                     ← Server guide
     ├── main.py                       ← App, lifespan, /chat, /reset, /health, auth, rate limit
     ├── config.py                     ← Loads .env, exposes settings
-    ├── rag_chain.py                  ← LangChain RAG chain + PgVectorRetriever
+    ├── rag_chain.py                  ← LangChain RAG chain + async PgVectorRetriever
     ├── middleware.py                 ← PII, classification, partisan-check guardrails
     ├── rag_logger.py                 ← Callback handler for token/cost/timing logging
+    ├── logging_setup.py              ← Central logging config + per-request IDs
+    ├── metrics.py                    ← In-process counters feeding the heartbeat log
     ├── session.py                    ← Thread-safe in-memory conversation store
+    ├── eval_guardrails.py            ← Offline eval: reasoning-effort regression check
     └── requirements.txt              ← Server Python dependencies
 ```
 
@@ -173,9 +197,18 @@ pip install -r maryland_rag/requirements.txt
 # Server dependencies
 pip install -r server/requirements.txt
 
+# Box automation dependencies — only needed to auto-download from Box (Section 6.5)
+pip install -r box_ingest/requirements.txt
+playwright install chromium
+
 # Download spaCy language model (required by server PII detection)
 python -m spacy download en_core_web_lg
 ```
+
+> The three `requirements.txt` files overlap (all pull the document-extraction
+> libraries). `box_ingest/requirements.txt` is only required if you run the Box
+> **automation** step (`box_ingest.automate`) — plain `box_ingest.ingest`
+> reuses the extraction libraries already installed for the pipeline.
 
 | Library | Used In | Purpose |
 |---|---|---|
@@ -195,9 +228,15 @@ python -m spacy download en_core_web_lg
 | `pgvector` | Pass 3, Server | pgvector extension support for psycopg |
 | `fastapi` | Server | Web framework |
 | `uvicorn[standard]` | Server | ASGI server to run FastAPI |
+| `pydantic` | Server | Request/response validation (`ChatRequest`, structured guardrail outputs) |
 | `langchain` / `langchain-openai` | Server | RAG chain orchestration + ChatOpenAI + OpenAI embeddings |
 | `presidio-analyzer` | Server | PII detection (SSN, credit card, email, phone, passport, driver's license, IP) |
 | `spacy` | Server | NLP backend for Presidio (requires `en_core_web_lg`) |
+| `python-dotenv` | Pipeline, Server, Box | Loads `.env` at startup |
+| `playwright` | Box automation | Headless Chromium to scrape the Box Hub folder list |
+
+> The non-English chunk filter (`pass2/langfilter.py`) is pure-Python (Unicode
+> codepoint ratio) — it needs no `langdetect`/`langid` dependency.
 
 ### 3.3 Environment Variables
 
@@ -207,9 +246,15 @@ Create a `.env` file in the project root:
 OPENAI_API_KEY=sk-...
 DATABASE_URL=postgresql://user:pass@localhost:5432/violets
 VIOLETS_API_KEY=<a long random string — required by /chat and /reset>
+
+# Only needed for the Box auto-download step (box_ingest.automate — Section 6.5):
+BOX_CLIENT_ID=<Box developer app client id>
+BOX_CLIENT_SECRET=<Box developer app client secret>
 ```
 
-The server validates `OPENAI_API_KEY`, `DATABASE_URL`, and `VIOLETS_API_KEY` at import time; missing values raise immediately instead of failing later inside a request.
+The server validates `OPENAI_API_KEY`, `DATABASE_URL`, and `VIOLETS_API_KEY` at import time; missing values raise immediately instead of failing later inside a request. `BOX_CLIENT_ID` / `BOX_CLIENT_SECRET` are read only when you run `box_ingest.automate`; the rest of the pipeline and the server never touch them.
+
+Optional server overrides (`LLM_MODEL`, `RETRIEVER_K`, `LOG_LEVEL`, logging toggles, etc.) are listed in [Section 14](#14-configuration-reference).
 
 Optional overrides are listed in [Section 14](#14-configuration-reference). See [Section 9](#9-operating-the-server-auth-cors-rate-limit) for how `VIOLETS_API_KEY` is enforced. See [Section 15](#15-security-warning) for key handling.
 
@@ -242,18 +287,27 @@ BFS from the seeds defined in `pass1/config.SEED_URLS`, up to 6 levels deep, sco
 **Crawl sequence per page:**
 
 ```
-1. Gate 1: Allowlist + exclusion patterns (no network call) → Skip if not in scope
+1. Gate 1: Allowlist + exclusion patterns (no network call) → Mark 'excluded' if not in scope
 2. Gate 2: Depth > MAX_DEPTH (6)                            → Mark 'skipped'
-3. Gate 3: robots.txt (per-domain parser)                   → Mark 'excluded'
-4. Fetch the page                                           ← Single HTTP request
-5. Gate 4: Bad HTTP status (404, 410, 403, 500, 502, 503)?  → Mark 'failed'
+3. Gate 3: robots.txt (per-domain parser)                   → Mark 'excluded' if disallowed
+4. Fetch the page (with transient-failure retry)           ← HTTP request(s)
+5. Gate 4: Permanent 403 / 404 / 410?                       → Mark 'failed'
 6. Extract content (text, links, metadata, breadcrumbs)
 7. Classify the page (rules.py)
 8. Persist row to manifest.db
 9. Enqueue discovered internal links
 ```
 
-**Single fetch per page:** No double-fetch (check then extract); everything happens in the one request.
+**Single fetch per page:** No double-fetch (check then extract); everything happens in the one request. The freshly-fetched HTML is written into the Pass 2 disk cache so Pass 2 chunks exactly the bytes Pass 1 hashed (see [Section 5.2](#52-the-http-cache-pass2cachepy)).
+
+**robots.txt (RFC 9309):** At crawl start, one parser is built per domain in `DOMAINS` (only when `RESPECT_ROBOTS_TXT`). The file is fetched with the **crawler's own `requests` client + User-Agent** — not `urllib`'s `RobotFileParser.read()`, whose default `Python-urllib` UA is 403'd by both sites' WAFs (a 403 would make robotparser disallow everything). The response text is then handed to a `urllib.robotparser.RobotFileParser` via `parse()`. Per RFC 9309 §2.3.1:
+- **2xx** → parse and honor the rules.
+- **4xx** → no restrictions (parser is `None`; Gate 3 is skipped).
+- **5xx / unreachable** (after retries) → a synthetic **disallow-all** parser, logged at ERROR — every URL on that domain is excluded until the fetch succeeds.
+
+The robots fetch itself retries up to `MAX_RETRIES` (3) times with `2 ** attempt` backoff on 5xx/network errors.
+
+**Transient-failure retry (`_fetch_with_retry`):** Page fetches retry up to `MAX_RETRIES` (3) times (4 attempts total) with exponential backoff `RATE_LIMIT_SECONDS * 2^(n+1)` = 1.5 s → 3 s → 6 s. A failure is *transient* if the fetch returned `None` (network error/timeout), the HTTP status is ≥ 500, or it's in `TRANSIENT_HTTP_STATUSES` (`408`, `429`). Permanent `403` / `404` / `410` return immediately and hit Gate 4. After retries are exhausted, a still-failing URL is marked `failed` **only if it has never been crawled** — a row already `crawled` from a prior run is preserved (`_mark_failure_preserving_crawled`), so Pass 2 can still chunk the cached copy. This same helper catches unexpected processing exceptions in the loop.
 
 **Resumability:** Every discovered URL is written to `manifest.db` as `pending` before fetching. On restart, the crawler seeds the queue from `pending` rows — no progress lost.
 
@@ -282,7 +336,9 @@ BFS from the seeds defined in `pass1/config.SEED_URLS`, up to 6 levels deep, sco
 
 Non-content file extensions (`.jpg`, `.css`, `.js`, `.json`, fonts, archives, media) and non-HTTP schemes (`mailto:`, `tel:`, `javascript:`) are also skipped, as are domains in `SKIP_DOMAINS` (Facebook, Twitter, YouTube, etc.).
 
-`is_excluded_status({404, 410, 403, 500, 502, 503})` is what flips an HTTP response to `failed` in step 5 above.
+`EXCLUDED_HTTP_STATUSES` still lists `{404, 410, 403, 500, 502, 503}`, but in practice the 5xx codes are intercepted earlier by the transient-retry path (Section 4.1); only permanent `403` / `404` / `410` reach Gate 4 and flip a never-crawled URL to `failed`.
+
+**Non-English translated documents** are excluded here too: filenames matching a language suffix (`amharic`, `korean`, `vietnamese`, `spanish`, `french`, `russian`, `tagalog`, `urdu`, `farsi`, `portuguese`, `haitian-creole`, `chinese`, …) on a `.pdf`/`.docx`/`.xls` are dropped with reason `"non-English translated document — English original is indexed"`. A second, content-based net runs in Pass 2 ([Section 5.5](#55-non-english-filter-pass2langfilterpy)).
 
 ---
 
@@ -297,8 +353,8 @@ For each **HTML page**:
 6. Compute SHA256 `content_hash` of the extracted text (used for dedup and change detection)
 
 For **documents (PDF, DOCX, XLS)**:
-- HEAD request only — get file size without downloading
-- PDFs additionally: download the first `PDF_PROBE_BYTES` (4096) via HTTP `Range` and look for text markers (`/Font`, `/Text`, `Tj`, `TJ`, `/ToUnicode`). If none found, flag `needs_ocr = 1`. If the server ignores `Range`, the probe reads just one chunk and aborts cleanly so we never download the full PDF.
+- HEAD request only — get file size (`Content-Length`) without downloading the body.
+- `needs_ocr` is **no longer probed at crawl time** and is always stored as `False`. The old 4 KB `Range` byte-probe was removed because it mis-flagged compressed-but-digital PDFs; the OCR decision now happens in Pass 2 after a real extraction attempt ([Section 13, PDF extraction](#pdf-extraction-pass2strategiespdfpy)). The `PDF_PROBE_BYTES` constant is retained in `config.py` but is now dead.
 
 Full document extraction is deferred to Pass 2 (discovery vs. extraction stay separate).
 
@@ -385,15 +441,21 @@ Different page types warrant different chunking approaches:
 
 ### 5.2 The HTTP Cache (`pass2/cache.py`)
 
-Pass 2 re-fetches HTML and documents to get full content (Pass 1 only stored a 500-char snippet for HTML). All fetches go through a disk cache at `data/cache/`, keyed by `SHA256(url)`, stored as `.html` (text) or `.bin` (bytes). Cache hits skip the network entirely. Cache misses sleep `RATE_LIMIT_SECONDS` before fetching so re-runs after a crash don't hammer the server.
+Pass 2 needs full content (Pass 1 only stored a 500-char snippet for HTML). All fetches go through a disk cache at `data/cache/`, keyed by `SHA256(url)`, stored as `.html` (text) or `.bin` (bytes). Writes are atomic (temp file + `os.replace`). Cache misses sleep `RATE_LIMIT_SECONDS` before fetching so re-runs after a crash don't hammer the server. Disk (not in-memory) because Pass 2 runs can be long and interrupted — a persistent cache survives restarts.
 
-Disk cache (not in-memory) because Pass 2 runs can be long and interrupted — a persistent cache survives restarts.
+**Freshness (there is no time-based TTL):**
+- **HTML** — Pass 1 writes every page it fetches straight into this cache (`put_html`), so a Pass 2 HTML cache hit returns exactly the bytes Pass 1 hashed. On a genuine miss, `get_html` fetches live (rate-limited).
+- **Binaries (`.bin`)** — each blob has a `.bin.meta` JSON sidecar holding its `ETag` / `Last-Modified`. On a cache hit, the URL is revalidated **at most once per process run** (tracked in an in-memory set) with a conditional GET (`If-None-Match` / `If-Modified-Since`): **304** keeps the cached blob, **200** replaces blob + sidecar, a network error falls back to the cached copy. Blobs with no validators are trusted; legacy blobs with no sidecar get one plain refresh GET.
 
 ---
 
-### 5.3 Deduplication (`pass2/chunker.py`)
+### 5.3 Deduplication & chunk_id (`pass2/chunker.py`, `pass2/metadata.py`)
 
-Pages with identical `content_hash` (same content under different URLs) are extracted once. Resulting chunks carry `source_urls` (plural array) listing every URL pointing at that content. The chunk's `chunk_id` is derived from the sorted URL set so it remains stable even if a secondary URL disappears between runs. This avoids inserting duplicate vectors while preserving full provenance.
+Pages with identical `content_hash` (same content under different URLs) are extracted once. Resulting chunks carry `source_urls` (plural array) listing every URL pointing at that content. This avoids inserting duplicate vectors while preserving full provenance.
+
+The `chunk_id` is **derived from the chunk's content**, not from its URL set:
+`chunk_id = SHA256( normalize(text) + "\x00" + section_key + "\x00" + chunk_index )[:32]`.
+It was deliberately changed away from the old sorted-URL-set id: when a duplicate URL appeared or disappeared between runs the id would shift and Pass 3's upsert would orphan the old vector. A content-derived id is stable across re-ingests regardless of which URLs currently point at the content. (`box_ingest` uses the same `_content_chunk_id` helper.)
 
 ---
 
@@ -422,6 +484,16 @@ The full chunk dict (minus the columns `chunk_id`/`text`/`source_url`/`title`) i
 
 ---
 
+### 5.5 Non-English Filter (`pass2/langfilter.py`)
+
+Bilingual PDFs and mixed-script pages can produce "extraction salad" (English interleaved with another script). A per-chunk content net drops those: `non_latin_ratio(text)` is the fraction of alphabetic characters whose codepoint is above `0x024F` (end of Latin Extended-B), and a chunk is dropped when that ratio exceeds `MAX_NON_LATIN_RATIO` (`0.10`). Accented European letters (é, ñ, ő) count as Latin and pass; Vietnamese diacritics and CJK/Cyrillic/Arabic scripts count as non-Latin. It runs in `chunker.run_pass2` after each page is chunked. This is the content-side companion to the URL-based exclusion of translated documents in Pass 1 ([Section 4.2](#42-the-allowlist--exclusions-pass1exclusionspy)); the threshold has wide margin (measured English chunks sit below 0.02).
+
+### 5.6 Chunk Size Caps
+
+Every strategy routes its output through `enforce_chunk_caps` (`pass2/strategies/semantic.py`): no chunk may exceed `MAX_CHUNK_WORDS` (500) or `MAX_CHUNK_CHARS` (20000, the hard embedding-safety limit). Oversized chunks are re-split semantically, and pathological single "sentences" (OCR / CID-stream garbage with no punctuation) are hard word/char-split. These are per-chunk **size** caps — there is no cap on the number of chunks per HTML page or PDF. The one per-*document* count cap is spreadsheets: a workbook producing more than `MAX_XLS_ROW_CHUNKS` (200) rows is treated as bulk tabular data and skipped entirely (see [XLS extraction](#xls--xlsx-extraction-pass2strategiesxls_strategypy)).
+
+---
+
 ## 6. Box Ingest — Curated Document Pipeline
 
 **Goal:** Ingest a hand-curated set of Box-hosted documents (election worker manuals, monthly admin reports, etc.) into the same pgvector store as the web crawl, using the same chunk schema.
@@ -442,30 +514,55 @@ Why a separate pipeline: Box files aren't crawlable — the State Board uploads 
 }
 ```
 
-Files whose mapping is empty or missing are **skipped with a warning** — they won't be embedded.
+Files whose mapping is empty or missing are **skipped with a warning** — they won't be embedded. `url_manifest.json`, `review_files.txt`, and `.DS_Store` are always skipped (`SKIP_NAMES`).
 
-**Run it:**
+**Run it (Step 2 — extract & chunk):**
 ```bash
 python -m box_ingest.ingest                       # write data/box_chunks.jsonl
-python -m box_ingest.ingest --dry-run             # show manifest mappings, no writes
+python -m box_ingest.ingest --dry-run             # list planned actions, write nothing
 python -m box_ingest.ingest --output path/to.jsonl
+python -m box_ingest.ingest --workers 8           # parallel extraction (default: CPU count)
 ```
 
-**Extraction:**
-- `.pdf` → pdfplumber → pymupdf → OCR (tesseract @ 250 dpi for scanned PDFs)
+Extraction runs in a `ProcessPoolExecutor`. A skip-if-unchanged cache in `data/box_ingest.state.json` (size + mtime fingerprint per file) means unchanged files aren't re-extracted; `box_chunks.jsonl` is rewritten each run as the union of all cached chunks. Deleted files are dropped from the state and every zero-chunk file is logged in a warning summary.
+
+**Extraction (all via the shared `maryland_rag.pass2` extractors):**
+- `.pdf` → pdfplumber → pymupdf → OCR (tesseract @ **300 dpi** for scanned PDFs — the same path Pass 2 uses)
 - `.docx` / `.doc` → python-docx walks heading hierarchy; each section keeps its `heading_chain`
+- `.xlsx` / `.xlsm` → one chunk per spreadsheet row (bypasses the word-count routing below)
 - `.txt` → plain read
 - Other extensions → warned and skipped
 
-**Chunking:**
+**Chunking (PDF / DOCX / TXT):**
 - DOCX with headings → each section chunked independently
-- ≤ 150 words → `ingest_as_single`
-- > 150 words → `semantic_chunk` (with paragraph-boundary fallback)
+- ≤ `SHORT_DOC_WORDS` (150) → `ingest_as_single`
+- > 150 words → `semantic_chunk` (with a `FALLBACK_CHUNK_WORDS` = 400 paragraph-boundary fallback)
 - Section hierarchy = folder chain (relative to `needtochunk/`) + DOCX heading chain
 
-**Stability:** `chunk_id = sha256(source_url + ":" + chunk_index)[:32]` — deterministic. Re-running on unchanged files produces the same IDs, so Pass 3's upsert is a no-op for unchanged content.
+**Stability:** the `chunk_id` is content-derived (`_content_chunk_id`: normalized text + section hierarchy + chunk index — **not** the source URL; see [Section 5.3](#53-deduplication--chunk_id-pass2chunkerpy-pass2metadatapy)). Re-running on unchanged files produces the same IDs, so Pass 3's upsert is a no-op for unchanged content.
 
 Each record in `data/box_chunks.jsonl` uses the same shape as `chunks.jsonl` (`page_classification='document'`, `chunking_strategy='box_ingest'`), so Pass 3 ingests it identically.
+
+---
+
+### 6.5 Box Auto-Download (`box_ingest.automate`)
+
+Step 2 above chunks whatever is already sitting in `needtochunk/`. **Step 1** (`box_ingest.automate`) is what fills `needtochunk/` from the State Board's public Box Hub in the first place. It is a **manual/separate** command — `python -m maryland_rag all` runs Step 2 (`ingest`) but never Step 1.
+
+```bash
+python -m box_ingest.automate                     # crawl Box hub, download, update manifest
+python -m box_ingest.automate --dry-run           # preview only, no downloads or writes
+```
+
+Flow:
+1. **Auth** — Box OAuth 2.0 (authorization-code grant) using `BOX_CLIENT_ID` / `BOX_CLIENT_SECRET`. First run opens a browser and captures the redirect at `http://localhost:8080`; tokens are cached in `.box_token` (mode `0600`) and refreshed silently thereafter.
+2. **Crawl** (`crawler.py`) — Playwright (headless Chromium) scrapes the public Hub page for folder IDs, then the Box REST API v2.0 lists each `2026-*` folder recursively (carrying the Hub's shared link on every call).
+3. **Filter** (`filter.py`) — each filename is classified `include` / `exclude` / `review` by keyword lists (`INCLUDE_TERMS` / `EXCLUDE_TERMS`; anything matching neither → `review`).
+4. **Download** — `include` files are downloaded into `needtochunk/<year-folder>/<name>` (already-present files skipped).
+5. **Manifest** (`manifest.py`) — new `include` files are merged into `url_manifest.json` (existing/populated entries are never overwritten).
+6. **Review log** — `review` files are written to `needtochunk/review_files.txt` with their Box URLs so an operator can add a keyword to `filter.py` or hand-add the file to the manifest.
+
+See [box_ingest/README.md](box_ingest/README.md) for the full module breakdown.
 
 ---
 
@@ -489,7 +586,7 @@ python -m maryland_rag pass3 --chunks data/box_chunks.jsonl
 1. Read chunks from the JSONL file.
 2. Create the `chunks` table if it doesn't exist (`CREATE EXTENSION IF NOT EXISTS vector` first).
 3. If `--resume`: query existing `chunk_id`s and skip them.
-4. Embed in batches of `EMBED_BATCH_SIZE` (100) → `text-embedding-3-small` → 1,536-dim vectors. 3 retries with exponential backoff.
+4. Embed in batches of `EMBED_BATCH_SIZE` (100) → `text-embedding-3-small` → 1,536-dim vectors. Up to 3 attempts with **linear backoff + jitter** (`RETRY_DELAY * attempt + random(0, RETRY_DELAY)`) on transient errors (incl. 408/429). On a deterministic 4xx the batch is recursively **bisected** to isolate the offending input; a chunk that still fails deterministically raises `RuntimeError` and aborts the run (non-zero exit) rather than silently dropping content.
 5. Upsert into PostgreSQL with `ON CONFLICT (chunk_id) DO UPDATE`. Each row is wrapped in a savepoint so a single failure doesn't roll back the rest of the batch.
 
 ---
@@ -543,7 +640,9 @@ python -m server.main            # host/port via HOST/PORT env (default 0.0.0.0:
 |---|---|---|---|
 | `POST` | `/chat` | `X-API-Key` required | Send a message, get a response (+ source list) |
 | `POST` | `/reset` | `X-API-Key` required | Clear conversation history for a user |
-| `GET` | `/health` | Public | Health check (returns `{status, model}`) |
+| `GET` | `/health` | Public | Health check — pings the DB; returns `{status, database, model}` |
+
+`/health` runs `SELECT 1` against the pool: healthy → **200** `{"status":"ok","database":"ok","model":…}`; DB/pool down → **503** `{"status":"degraded","database":"unreachable",…}`. Before the pool/chain finish initializing, `/chat` and `/reset` return **503** `"Service starting, retry shortly"`. There is **no** `/metrics` HTTP endpoint — metrics surface only in the periodic heartbeat log line.
 
 ### Request / Response shape
 
@@ -592,10 +691,11 @@ User query
 │  Guard 2: Query classification (gpt-5-nano, ~70tok)   │
 │  Categories: normal, conversational, concerns,        │
 │              polling_location, voter_lookup,          │
-│              voter_update, candidates, partisan       │
+│              voter_update, candidates, partisan,      │
+│              out_of_scope                             │
 │  → polling_location / voter_lookup / voter_update /   │
 │    candidates  → return hardcoded URL, exit           │
-│  → partisan                  → return fallback, exit  │
+│  → partisan / out_of_scope   → return fallback, exit  │
 │  → normal / conversational / concerns → continue      │
 │  (Survey system tag "__User concerns:__" short-       │
 │   circuits LLM, jumps straight to 'concerns')         │
@@ -624,42 +724,51 @@ User query
 │  If flagged: re-invoke the chain with a stricter      │
 │  nonpartisan retry prompt appended to the user msg.   │
 │  Up to MAX_PARTISAN_RETRIES (2) retries; checks each  │
-│  retry. Fails open after exhaustion — returns last    │
-│  generated response.                                   │
+│  retry. FAILS CLOSED — if still partisan after        │
+│  retries (or on error) it discards the answer and     │
+│  returns a canned refusal, never the unvetted text.   │
 └───────────────────────┬───────────────────────────────┘
                         ▼
    log_request() + store.add_exchange() + return ChatResponse
 ```
 
 > ℹ️ There is **no output-side PII scrub** in the current code — only input PII is blocked. The partisan check is the only post-generation guard.
+>
+> ⚠️ **The three guardrails fail *closed*, not open.** `detect_pii` (on analyzer error), `classify_query` (on classifier error → canned error reply), and `check_partisan_response` (still-partisan after retries → `partisan_persist`; on exception → `partisan`) all suppress the response rather than let an unvetted answer through. This is the opposite of a fail-open design and is intentional for an elections chatbot.
 
 ### Server Modules
 
-**`main.py`** — FastAPI app with async lifespan startup (logging, `ConnectionPool`, `SessionStore`, `build_chain()`). Hosts `_RateLimiter`, the `X-API-Key` dependency, CORS middleware, and a background task that calls `store.cleanup_expired()` every 5 minutes. On RAG failure → HTTP 502. Pool is closed with a 30 s grace on shutdown.
+**`main.py`** — FastAPI app with async lifespan startup: `setup_logging()`, an **`AsyncConnectionPool`** (`min_size=4, max_size=25, timeout=10`, opened with `wait=True`; if the DB is unreachable at startup the server refuses to start), `SessionStore`, and `build_chain(pool)`. Hosts `_RateLimiter` (which also evicts stale per-user windows each call), the `X-API-Key` dependency, CORS middleware, and a background `_periodic_maintenance()` task (every `HEARTBEAT_INTERVAL` = 300 s) that runs `store.cleanup_expired()` **and** emits a `HEARTBEAT` log line (requests / errors / blocked / cost + pool gauge). The RAG call is wrapped in `asyncio.wait_for(..., RAG_CHAIN_TIMEOUT=60)`; timeout or chain error → HTTP 502. Each `/chat` gets an 8-char request id (`new_request_id()`) that tags every log line for that request. Pool is closed with a 30 s grace on shutdown; the process pins `workers=1`.
 
-**`rag_chain.py`** — Built with `langchain_core` runnables. A custom `PgVectorRetriever(BaseRetriever)` queries PostgreSQL via pgvector directly (`embedding <=> %s::vector`) and emits debug logs per retrieved chunk. Four prompts:
+**`rag_chain.py`** — Built with `langchain_core` runnables. `full_pipeline` is a `RunnableLambda` that branches on `query_category`: `conversational` → answer from history, no retrieval; `concerns` → Rumor Control prompt; else standard QA. A custom `PgVectorRetriever(BaseRetriever)` queries PostgreSQL via pgvector directly (`embedding <=> %s::vector`, with `SET LOCAL statement_timeout = '30s'`). Four prompts:
   - `_CONTEXTUALIZE_PROMPT` — rephrases follow-ups into standalone questions
   - `_QA_PROMPT` — main answer prompt with `[Source N]` citation contract
   - `_CONVERSATIONAL_PROMPT` — answers from chat history only, no retrieval
   - `_CONCERNS_PROMPT` — Rumor Control prompt; always starts the response by linking https://elections.maryland.gov/press_room/rumor_control.html
 
-After answer generation, `_replace_source_refs` substitutes inline `[Source N]` markers with markdown links built from the retrieved source list, so the front-end gets clickable citations.
+After answer generation, `_replace_source_refs` substitutes inline `[Source N]` markers with markdown links built from the retrieved source list (multi-source chunks render their extra URLs as numbered links).
 
-`PgVectorRetriever._aget_relevant_documents` is currently a TODO — `BaseRetriever.ainvoke` runs the sync method in a threadpool, which limits per-worker throughput.
+Retrieval is **fully async**: `_aget_relevant_documents` uses `aembed_query` + an async pool connection. The sync `_get_relevant_documents` raises `NotImplementedError` (async-only), so retrieval no longer runs in the anyio threadpool.
 
-**`middleware.py`** — All guardrail logic. Shared `QueryContext` dataclass travels through the request.
+**`middleware.py`** — All guardrail logic. Shared `QueryContext` dataclass travels through the request. All guardrail LLM calls are wrapped in `asyncio.wait_for` (`GUARDRAIL_LLM_TIMEOUT` = 30 s; partisan retry `PARTISAN_RETRY_TIMEOUT` = 60 s).
 
 | Function | Purpose | Failure mode |
 |---|---|---|
-| `detect_pii(query, ctx)` | Presidio scan for `US_SSN`, `CREDIT_CARD`, `EMAIL_ADDRESS`, `IP_ADDRESS`, `PHONE_NUMBER`, `US_PASSPORT`, `US_DRIVER_LICENSE` at score ≥ 0.5 | Hard block — canned PII fallback |
-| `classify_query(query, ctx)` | LLM (`LLM_MODEL`, structured `ClassificationResult`) → 8 categories. Short-circuits `__User concerns:__` to skip the LLM | Fail open — allows query through |
-| `check_partisan_response(...)` | Structured `PartisanCheckResult`; on `is_partisan=True`, re-invokes chain with stricter retry prompt up to `MAX_PARTISAN_RETRIES` (2) | Fail open — returns last response |
+| `detect_pii(query, ctx)` | Presidio scan for `US_SSN`, `CREDIT_CARD`, `EMAIL_ADDRESS`, `IP_ADDRESS`, `PHONE_NUMBER`, `US_PASSPORT`, `US_DRIVER_LICENSE` at score ≥ 0.5 | **Fail closed** — blocks (canned PII fallback) on any analyzer error |
+| `classify_query(query, ctx)` | LLM (`LLM_MODEL`, structured `ClassificationResult`, `reasoning_effort="medium"`) → 9 categories. Short-circuits `__User concerns:__` to skip the LLM | **Fail closed** — returns canned `error` reply on classifier failure |
+| `check_partisan_response(...)` | Structured `PartisanCheckResult` (`reasoning_effort="minimal"`); on `is_partisan=True`, re-invokes chain with stricter retry prompt up to `MAX_PARTISAN_RETRIES` (2) | **Fail closed** — still-partisan → `partisan_persist` refusal; exception → `partisan` refusal |
 
-Categories `normal` / `conversational` / `concerns` reach the RAG chain. The four "hardcoded URL" categories (`polling_location`, `voter_lookup`, `voter_update`, `candidates`) return a static URL from `FALLBACK_RESPONSES` without ever calling the LLM. `partisan` returns a refusal message.
+Categories `normal` / `conversational` / `concerns` reach the RAG chain. The four "hardcoded URL" categories (`polling_location`, `voter_lookup`, `voter_update`, `candidates`) return a static URL from `FALLBACK_RESPONSES` without ever calling the LLM. `partisan` returns a refusal; `out_of_scope` returns a redirect toward what the assistant can help with (registration, polling locations, ballot procedures, candidates) rather than a flat decline. `FALLBACK_RESPONSES` also carries `pii`, `partisan_persist`, and `error` messages.
 
-**`rag_logger.py`** — LangChain `BaseCallbackHandler` that captures LLM prompts/responses (toggleable via `LOG_PROMPTS`, `LOG_RESPONSES`, `LOG_QUERIES` module flags — currently all `True`; set to `False` before deploying so PII is not written to logs), token usage, estimated cost per request from a built-in `_COST_TABLE`, and retriever start/end timing. `log_request()` writes one summary line per `/chat` exchange. The lock around the run-tracking dicts is required because the retriever fires callbacks from worker threads.
+**`rag_logger.py`** — LangChain `BaseCallbackHandler` that captures LLM prompts/responses (toggled by env vars `LOG_PROMPTS`, `LOG_RESPONSES`, `LOG_QUERIES` — **all default `False`** / production-safe; set to `1`/`true` to opt in for debugging), token usage, estimated cost from a built-in `_COST_TABLE`, and retriever timing. Per-call token/cost and retriever lines log at `DEBUG` (suppressed at default `INFO`); `on_llm_end` also feeds `metrics.METRICS.record_llm(...)`. `log_request(user_id, query, response, elapsed, outcome)` writes one summary line per `/chat` exchange (query text logged only when `LOG_QUERIES`). The lock around the run-tracking dicts is required because callbacks fire from worker threads.
+
+**`logging_setup.py`** — Central logging config (imported by `main.py`). `setup_logging()` (idempotent) installs a `RotatingFileHandler` (`SERVER_LOG_FILE`, default `logs/server.log`, 10 MB × 5 backups) + console handler at `LOG_LEVEL` (default `INFO`), silences noisy third-party loggers (uvicorn.access, httpx, openai, urllib3), and injects a per-request id into every record. `new_request_id()` mints the id and binds it to a `contextvars.ContextVar`.
+
+**`metrics.py`** — Thread-safe in-process counters (`METRICS` singleton). `record_request(outcome)` and `record_llm(tokens, cost)` accumulate both cumulative and rolling totals; `drain_rolling()` snapshots-and-resets the rolling window for the heartbeat line. No HTTP surface, no new dependencies.
 
 **`session.py`** — Thread-safe in-memory per-`user_id` conversation store with TTL expiration (`SESSION_TTL_MINUTES`) and max-turn cap (`MAX_HISTORY_TURNS`). Designed for pilot-scale (tens of concurrent users) — swap to Redis or a database for production scale.
+
+**`eval_guardrails.py`** — Offline eval (not part of the server runtime). Runs the classifier and partisan checker at both `reasoning_effort="minimal"` and `"medium"` over labeled fixtures and reports whether `minimal` disagrees with the expected labels or with `medium`. Makes ~26 real OpenAI calls; exit code = number of `minimal` mislabels. `python -m server.eval_guardrails`.
 
 ---
 
@@ -758,7 +867,23 @@ python -m maryland_rag.scripts.reclassify --dry-run   # preview transitions
 python -m maryland_rag.scripts.reclassify              # apply
 ```
 
-### 10.4 Stress Test (`scripts/stress_test.py`)
+### 10.4 Verify Chunks (`scripts/verify_chunks.py`)
+
+Post-ingest verification gate. Exits non-zero on any failure so it can gate a pipeline run. Three checks:
+1. **Coverage** — every `crawl_status='crawled'` page (except `chunking_strategy='skip'`) must have at least one chunk in `chunks.jsonl` (counting both `source_url` and dedup `source_urls`).
+2. **Junk** — scans `chunks.jsonl` + `box_chunks.jsonl` for empty/whitespace text, literal `None:` prefixes, chunks over the char cap (`MAX_CHUNK_CHARS`), over the word cap (warn-only), and non-English text (`langfilter`).
+3. **DB parity** — if `DATABASE_URL` is set and Postgres is reachable, compares the JSONL `chunk_id` set against the pgvector `chunks` table both ways (missing / orphaned). **Skipped** (not failed) when the DB is unavailable.
+
+```bash
+python -m maryland_rag.scripts.verify_chunks
+python -m maryland_rag.scripts.verify_chunks --chunks data/chunks.jsonl --box-chunks data/box_chunks.jsonl
+```
+
+### 10.5 Audit (`scripts/audit.py`)
+
+Backs the `python -m maryland_rag audit` command — see [Section 11](#audit-the-database). Prints the classification/strategy breakdown, exclusion reasons, depth distribution, failed pages, duplicate content, top documents by inbound links, an exclusion-leak check, and the largest `semantic_with_overlap` candidates.
+
+### 10.6 Stress Test (`scripts/stress_test.py`)
 
 See [Section 9.4](#94-stress-testing).
 
@@ -788,38 +913,47 @@ python -m maryland_rag.scripts.apply_keep_filter --apply
 # 6. Chunk the web pages
 python -m maryland_rag pass2
 
-# 7. Chunk Box documents (skips any file missing a URL in url_manifest.json)
+# 7. (Optional) auto-download curated Box documents into needtochunk/
+#    Requires BOX_CLIENT_ID / BOX_CLIENT_SECRET in .env + playwright (Section 6.5)
+python -m box_ingest.automate
+
+# 8. Chunk Box documents (skips any file missing a URL in url_manifest.json)
 python -m box_ingest.ingest
 
-# 8. Embed and upload — web chunks
+# 9. Verify chunk coverage / junk / DB parity before embedding
+python -m maryland_rag.scripts.verify_chunks
+
+# 10. Embed and upload — web chunks
 python -m maryland_rag pass3 --chunks data/chunks.jsonl
 
-# 9. Embed and upload — Box chunks (same table, different input)
+# 11. Embed and upload — Box chunks (same table, different input)
 python -m maryland_rag pass3 --chunks data/box_chunks.jsonl
 
-# 10. Verify vectors are in PostgreSQL:
+# 12. Verify vectors are in PostgreSQL:
 #     psql $DATABASE_URL -c "SELECT count(*) FROM chunks;"
 
-# 11. Start the server
+# 13. Start the server
 uvicorn server.main:app --host 0.0.0.0 --port 8000
 ```
 
 ### One-shot: `python -m maryland_rag all`
 
-`all` runs the full pipeline end-to-end and is safe to re-run:
+`all` runs the full pipeline end-to-end and is safe to re-run. The operating model is **drop-and-reingest**: the operator rebuilds the pgvector table from `chunks.jsonl` each run, and Pass 2 truncates that file — so `all` must always emit the full corpus.
 
 ```bash
 python -m maryland_rag all
 ```
 
 Internally it:
-1. Captures `is_first_run()` **before** snapshotting hashes (the order matters — once `snapshot_hashes_for_recrawl()` runs, `previous_content_hash` is populated and the question becomes meaningless).
-2. Snapshots current `content_hash → previous_content_hash`.
-3. Runs Pass 1 with `resume=False` (full re-discovery).
-4. Runs Pass 2 with `only_changed=not first_run` — first ever run chunks everything; subsequent runs re-chunk only pages whose hash actually changed.
-5. Runs Box ingest.
-6. Runs Pass 3 on web chunks with `resume=False` (so changed content always upserts).
+1. Runs Pass 1 with `resume=False` (full re-discovery).
+2. Runs Pass 2 with `only_changed=False` — **always the full corpus.** An incremental pass here would silently drop every unchanged page from the rebuilt vector store (`manifest.db` persists, so change detection would find nothing changed). Incremental chunking stays available via the standalone `pass2 --changed`.
+3. **Coverage gate** (`_report_chunk_coverage`): prints per-page chunk coverage and **aborts with a non-zero exit if more than 20% of expected pages produced zero chunks**, so pgvector is never rebuilt from a badly incomplete `chunks.jsonl`.
+4. Snapshots `content_hash → previous_content_hash` **after** a successful full chunk pass (so `previous_content_hash` means "reflected in `chunks.jsonl`", the baseline `pass2 --changed` diffs against).
+5. Runs Box ingest (`box_ingest.ingest`) — Step 2 only; it does **not** auto-download from Box (run `box_ingest.automate` separately for that, Section 6.5).
+6. Runs Pass 3 on web chunks with `resume=False`.
 7. Runs Pass 3 on Box chunks (only if any were produced).
+
+> `all` accepts `--output` (default `data/chunks.jsonl`) to relocate the web-chunk file.
 
 ### Audit the database
 
@@ -878,7 +1012,7 @@ For a richer breakdown use `python -m maryland_rag audit` — it always reflects
 | `content_hash` | TEXT | SHA256 of extracted text |
 | `previous_content_hash` | TEXT | Snapshotted hash from prior run (powers `--changed`) |
 | `file_size_bytes` | INTEGER | File size (documents) |
-| `needs_ocr` | INTEGER | 1 if PDF has no text layer in first 4KB |
+| `needs_ocr` | INTEGER | Legacy/deprecated — now always `0`; OCR is decided in Pass 2, not at crawl time |
 | `extracted_snippet` | TEXT | First ~500 chars of content |
 | `links_out_count` | INTEGER | Outbound link count |
 | `discovered_at` | TIMESTAMP | When URL was first found |
@@ -962,12 +1096,14 @@ Embedding a whole results table as one vector makes every row equally retrievabl
 ### PDF extraction ([pass2/strategies/pdf.py](maryland_rag/pass2/strategies/pdf.py))
 **Used for:** all `.pdf` files
 
-Three-tier extraction:
+Three-tier extraction, **digital-first**:
 1. **pdfplumber** — primary, handles clean digital PDFs well; extracts tables too
 2. **PyMuPDF (fitz)** — fallback for complex layouts or mixed-column formats
-3. **OCR via pytesseract** — for `needs_ocr=1` PDFs flagged in Pass 1; PyMuPDF renders pages at 300 dpi, Tesseract reads the text
+3. **OCR via pytesseract** — last resort, triggered **only when both digital extractors return effectively empty text** (fewer than `MIN_DIGITAL_TEXT_CHARS` = 20 word-characters) and `ocr_fallback=True`. PyMuPDF renders each page at 300 dpi (`get_pixmap(dpi=300)`, no image preprocessing) and Tesseract reads it.
 
-After extraction, `_detect_pdf_structure` classifies the dominant shape (`table_heavy` → tables become row chunks; `faq` → semantic chunk (no HTML to parse); `short` → `ingest_as_single`; default `prose` → `semantic_chunk`).
+This is the "OCR rework": the Pass 1 `needs_ocr` manifest flag is **deprecated and ignored** — every PDF is tried digitally first, and OCR is decided from the real extraction result rather than a crawl-time byte-probe. If OCR dependencies are missing, `structure_type='ocr_failed'` and whatever digital scraps exist are kept rather than dropped.
+
+After extraction, `_detect_pdf_structure` classifies the dominant shape (`table_heavy` → tables become row chunks, plus deduped narrative prose; `faq` → semantic chunk, since there's no HTML to parse into Q&A; `short` → `ingest_as_single`; default `prose` → `semantic_chunk`). Every branch's output passes through `enforce_chunk_caps`.
 
 ---
 
@@ -987,10 +1123,11 @@ Heading chain is preserved in each chunk so a retrieved chunk always carries its
 ### XLS / XLSX extraction ([pass2/strategies/xls_strategy.py](maryland_rag/pass2/strategies/xls_strategy.py))
 **Used for:** `.xls`, `.xlsx` spreadsheets
 
-- `.xlsx` via `openpyxl` (read-only, data-only); `.xls` via `xlrd`
+- `.xlsx` / `.xlsm` via `openpyxl` (read-only, data-only); `.xls` via `xlrd`
 - Each sheet processed independently
-- First row is treated as headers if all the first two cells are non-empty strings
+- First row is treated as headers if the first two cells are non-empty strings
 - Each non-empty data row → `"[SheetName] Header: Value | Header: Value | ..."` (or pipe-joined values if no headers)
+- **Guardrail:** a workbook producing more than `MAX_XLS_ROW_CHUNKS` (200) row-chunks is treated as bulk tabular data and **skipped entirely** (logged loudly) rather than flooding the vector store with thousands of near-identical rows.
 
 Same rationale as `table_rows`: per-row chunks make spreadsheet data independently retrievable.
 
@@ -1005,16 +1142,30 @@ Same rationale as `table_rows`: per-row chunks make spreadsheet data independent
 | `SEED_URLS` | curated list | Seed URLs for the BFS crawl (State BoE + MoCo) |
 | `DOMAINS` | `elections.maryland.gov`, `mcg.montgomerycountymd.gov` | Domains considered "internal" for link queuing |
 | `MAX_DEPTH` | `6` | Max BFS depth |
-| `RATE_LIMIT_SECONDS` | `0.75` | Delay between crawl requests |
+| `MAX_RETRIES` | `3` | Retries for transient page fetches and the robots.txt fetch |
+| `RATE_LIMIT_SECONDS` | `0.75` | Delay between crawl requests (also base for retry backoff) |
 | `REQUEST_TIMEOUT` | `15` | Per-request HTTP timeout |
 | `REQUESTS_PER_MINUTE_WARN` | `80` | Log a warning if exceeded in last 60 s |
-| `PDF_PROBE_BYTES` | `4096` | Bytes checked for PDF text markers |
 | `TRAFILATURA_MIN_WORDS` | `50` | Min words for trafilatura to be trusted (else BS4 fallback) |
 | `DOCUMENT_EXTENSIONS` | `.pdf .docx .doc .xls .xlsx .csv` | Treated as documents, not HTML |
 | `SKIP_DOMAINS` | Facebook, Twitter, YouTube, etc. | External domains never queued |
-| `RESPECT_ROBOTS_TXT` | `True` | Honor robots.txt |
+| `RESPECT_ROBOTS_TXT` | `True` | Honor robots.txt (per-domain, RFC 9309) |
 | `SAVE_RAW_HTML` | `False` | Save raw HTML to `data/raw/` (debug) |
 | `LOG_DIR` / `LOG_FILE` | `logs/`, `logs/crawl.log` | Where the crawler's file handler writes |
+| `PDF_PROBE_BYTES` | `4096` | **Dead** — the crawl-time PDF byte-probe was removed; OCR is decided in Pass 2 |
+
+`TRANSIENT_HTTP_STATUSES` (`{408, 429}`) and `EXCLUDED_HTTP_STATUSES` (`{404, 410, 403, 500, 502, 503}`) live in `pass1/exclusions.py`.
+
+### Pass 2 caps & filters
+
+| Constant | Location | Default | Description |
+|---|---|---|---|
+| `MAX_CHUNK_WORDS` | `pass2/strategies/semantic.py` | `500` | Per-chunk word cap (enforced across all strategies) |
+| `MAX_CHUNK_CHARS` | `pass2/strategies/semantic.py` | `20000` | Per-chunk char cap (hard embedding-safety limit) |
+| `TARGET_CHUNK_WORDS` | `semantic.py` / `simple_split.py` | `300` / `250` | Target chunk size |
+| `OVERLAP_RATIO` | `pass2/strategies/semantic.py` | `0.20` | Overlap between consecutive semantic chunks |
+| `MAX_NON_LATIN_RATIO` | `pass2/langfilter.py` | `0.10` | Drop a chunk above this non-Latin-letter ratio |
+| `MAX_XLS_ROW_CHUNKS` | `pass2/strategies/xls_strategy.py` | `200` | Skip a spreadsheet producing more rows than this |
 
 ### Pass 3 (`maryland_rag/pass3/embed.py`)
 
@@ -1024,9 +1175,11 @@ Same rationale as `table_rows`: per-row chunks make spreadsheet data independent
 | `EMBED_DIM` | `1536` | Vector dimension (must match model) |
 | `EMBED_BATCH_SIZE` | `100` | Texts per OpenAI call |
 | `INSERT_BATCH_SIZE` | `100` | Rows per commit (each wrapped in a savepoint) |
-| `RETRY_DELAY` | `5` | Seconds between embedding retries (3 attempts) |
+| `RETRY_DELAY` | `5` | Base seconds for embedding retry backoff — linear + jitter, 3 attempts |
 
-### Server (`server/config.py`) — env vars
+### Server — env vars
+
+Validated in `server/config.py` (the first three raise at import time if missing):
 
 | Variable | Default | Description |
 |---|---|---|
@@ -1039,20 +1192,39 @@ Same rationale as `table_rows`: per-row chunks make spreadsheet data independent
 | `SESSION_TTL_MINUTES` | `30` | Session expiration |
 | `MAX_HISTORY_TURNS` | `20` | Max conversation turns kept per user |
 | `RATE_LIMIT_PER_MINUTE` | `20` | Per-`user_id` sliding-window request limit |
-| `CORS_ORIGINS` | `https://umdsurvey.umd.edu` | Comma-separated allowed origins |
+
+Read elsewhere at runtime (not in `config.py`):
+
+| Variable | Default | Read in | Description |
+|---|---|---|---|
+| `CORS_ORIGINS` | `https://umdsurvey.umd.edu` | `main.py` | Comma-separated allowed origins |
+| `HOST` / `PORT` | `0.0.0.0` / `8000` | `main.py` | Bind address when run via `python -m server.main` |
+| `LOG_LEVEL` | `INFO` | `logging_setup.py` | Root log level |
+| `SERVER_LOG_FILE` | `logs/server.log` | `logging_setup.py` | Rotating server log path |
+| `LOG_PROMPTS` / `LOG_RESPONSES` / `LOG_QUERIES` | `False` | `rag_logger.py` | Opt-in verbose logging of prompts / responses / query text (leave off in prod) |
+
+### Box automation — env vars (only for `box_ingest.automate`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `BOX_CLIENT_ID` | **required for automate** | Box developer app client id |
+| `BOX_CLIENT_SECRET` | **required for automate** | Box developer app client secret |
+
+Tokens are cached in `.box_token` (repo root, mode `0600`) after the first browser auth.
 
 ---
 
 ## 15. Security Warning
 
-**The `.env` file contains API keys for paid services and the server's auth token.**
+**The `.env` file contains API keys for paid services and the server's auth token; `.box_token` caches Box OAuth tokens.**
 
-- **Never commit `.env` to Git.** Verify `.gitignore` excludes it before pushing.
+- **Never commit `.env` or `.box_token` to Git.** Verify `.gitignore` excludes both before pushing.
 - Rotate immediately if exposed:
   - OpenAI: https://platform.openai.com/api-keys
   - PostgreSQL: rotate the database password and update `DATABASE_URL`
   - `VIOLETS_API_KEY`: regenerate (`python -c 'import secrets; print(secrets.token_urlsafe(48))'`) and redeploy
-- Prompt/response logging in `server/rag_logger.py` (`LOG_PROMPTS`, `LOG_RESPONSES`, `LOG_QUERIES`) defaults to `True`. Set these to `False` before deploying to production so user PII is not written to logs.
+  - Box: rotate the developer-app secret in the Box console and delete `.box_token`
+- Prompt/response logging in `server/rag_logger.py` (`LOG_PROMPTS`, `LOG_RESPONSES`, `LOG_QUERIES`) now **defaults to `False`** (production-safe) — it is opt-in via env var. Leave these unset in production so user PII is not written to logs.
 
 ---
 
@@ -1089,7 +1261,13 @@ A single `user_id` exceeded `RATE_LIMIT_PER_MINUTE`. Either back off or raise th
 Your origin isn't in `CORS_ORIGINS`. Set it explicitly at startup (comma-separated for multiple).
 
 **Server won't start**
-Check that `OPENAI_API_KEY`, `DATABASE_URL`, and `VIOLETS_API_KEY` are set in `.env` — `server/config.py` raises at import time if any are missing. Also verify the spaCy model is installed (`python -m spacy download en_core_web_lg`) — Presidio's `AnalyzerEngine` loads it at import time.
+Check that `OPENAI_API_KEY`, `DATABASE_URL`, and `VIOLETS_API_KEY` are set in `.env` — `server/config.py` raises at import time if any are missing. The lifespan also opens the Postgres pool eagerly and **refuses to start if the database is unreachable** — confirm `DATABASE_URL` points at a running pgvector instance. Also verify the spaCy model is installed (`python -m spacy download en_core_web_lg`) — Presidio's `AnalyzerEngine` loads it at import time.
+
+**`/health` returns 503 / `/chat` returns 503 "Service starting"**
+`/health` pings the DB and returns 503 when the pool can't reach Postgres — check the database. A 503 `"Service starting, retry shortly"` on `/chat` or `/reset` means the pool/chain haven't finished initializing yet; retry after startup completes.
+
+**Box automate: `EnvironmentError` / browser auth loop**
+`box_ingest.automate` needs `BOX_CLIENT_ID` and `BOX_CLIENT_SECRET` in `.env`. First run opens a browser for OAuth and captures the redirect on `http://localhost:8080` — allow that port. If refresh keeps failing, delete `.box_token` to force a fresh browser login. Missing Playwright → `pip install -r box_ingest/requirements.txt && playwright install chromium`.
 
 ---
 
@@ -1105,7 +1283,12 @@ Project-specific terms and non-obvious library names only.
 | **chunks (table)** | PostgreSQL table storing vectors and metadata. `--resume` queries existing `chunk_id`s to skip them. |
 | **content_hash** | SHA256 of a page's extracted text. Two pages with the same hash have identical content and are deduplicated in Pass 2. |
 | **previous_content_hash** | Snapshot of `content_hash` taken before a re-crawl; powers `pass2 --changed` and the `all` command's first-run logic. |
-| **needs_ocr** | Flag on PDFs where no text layer was detected in the first 4KB. |
+| **needs_ocr** | Legacy manifest flag. **Deprecated** — Pass 1 no longer probes PDFs and always stores `False`; Pass 2 decides OCR from a real digital-extraction attempt instead. |
+| **chunk_id** | Stable 32-char id derived from a chunk's *content* (`sha256(normalized_text + section_hierarchy + chunk_index)[:32]`), not from its source URL — so re-ingests don't orphan pgvector rows. |
+| **langfilter** | `pass2/langfilter.py` — drops chunks whose non-Latin-letter ratio exceeds `MAX_NON_LATIN_RATIO` (0.10). Content-side companion to the Pass-1 URL exclusion of translated documents. |
+| **heartbeat** | Periodic server log line (every 300 s) emitted by `_periodic_maintenance`, summarizing rolling requests / errors / blocked / cost and the pool gauge (fed by `metrics.py`). |
+| **Box automate** | `box_ingest.automate` — Step 1 of the Box pipeline: OAuth into Box, scrape the Hub (Playwright), download `include` files into `needtochunk/`, and update `url_manifest.json`. Separate from `box_ingest.ingest` (Step 2, chunking). |
+| **verify_chunks** | Post-ingest gate (`scripts/verify_chunks.py`) checking per-page coverage, junk heuristics, and JSONL-vs-pgvector parity; exits non-zero on failure. |
 | **allowlist** | Two-layer URL gate in `pass1/exclusions.py`: prefix list + exact list. Crawler will not enqueue anything failing the allowlist. |
 | **keep filter** | Curated 2025–2026 keep list applied via `apply_keep_filter` — narrows the crawl down to current-cycle materials by marking everything else `excluded`. |
 | **trafilatura** | Library that extracts clean article text from HTML, removing nav, footers, boilerplate. Primary HTML extractor in Pass 1. |
@@ -1122,4 +1305,4 @@ Project-specific terms and non-obvious library names only.
 | **QueryContext** | Dataclass in `middleware.py` that travels through guardrails: classification result, PII detection flags, query category. |
 | **RAGCallbackHandler** | LangChain callback handler in `rag_logger.py` that captures token usage, estimates cost, and logs retriever performance per request. |
 | **Structured output** | LangChain/OpenAI feature used by the guardrail LLMs — returns Pydantic models (`ClassificationResult`, `PartisanCheckResult`) instead of free-form text. |
-| **Fail open** | Guardrail error-handling strategy: if the classifier or partisan checker LLM call fails, the query is allowed through rather than blocked. Prevents guardrail outages from taking down the chatbot. |
+| **Fail closed** | Guardrail error-handling strategy used by all three server guardrails: if PII detection, classification, or the partisan check errors or can't clear the response, the answer is **suppressed** (canned refusal / error message) rather than passed through. Chosen deliberately for an elections chatbot, where shipping an unvetted answer is worse than a graceful refusal. |

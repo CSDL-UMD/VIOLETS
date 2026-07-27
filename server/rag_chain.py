@@ -53,9 +53,22 @@ _QA_PROMPT = ChatPromptTemplate.from_messages([
      "Even if the context only partially covers the question, share what you know — "
      "do not refuse to answer just because the context is incomplete. "
      "Only say you don't have information if the context contains nothing relevant whatsoever.\n\n"
-     "Each context chunk is labeled [Source N] with a URL. When you use "
-     "information from a source, cite it inline using [Source N] notation. "
-     "Always cite your sources so users can verify the information.\n\n"
+     "Each context chunk is labeled [Source N] with a title and URL. Cite your "
+     "sources by naming them IN WORDS, not only with the tag:\n"
+     "1. Always attribute information in natural language by naming the "
+     "publishing organization or website — e.g. \"According to the Maryland "
+     "State Board of Elections...\" or \"The Maryland State Board of Elections "
+     "notes that...\". Infer the name from the source's title and URL. Do this "
+     "even when your answer is a list: name the source in the lead-in sentence "
+     "(e.g. \"The Maryland State Board of Elections lists the following...\"). "
+     "The [Source N] tag alone is NOT sufficient — it may be hidden from the "
+     "user, so the credit must survive in your prose.\n"
+     "2. Immediately after each attributed statement, also add its [Source N] "
+     "tag (the system uses these to resolve links and may hide them).\n"
+     "3. Never write raw URLs or the source title in parentheses yourself — "
+     "use only the [Source N] tag for the machine-readable citation.\n"
+     "4. Do NOT append a separate \"Sources:\" or references list at the end. "
+     "Cite inline only.\n\n"
      "Be concise, accurate, and conversational.\n\n"
      "Context:\n{context}"),
     MessagesPlaceholder("chat_history"),
@@ -94,6 +107,13 @@ _CONCERNS_PROMPT = ChatPromptTemplate.from_messages([
      "give additional factual information if relevant. Be empathetic, calm, "
      "and factual. Do not dismiss the user's concern — acknowledge it and "
      "redirect to official sources.\n\n"
+     "When you use information from a source, attribute it in natural language "
+     "within your sentence by naming the publishing organization or website — "
+     "for example, \"According to the Maryland State Board of Elections...\". "
+     "Infer the name from the source's title and URL. Immediately after the "
+     "attributed statement, also add its [Source N] tag so the citation can be "
+     "resolved (these tags are handled by the system and may be hidden from "
+     "the user).\n\n"
      "Context:\n{context}"),
     MessagesPlaceholder("chat_history"),
     ("human", "{input}"),
@@ -197,28 +217,96 @@ def _format_docs(docs: list[Document]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
+# Matches a user asking for the underlying links/sources/citations. When this
+# fires we render the [Source N] markers as markdown links and return the
+# `sources` array; otherwise the markers are stripped and only the natural-
+# language attribution the model wrote in prose is shown.
+_SOURCE_LINK_REQUEST_RE = re.compile(
+    r"\b(link|links|url|urls|source|sources|cite|cited|citation|citations|"
+    r"reference|references|hyperlink|hyperlinks)\b",
+    re.IGNORECASE,
+)
+
+
+def _wants_source_links(query: str) -> bool:
+    """True if the user's query explicitly asks for source links/citations."""
+    return bool(_SOURCE_LINK_REQUEST_RE.search(query or ""))
+
+
+# Matches [Source N] citation markers, including combined comma-separated forms
+# the model sometimes emits ("[Source 2, Source 1, 3]"). Any leading whitespace
+# is captured so stripping a marker doesn't leave a dangling space before
+# punctuation. The inner group holds the digit/comma run for number extraction.
+_SOURCE_MARKER_RE = re.compile(
+    r"\s*\[\s*source[s]?\s+([\d]+(?:\s*,\s*(?:source\s+)?\d+)*)\s*\]",
+    re.IGNORECASE,
+)
+
+# Catch-all for any leftover "[Source ...]" bracket the model invents in a form
+# we can't resolve to a numbered citation — e.g. "[Source: Challenger Manual]".
+# The negative lookahead `(?!\()` skips real markdown links "[text](url)" so we
+# never strip a rendered citation, only stray literal tags. Applied last in both
+# modes so no citation junk ever reaches the user.
+_LEFTOVER_SOURCE_RE = re.compile(r"\s*\[\s*sources?\b[^\]]*\](?!\()", re.IGNORECASE)
+
+
+def _strip_source_refs(answer: str) -> str:
+    """Remove internal [Source N] markers, leaving the prose attribution intact.
+
+    The model is prompted to name the source organization in natural language
+    (e.g. "According to the Maryland State Board of Elections...") AND to tag it
+    with [Source N]. By default we hide the tags so the citation stays embedded
+    in the message rather than surfaced as a link.
+    """
+    # Drop any whitespace immediately before the marker so "text [Source 1]."
+    # collapses cleanly to "text.". Handles single markers and comma-separated
+    # combined forms the model sometimes emits, e.g. "[Source 2, Source 1, 3]".
+    cleaned = _SOURCE_MARKER_RE.sub("", answer)
+    # Sweep any non-numbered leftover tags the model invented.
+    cleaned = _LEFTOVER_SOURCE_RE.sub("", cleaned)
+    # Tidy any doubled spaces left mid-sentence.
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned.strip()
+
+
 def _replace_source_refs(answer: str, sources: list[dict]) -> str:
     """Replace [Source N] markers in the answer with markdown links."""
     source_map = {
         s["source_number"]: s for s in sources
     }
 
-    def _sub(m: re.Match) -> str:
-        num = int(m.group(1))
+    def _links_for(num: int) -> list[str]:
         src = source_map.get(num)
         if not src or src["source_url"] == "unknown":
-            return m.group(0)
+            return []
         urls = src.get("source_urls") or [src["source_url"]]
         title = src.get("title") or src["source_url"]
         if len(urls) == 1:
-            return f"[{title}]({urls[0]})"
+            return [f"[{title}]({urls[0]})"]
         # Multi-source chunk: render the title link to the primary URL plus
         # the remaining URLs as numbered links so all citations are surfaced.
         links = [f"[{title}]({urls[0]})"]
         links += [f"[{j}]({u})" for j, u in enumerate(urls[1:], 2)]
-        return " ".join(links)
+        return links
 
-    return re.sub(r"\[Source\s+(\d+)\]", _sub, answer, flags=re.IGNORECASE)
+    def _sub(m: re.Match) -> str:
+        # The marker may combine several numbers ("[Source 2, Source 1, 3]");
+        # render each to a link, de-duplicating so a repeated source appears once.
+        nums = [int(n) for n in re.findall(r"\d+", m.group(1))]
+        links, seen = [], set()
+        for num in nums:
+            for link in _links_for(num):
+                if link not in seen:
+                    seen.add(link)
+                    links.append(link)
+        # No resolvable link (all "unknown"/missing) — drop the raw marker
+        # rather than leaking "[Source N]" literal text to the user.
+        return " " + " ".join(links) if links else ""
+
+    rendered = _SOURCE_MARKER_RE.sub(_sub, answer)
+    # Strip any leftover unresolved "[Source: ...]" tags the model invented that
+    # aren't numbered markers (and so weren't turned into links above).
+    return _LEFTOVER_SOURCE_RE.sub("", rendered)
 
 
 def build_chain(pool):
@@ -313,7 +401,15 @@ def build_chain(pool):
                 "chat_history": chat_history,
             }, run_config)
 
-        answer = _replace_source_refs(answer, sources)
+        # By default keep citations embedded in the prose (the model names the
+        # source organization inline) and hide the [Source N] markers + link
+        # list. Only when the user explicitly asks for links/sources do we
+        # render the markdown links and surface the sources array.
+        if _wants_source_links(user_input):
+            answer = _replace_source_refs(answer, sources)
+        else:
+            answer = _strip_source_refs(answer)
+            sources = []
 
         return {"answer": answer, "sources": sources}
 

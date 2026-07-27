@@ -57,6 +57,15 @@ CLASSIFY_FIXTURES = [
     ("Who is on the ballot for governor?", "candidates"),
     ("How do I check whether I'm registered to vote?", "voter_lookup"),
     ("I moved — how do I update my registration address?", "voter_update"),
+    # out_of_scope: clearly unrelated to Maryland voting/elections/civics.
+    ("What's a good recipe for banana bread?", "out_of_scope"),
+    ("What's the capital of France?", "out_of_scope"),
+    ("Can you write me a Python script to sort a list?", "out_of_scope"),
+    ("Who won the Super Bowl this year?", "out_of_scope"),
+    # Borderline civic-but-not-Maryland-specific — should stay normal so the
+    # out_of_scope category doesn't over-trigger on legitimate questions.
+    ("How do primary elections work in general?", "normal"),
+    ("What's the difference between a caucus and a primary?", "normal"),
 ]
 
 # (response text, expected is_partisan)
