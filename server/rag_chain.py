@@ -327,7 +327,7 @@ def build_chain(pool):
         model=config.LLM_MODEL,
         openai_api_key=config.OPENAI_API_KEY,
         base_url=config.OPENAI_BASE_URL,
-        reasoning_effort="medium",
+        reasoning_effort=config.RAG_REASONING_EFFORT,
         verbosity="low",
     )
 

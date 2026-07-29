@@ -54,9 +54,9 @@ def run_embed(
         Number of vectors inserted.
 
     Raises:
-        RuntimeError: If any chunk permanently failed to embed, so the
-            pipeline exits non-zero instead of silently shipping a corpus
-            with holes.
+        RuntimeError: If any chunk permanently failed to embed or insert,
+            so the pipeline exits non-zero instead of silently shipping a
+            corpus with holes.
     """
     _setup_logging()
     load_dotenv()
@@ -89,7 +89,8 @@ def run_embed(
 
     total = len(chunks)
     inserted = 0
-    # (chunk_id, reason) for every chunk whose embedding permanently failed.
+    # (chunk_id, reason) for every chunk whose embedding or INSERT
+    # permanently failed — either kind must fail the run.
     failed: list[tuple[str, str]] = []
 
     for batch_start in range(0, total, EMBED_BATCH_SIZE):
@@ -117,8 +118,9 @@ def run_embed(
             }
             rows.append((chunk_id, embedding, text, source_url, title, json.dumps(meta)))
 
-        count = _insert_batch(conn, rows)
+        count, insert_failed = _insert_batch(conn, rows)
         inserted += count
+        failed.extend(insert_failed)
 
         pct = 100.0 * (batch_start + len(batch)) / total
         logger.info(
@@ -134,14 +136,14 @@ def run_embed(
     if failed:
         sample = [chunk_id for chunk_id, _ in failed[:10]]
         logger.error(
-            "Pass 3 FAILED: %d of %d chunk(s) could not be embedded "
+            "Pass 3 FAILED: %d of %d chunk(s) could not be embedded or inserted "
             "(%d inserted). Sample failed chunk_ids: %s",
             len(failed), total, inserted, sample,
         )
         # The 'all' command must exit non-zero — a silent gap in the vector
         # store is worse than a failed run the operator can retry.
         raise RuntimeError(
-            f"Pass 3: {len(failed)} chunk(s) permanently failed to embed "
+            f"Pass 3: {len(failed)} chunk(s) permanently failed to embed or insert "
             f"({inserted} inserted). Sample chunk_ids: {sample}"
         )
 
@@ -164,9 +166,21 @@ def _setup_pgvector(database_url: str):
         )
 
     conn = psycopg.connect(database_url)
+
+    # CREATE EXTENSION must run (and commit) before register_vector: on a
+    # freshly created database — the operator's drop-and-reingest workflow —
+    # the vector type doesn't exist yet and register_vector would fail.
+    try:
+        conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    except psycopg.errors.InsufficientPrivilege:
+        raise RuntimeError(
+            "Cannot create the pgvector extension with this role. Run "
+            "'CREATE EXTENSION vector;' once as a superuser on this database, "
+            "then re-run pass 3."
+        )
+    conn.commit()
     register_vector(conn)
 
-    conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
     conn.execute(f"""
         CREATE TABLE IF NOT EXISTS chunks (
             chunk_id   TEXT PRIMARY KEY,
@@ -193,13 +207,18 @@ def _get_existing_ids(conn) -> set[str]:
 # ---------------------------------------------------------------------------
 
 
-def _insert_batch(conn, rows: list[tuple]) -> int:
+def _insert_batch(conn, rows: list[tuple]) -> tuple[int, list[tuple[str, str]]]:
     """Insert a batch of rows, using ON CONFLICT to upsert.
 
     Each row is wrapped in a savepoint so a single failure doesn't
     roll back previously-committed rows in the same batch.
+
+    Returns (count, failures): failures is (chunk_id, reason) for every row
+    that could not be inserted — the caller adds them to the fatal `failed`
+    list so a run with holes cannot report success.
     """
     count = 0
+    failures: list[tuple[str, str]] = []
     for row in rows:
         try:
             conn.execute("SAVEPOINT insert_row")
@@ -219,11 +238,12 @@ def _insert_batch(conn, rows: list[tuple]) -> int:
             conn.execute("RELEASE SAVEPOINT insert_row")
             count += 1
         except Exception as exc:
-            logger.warning("Insert failed for chunk %s: %s", row[0], exc)
+            logger.error("Insert failed for chunk %s: %s", row[0], exc)
+            failures.append((row[0], f"insert failed: {exc}"))
             conn.execute("ROLLBACK TO SAVEPOINT insert_row")
             continue
     conn.commit()
-    return count
+    return count, failures
 
 
 # ---------------------------------------------------------------------------

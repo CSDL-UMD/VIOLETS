@@ -57,6 +57,12 @@ OPENAI_BASE_URL: str = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com
 # (e.g. gpt-4o-mini), pass temperature explicitly at the call site.
 LLM_MODEL: str = os.environ.get("LLM_MODEL", "gpt-5-nano")
 
+# Reasoning effort for the RAG chain LLM (rephrase/QA/conversational/concerns).
+# "low" cut QA generation from ~26s to ~6s vs "medium" with identical visible
+# answers in a 45-call benchmark (2026-07-29). The classifier and partisan
+# checker in middleware.py pin their own efforts and are not affected.
+RAG_REASONING_EFFORT: str = os.environ.get("RAG_REASONING_EFFORT", "low")
+
 # Retrieval
 RETRIEVER_K: int = int(os.environ.get("RETRIEVER_K", "5"))
 
