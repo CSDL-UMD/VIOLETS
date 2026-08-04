@@ -45,7 +45,7 @@ OPENAI_API_KEY: str = _require_env("OPENAI_API_KEY")
 DATABASE_URL: str = _require_env("DATABASE_URL")
 VIOLETS_API_KEY: str = _require_env("VIOLETS_API_KEY")
 
-OPENAI_BASE_URL: str = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+OPENAI_BASE_URL: str = os.environ.get("OPENAI_BASE_URL", "https://us.api.openai.com/v1")
 
 # ---------------------------------------------------------------------------
 # Configurable settings
