@@ -19,12 +19,16 @@ from bs4 import BeautifulSoup
 from .config import (
     REQUEST_TIMEOUT,
     TRAFILATURA_MIN_WORDS,
+    USER_AGENT,
 )
 from .exclusions import TRANSIENT_HTTP_STATUSES, is_excluded_status
 from .utils import get_content_type
-from ..pass2.cache import put_html
+from ..pass2.cache import deobfuscate_cloudflare_emails, put_html
 
 logger = logging.getLogger(__name__)
+
+# Sent on every outbound request — see USER_AGENT in config.py.
+_HEADERS = {'User-Agent': USER_AGENT}
 
 
 def extract_page(url: str) -> dict | None:
@@ -45,8 +49,16 @@ def extract_page(url: str) -> dict | None:
 def _extract_html(url: str) -> dict | None:
     """Fetch an HTML page, extract text + metadata + links."""
     try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        resp = requests.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True,
+                            headers=_HEADERS)
         http_status = resp.status_code
+        final_url = str(resp.url)  # post-redirect URL; may differ from url
+        # When the Content-Type header omits a charset, requests falls back
+        # to ISO-8859-1 and mojibakes UTF-8 pages — sniff the real encoding
+        # from the bytes instead. (raw_html stays a str, so the cache write
+        # below still produces valid UTF-8 via .encode('utf-8').)
+        if 'charset' not in resp.headers.get('Content-Type', '').lower():
+            resp.encoding = resp.apparent_encoding
         raw_html = resp.text
     except requests.RequestException as exc:
         logger.warning("HTTP error fetching %s: %s", url, exc)
@@ -54,6 +66,8 @@ def _extract_html(url: str) -> dict | None:
 
     if not raw_html:
         return None
+
+    raw_html = deobfuscate_cloudflare_emails(raw_html)
 
     # --- Primary extraction via trafilatura ---
     metadata = trafilatura.extract_metadata(raw_html)
@@ -100,6 +114,7 @@ def _extract_html(url: str) -> dict | None:
 
     return {
         'url': url,
+        'final_url': final_url,
         'title': metadata.title if metadata else _title_from_soup(soup),
         'date': metadata.date if metadata else None,
         'section_hierarchy': breadcrumb,
@@ -188,8 +203,10 @@ def _extract_document_metadata(url: str, ctype: str) -> dict | None:
     For documents, we only collect metadata in Pass 1: file size from HEAD.
     """
     try:
-        resp = requests.head(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        resp = requests.head(url, timeout=REQUEST_TIMEOUT, allow_redirects=True,
+                             headers=_HEADERS)
         http_status = resp.status_code
+        final_url = str(resp.url)  # post-redirect URL; may differ from url
         file_size = int(resp.headers.get('Content-Length', 0) or 0)
     except requests.RequestException as exc:
         logger.warning("HEAD request failed for %s: %s", url, exc)
@@ -211,6 +228,7 @@ def _extract_document_metadata(url: str, ctype: str) -> dict | None:
 
     return {
         'url': url,
+        'final_url': final_url,
         'title': title,
         'section_hierarchy': hierarchy,
         'content_type': ctype,

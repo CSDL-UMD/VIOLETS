@@ -90,7 +90,8 @@ def build_chunk_metadata(
     # can never overwrite the canonical chunk_id / chunk_index / text /
     # word_count values computed above.
     if extra:
-        for key in ("question", "answer", "heading_chain", "table_index", "row_index"):
+        for key in ("question", "answer", "heading_chain", "table_index",
+                    "row_index", "row_start", "row_end"):
             if key in extra:
                 chunk[key] = extra[key]
 
@@ -106,6 +107,7 @@ def build_chunk_metadata_multi_source(
     chunk_index: int,
     chunk_total: int,
     text: str,
+    extra: dict | None = None,
 ) -> dict:
     """
     Build chunk metadata for deduplicated content that exists at multiple URLs.
@@ -128,6 +130,7 @@ def build_chunk_metadata_multi_source(
         chunk_index=chunk_index,
         chunk_total=chunk_total,
         text=text,
+        extra=extra,
     )
     # Preserve the full, deduped source list (order-stable) for citations.
     seen = set()

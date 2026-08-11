@@ -13,6 +13,9 @@ from threading import Lock
 @dataclass
 class Session:
     messages: list = field(default_factory=list)
+    # Sources (URLs + titles) from the most recent retrieval turn, overwritten
+    # each turn so link follow-ups can be answered without inventing URLs.
+    last_sources: list = field(default_factory=list)
     last_active: float = field(default_factory=time.time)
 
 
@@ -45,6 +48,19 @@ class SessionStore:
             if len(session.messages) > max_msgs:
                 session.messages = session.messages[-max_msgs:]
             session.last_active = time.time()
+
+    def set_last_sources(self, user_id: str, sources: list):
+        """Overwrite the cached sources with the latest retrieval turn's."""
+        with self._lock:
+            session = self._sessions.get(user_id)
+            if not session:
+                return
+            session.last_sources = list(sources)
+
+    def get_last_sources(self, user_id: str) -> list:
+        with self._lock:
+            session = self._sessions.get(user_id)
+            return list(session.last_sources) if session else []
 
     def get_history(self, user_id: str) -> list[dict]:
         with self._lock:

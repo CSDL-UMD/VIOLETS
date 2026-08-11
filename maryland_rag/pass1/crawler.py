@@ -36,11 +36,17 @@ from .config import (
     RESPECT_ROBOTS_TXT,
     SAVE_RAW_HTML,
     RAW_HTML_DIR,
+    USER_AGENT,
 )
 from .db import DB
 from .extractor import extract_page
 from .classifier import classify_page
-from .exclusions import should_exclude, is_excluded_status, TRANSIENT_HTTP_STATUSES
+from .exclusions import (
+    should_exclude,
+    matches_exclusion_rules,
+    is_excluded_status,
+    TRANSIENT_HTTP_STATUSES,
+)
 from .utils import normalize_url, is_internal, get_content_type
 
 logger = logging.getLogger(__name__)
@@ -50,9 +56,14 @@ logger = logging.getLogger(__name__)
 # robots.txt
 # ---------------------------------------------------------------------------
 
+class RobotsUnreachableError(RuntimeError):
+    """robots.txt could not be fetched after retries — the crawl must abort
+    rather than run under the RFC 9309 disallow-all assumption."""
+
+
 def _load_robots(domain: str) -> RobotFileParser | None:
-    """Fetch and parse robots.txt using the same HTTP client (and therefore
-    the same User-Agent) as every other crawler request.
+    """Fetch and parse robots.txt with the project User-Agent — the same
+    one sent on every other crawler request.
 
     RobotFileParser.read() is deliberately NOT used: it fetches with
     urllib's default 'Python-urllib' UA, which both target sites' WAFs
@@ -62,9 +73,11 @@ def _load_robots(domain: str) -> RobotFileParser | None:
     Response handling follows RFC 9309 §2.3.1:
       - 2xx: parse the rules.
       - 4xx ("unavailable"): robots.txt imposes no restrictions -> None.
-      - 5xx / network failure after retries ("unreachable"): must assume
-        complete disallow -> disallow-all parser, logged as an error so the
-        run visibly explains why everything is being excluded.
+      - 5xx / network failure after retries ("unreachable"): RFC 9309 says
+        assume complete disallow — but writing 'excluded' rows for a whole
+        domain would sticky-poison the persistent manifest, so for this
+        occasional two-domain crawl we ABORT the run instead (raise) and
+        let the operator retry once the outage clears.
     """
     robots_url = f"https://{domain}/robots.txt"
     last_err = ""
@@ -72,7 +85,8 @@ def _load_robots(domain: str) -> RobotFileParser | None:
         if attempt:
             time.sleep(2 ** attempt)
         try:
-            resp = requests.get(robots_url, timeout=REQUEST_TIMEOUT)
+            resp = requests.get(robots_url, timeout=REQUEST_TIMEOUT,
+                                headers={'User-Agent': USER_AGENT})
         except requests.RequestException as exc:
             last_err = str(exc)
             continue
@@ -90,16 +104,15 @@ def _load_robots(domain: str) -> RobotFileParser | None:
         rp.parse(resp.text.splitlines())
         return rp
 
-    logger.error(
-        "robots.txt UNREACHABLE for %s after %d attempts (%s) — treating the "
-        "entire domain as disallowed per RFC 9309; every %s URL will be "
-        "excluded until the fetch succeeds",
-        domain, MAX_RETRIES, last_err, domain,
+    msg = (
+        f"robots.txt UNREACHABLE for {domain} after {MAX_RETRIES} attempts "
+        f"({last_err}) — RFC 9309 would require disallowing the entire "
+        f"domain, which would write sticky 'excluded' rows across the "
+        f"manifest. Aborting the crawl instead; re-run once {domain} is "
+        f"reachable."
     )
-    rp = RobotFileParser()
-    rp.set_url(robots_url)
-    rp.parse(["User-agent: *", "Disallow: /"])
-    return rp
+    logger.error(msg)
+    raise RobotsUnreachableError(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +181,39 @@ def _fetch_with_retry(url: str, rate_monitor: RateMonitor) -> dict | None:
     return result
 
 
+def apply_retroactive_exclusions(db: DB) -> int:
+    """
+    Re-apply the exclusion RULES to rows that already exist in the manifest.
+
+    Exclusion patterns normally only run at link-discovery time, so a rule
+    added AFTER a URL was crawled leaves its row 'crawled'/'failed' forever
+    — a permanent zero-chunk coverage failure in Pass 2. Flip newly-matching
+    rows to 'excluded' with the rule's reason. Idempotent: already-excluded
+    rows are not re-examined, and a row is only ever updated once per run.
+
+    Deliberately uses matches_exclusion_rules(), NOT should_exclude(): the
+    allowlist gate must not be re-run against existing rows — the manifest
+    holds ~100 deliberately-kept document rows (keep_filter_2026) that sit
+    outside the link-follow allowlist and would be wrongly flipped.
+    """
+    rows = db.conn.execute(
+        "SELECT url FROM pages WHERE crawl_status IN ('crawled', 'failed')"
+    ).fetchall()
+    flipped = 0
+    for row in rows:
+        excluded, reason = matches_exclusion_rules(row['url'])
+        if excluded:
+            logger.info("RETRO-EXCLUDED [%s]: %s", reason, row['url'])
+            db.update_status(row['url'], 'excluded', reason=reason)
+            flipped += 1
+    if flipped:
+        logger.warning(
+            "Retroactive exclusion pass flipped %d existing row(s) to "
+            "'excluded'", flipped,
+        )
+    return flipped
+
+
 def _mark_failure_preserving_crawled(db: DB, url: str, why: str):
     """
     Record a failure without demoting a previously-crawled page.
@@ -205,6 +251,10 @@ def run_crawl(resume: bool = True):
     db = DB()
     db.init_schema()
 
+    # Exclusion rules added since the last crawl must also apply to rows
+    # already in the persistent manifest, not just newly-discovered links.
+    apply_retroactive_exclusions(db)
+
     # --- robots.txt (one parser per domain) ---
     robots_map: dict[str, RobotFileParser | None] = {}
     if RESPECT_ROBOTS_TXT:
@@ -214,10 +264,14 @@ def run_crawl(resume: bool = True):
     # --- Resume or fresh start ---
     pending = db.get_pending() if resume else []
 
+    # Both target sites are served case-insensitively (IIS), and pages link
+    # to the same file under multiple path casings. All dedup sets therefore
+    # hold casefolded URLs; the first-seen casing is what gets crawled and
+    # stored.
     if pending:
         logger.info("Resuming crawl with %d pending URLs", len(pending))
         queue = deque((row['url'], row['parent_url'], row['depth']) for row in pending)
-        visited = db.get_all_visited_urls()
+        visited = {u.lower() for u in db.get_all_visited_urls()}
         run_id = db.start_run(f"multi-domain resumed ({len(SEED_URLS)} seeds)")
     else:
         logger.info("Starting fresh crawl from %d seed URLs", len(SEED_URLS))
@@ -233,13 +287,17 @@ def run_crawl(resume: bool = True):
             db.add_page(url=seed_url, parent_url=None, depth=0)
             queue.append((seed_url, None, 0))
 
+    # Everything ever enqueued (casefolded) — prevents a second case-variant
+    # of a URL from getting its own pending row and queue entry.
+    enqueued = {u.lower() for u, _, _ in queue} | visited
+
     rate_monitor = RateMonitor(REQUESTS_PER_MINUTE_WARN)
     pages_crawled = 0
 
     while queue:
         url, parent_url, depth = queue.popleft()
 
-        if url in visited:
+        if url.lower() in visited:
             continue
 
         # Gate 1: exclusion check (no network call)
@@ -247,13 +305,13 @@ def run_crawl(resume: bool = True):
         if excluded:
             logger.info("EXCLUDED [%s]: %s", reason, url)
             db.update_status(url, 'excluded', reason=reason)
-            visited.add(url)
+            visited.add(url.lower())
             continue
 
         # Gate 2: depth limit
         if depth > MAX_DEPTH:
             db.update_status(url, 'skipped', reason='max_depth')
-            visited.add(url)
+            visited.add(url.lower())
             continue
 
         # Gate 3: robots.txt — look up parser by domain
@@ -261,10 +319,10 @@ def run_crawl(resume: bool = True):
         if _robots and not _robots.can_fetch('*', url):
             logger.info("ROBOTS.TXT blocked: %s", url)
             db.update_status(url, 'excluded', reason='robots.txt')
-            visited.add(url)
+            visited.add(url.lower())
             continue
 
-        visited.add(url)
+        visited.add(url.lower())
         logger.info("[depth=%d] Crawling: %s", depth, url)
 
         try:
@@ -277,32 +335,71 @@ def run_crawl(resume: bool = True):
 
             http_status = result.get('http_status', 200)
 
-            # 5xx / 429 / 408 that survived all retries is still transient —
-            # never demote a previously-crawled row over it, and never persist
-            # the error body as page content
+            # 5xx / 429 / 408 / 403 that survived all retries is still
+            # transient — never demote a previously-crawled row over it, and
+            # never persist the error body as page content
             if http_status >= 500 or http_status in TRANSIENT_HTTP_STATUSES:
                 logger.info("HTTP %d after retries: %s", http_status, url)
                 _mark_failure_preserving_crawled(db, url, f"HTTP {http_status} after retries")
                 continue
 
-            # Gate 4: HTTP status exclusion (permanent errors, e.g. 403/404/410)
+            # Gate 4: HTTP status exclusion (permanent errors, e.g. 404/410).
+            # 403 normally never reaches here — it is in
+            # TRANSIENT_HTTP_STATUSES (WAF challenges) and handled above —
+            # but keep the no-demotion rule as defense in depth.
             if is_excluded_status(http_status):
                 logger.info("HTTP %d — marking failed: %s", http_status, url)
-                db.update_status(url, 'failed')
+                if http_status == 403:
+                    _mark_failure_preserving_crawled(db, url, "HTTP 403 (WAF challenge?)")
+                else:
+                    db.update_status(url, 'failed')
                 continue
 
-            # Classify and persist
+            # Gate 5: redirect target must still be in scope. The manifest
+            # row stays keyed by the originally-requested URL; the final URL
+            # is only used for the scope check and as the link-resolution
+            # base below.
+            final_url = result.get('final_url') or url
+            link_base = url
+            if final_url != url:
+                resolved_final = normalize_url(final_url, base=url) or final_url
+                redirected_excluded, redirect_reason = should_exclude(resolved_final)
+                if redirected_excluded:
+                    # A WAF challenge served as a 302 to an off-allowlist
+                    # challenge page must not demote a previously-crawled
+                    # row — same no-demotion rule as transient failures.
+                    # Only rows that have never been crawled are excluded.
+                    if db.get_page_status(url) == 'crawled':
+                        logger.warning(
+                            "REDIRECT off-allowlist on previously-crawled "
+                            "page %s -> %s (%s) — keeping prior 'crawled' "
+                            "row (possible WAF challenge redirect)",
+                            url, final_url, redirect_reason,
+                        )
+                    else:
+                        logger.info(
+                            "REDIRECT off-allowlist: %s -> %s (%s)",
+                            url, final_url, redirect_reason,
+                        )
+                        db.update_status(
+                            url, 'excluded',
+                            reason=f"redirect target excluded: {redirect_reason}",
+                        )
+                    continue
+                link_base = resolved_final
+
+            # Classify, then collect outbound links BEFORE persisting: the
+            # child 'pending' rows must land in the same transaction as this
+            # page's 'crawled' update — committing the parent first would
+            # orphan the children if the run crashed in between (parent
+            # never re-crawled on resume, children never enqueued).
             classification = classify_page(result)
-            db.update_page(url, result, classification)
-            pages_crawled += 1
 
-            # Optionally save raw HTML
-            if SAVE_RAW_HTML and result.get('raw_html'):
-                _save_raw_html(url, result['raw_html'])
-
-            # Process outbound links — use CURRENT page as base URL
+            link_rows = []      # rows for the links table
+            child_pages = []    # (url, parent_url, depth) pending rows
+            # Resolve against the FINAL (post-redirect) URL of this page
             for link in result.get('links', []):
-                norm = normalize_url(link['href'], base=url)
+                norm = normalize_url(link['href'], base=link_base)
                 if not norm:
                     continue
 
@@ -314,19 +411,30 @@ def run_crawl(resume: bool = True):
                 is_int = is_internal(norm)
                 is_doc = get_content_type(norm) != 'html'
 
-                db.add_link(
-                    source=url,
-                    target=norm,
-                    text=link.get('text', ''),
-                    context=link.get('context', ''),
-                    is_internal=int(is_int),
-                    is_document=int(is_doc),
-                )
+                link_rows.append((
+                    url, norm, link.get('text', ''), link.get('context', ''),
+                    int(is_int), int(is_doc),
+                ))
 
-                # Only queue internal links we haven't visited
-                if is_int and norm not in visited:
-                    db.add_page(url=norm, parent_url=url, depth=depth + 1)
-                    queue.append((norm, url, depth + 1))
+                # Only queue internal links we haven't visited or already
+                # enqueued (casefolded, so a case-variant of a known URL
+                # doesn't get crawled as a separate page)
+                if is_int and norm.lower() not in enqueued:
+                    enqueued.add(norm.lower())
+                    child_pages.append((norm, url, depth + 1))
+
+            # One atomic transaction: crawled status + links + children
+            db.update_page_with_children(
+                url, result, classification, link_rows, child_pages,
+            )
+            pages_crawled += 1
+
+            # Optionally save raw HTML
+            if SAVE_RAW_HTML and result.get('raw_html'):
+                _save_raw_html(url, result['raw_html'])
+
+            for child_url, child_parent, child_depth in child_pages:
+                queue.append((child_url, child_parent, child_depth))
 
         except Exception as exc:
             logger.error("Exception on %s: %s", url, exc, exc_info=True)

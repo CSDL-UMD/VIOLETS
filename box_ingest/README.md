@@ -26,11 +26,21 @@ Requires `BOX_CLIENT_ID` / `BOX_CLIENT_SECRET` in `.env` and Playwright
 (`pip install -r box_ingest/requirements.txt && playwright install chromium`).
 
 Flow: OAuth (browser once, then `.box_token` refresh) → Playwright scrapes the
-Hub for folder IDs → Box REST API lists each `2026-*` folder → `filter.py`
-classifies each filename `include`/`exclude`/`review` → `include` files
-downloaded into `needtochunk/<folder>/<name>` → `manifest.py` merges new entries
-into `url_manifest.json` (never overwriting) → `review` files written to
-`needtochunk/review_files.txt` for a human decision.
+Hub for folder IDs → Box REST API lists each `2026-*` folder (with `sha1`/`size`
+per file) → `filter.py` classifies each filename `include`/`exclude`/`review` →
+`include` files downloaded into `needtochunk/<folder>/<name>` → `manifest.py`
+merges new entries into `url_manifest.json` (never overwriting) → `review` files
+written to `needtochunk/review_files.txt` for a human decision.
+
+Update detection: `data/box_download.state.json` maps each downloaded file
+(path relative to `needtochunk/`) to `{"sha1": …, "size": …}` from Box. On each
+run a file is **new** (missing locally → download), **updated** (Box sha1
+differs from the recorded one — or, when no sha1 was recorded, from a hash of
+the local bytes → re-download), or **unchanged** (skip). Downloads are written
+to `<name>.tmp`, verified against Box's size/sha1, then atomically renamed, so
+a truncated download never replaces a good copy. Local files with no current
+Box counterpart are logged (`[drift]`) but never deleted — the operator's
+drop-and-reingest workflow accepts lingering files.
 
 ## Step 2 — extract & chunk (`ingest.py`)
 
@@ -57,11 +67,11 @@ python -m box_ingest.ingest --workers 8  # default: CPU count
 | File | Responsibility |
 |---|---|
 | `automate.py` | Step 1 orchestrator (crawl → download → manifest → review log). |
-| `crawler.py` | Box Hub scraper (Playwright) + Box OAuth 2.0 / REST v2.0 client. `python -m box_ingest.crawler` prints a classified file listing. |
+| `crawler.py` | Box Hub scraper (Playwright) + Box OAuth 2.0 / REST v2.0 client. A corrupt `.box_token` is dropped and triggers re-auth instead of crashing. `python -m box_ingest.crawler` prints a classified file listing. |
 | `filter.py` | `INCLUDE_TERMS` / `EXCLUDE_TERMS` keyword rules → include/exclude/review. |
 | `manifest.py` | Merge new `include` files into `url_manifest.json` (additive). |
 | `ingest.py` | Step 2 extract + chunk. |
-| `paths.py` | Shared path constants (`NEEDTOCHUNK_DIR`, `MANIFEST_PATH`, `STATE_PATH`, `TOKEN_CACHE`, …). |
+| `paths.py` | Shared path constants (`NEEDTOCHUNK_DIR`, `MANIFEST_PATH`, `STATE_PATH`, `DOWNLOAD_STATE`, `TOKEN_CACHE`, …). |
 | `requirements.txt` | Playwright + document-extraction libs. |
 
 ## Auth & secrets

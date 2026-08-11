@@ -1188,10 +1188,15 @@ Validated in `server/config.py` (the first three raise at import time if missing
 | `VIOLETS_API_KEY` | **required** | Server API key — clients must send as `X-API-Key` |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible API base URL |
 | `LLM_MODEL` | `gpt-5-nano` | Chat model used by RAG, classifier, and partisan checker (GPT-5 family ignores `temperature`) |
+| `ELECTION_NAME` | `2026 Maryland Gubernatorial General Election` | Election named in the QA/concerns system prompts (with today's date) so deadlines are anchored to the right election |
+| `ELECTION_DATE` | `November 3, 2026` | Date of that election, injected alongside `ELECTION_NAME` |
 | `RETRIEVER_K` | `5` | Number of chunks retrieved per query |
+| `SIMILARITY_FLOOR` | `0.0` | Drop retrieved chunks whose similarity score (1 − cosine distance) is below this value; `0.0` disables the filter |
+| `CANDIDATES_URL` | 2026 primary candidates page | URL returned verbatim for `candidates`-classified queries — repoint at the general-election page once the State Board publishes it |
 | `SESSION_TTL_MINUTES` | `30` | Session expiration |
 | `MAX_HISTORY_TURNS` | `20` | Max conversation turns kept per user |
 | `RATE_LIMIT_PER_MINUTE` | `20` | Per-`user_id` sliding-window request limit |
+| `RATE_LIMIT_GLOBAL_PER_MINUTE` | `90` | Request cap per minute across **all** users combined (`/chat` + `/reset`) — backstop for `RATE_LIMIT_PER_MINUTE`, which rotating `user_id`s can bypass |
 
 Read elsewhere at runtime (not in `config.py`):
 

@@ -65,7 +65,8 @@ def extract_pdf_from_path(path: str, needs_ocr: bool = False, ocr_fallback: bool
     return dict(_EMPTY_RESULT)
 
 
-def extract_pdf(url: str, needs_ocr: bool = False, ocr_fallback: bool = True) -> dict:
+def extract_pdf(url: str, needs_ocr: bool = False, ocr_fallback: bool = True,
+                data: bytes | None = None) -> dict:
     """
     Extract text and structure from a PDF, fetched via the Pass 2 disk cache.
 
@@ -74,12 +75,16 @@ def extract_pdf(url: str, needs_ocr: bool = False, ocr_fallback: bool = True) ->
         needs_ocr: Deprecated and ignored (see extract_pdf_from_path).
         ocr_fallback: If True (default) and digital extraction yields
                       effectively no text, fall back to OCR.
+        data: Pre-fetched (and magic-validated) PDF bytes; fetched via the
+              cache when None.
 
     Returns:
         Dict with 'text', 'pages', 'tables', 'structure_type' keys.
     """
-    from ..cache import get_bytes
-    pdf_bytes = get_bytes(url)
+    pdf_bytes = data
+    if pdf_bytes is None:
+        from ..cache import get_bytes
+        pdf_bytes = get_bytes(url, expect='pdf')
     if not pdf_bytes:
         return dict(_EMPTY_RESULT)
 

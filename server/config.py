@@ -63,8 +63,26 @@ LLM_MODEL: str = os.environ.get("LLM_MODEL", "gpt-5-nano")
 # checker in middleware.py pin their own efforts and are not affected.
 RAG_REASONING_EFFORT: str = os.environ.get("RAG_REASONING_EFFORT", "low")
 
+# Election context — injected into the QA/concerns prompts so the model
+# anchors deadlines and dates to the correct election.
+ELECTION_NAME: str = os.environ.get(
+    "ELECTION_NAME", "2026 Maryland Gubernatorial General Election"
+)
+ELECTION_DATE: str = os.environ.get("ELECTION_DATE", "November 3, 2026")
+
 # Retrieval
 RETRIEVER_K: int = int(os.environ.get("RETRIEVER_K", "5"))
+# Minimum similarity score (1 - cosine distance) a retrieved chunk must meet.
+# 0.0 (default) disables the floor and keeps every retrieved chunk.
+SIMILARITY_FLOOR: float = float(os.environ.get("SIMILARITY_FLOOR", "0.0"))
+
+# Hardcoded candidates redirect URL (middleware.py). Defaults to the 2026
+# primary candidates page — the crawl contains no general-election candidates
+# page yet, so set CANDIDATES_URL once the State Board publishes one.
+CANDIDATES_URL: str = os.environ.get(
+    "CANDIDATES_URL",
+    "https://elections.maryland.gov/elections/2026/primary_candidates/index.html",
+)
 
 # Session management
 SESSION_TTL_MINUTES: int = int(os.environ.get("SESSION_TTL_MINUTES", "30"))
@@ -72,3 +90,6 @@ MAX_HISTORY_TURNS: int = int(os.environ.get("MAX_HISTORY_TURNS", "20"))
 
 # Rate limiting
 RATE_LIMIT_PER_MINUTE: int = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "20"))
+# Global backstop across all users combined — the per-user limit is keyed on
+# the client-supplied user_id and can be bypassed by rotating ids.
+RATE_LIMIT_GLOBAL_PER_MINUTE: int = int(os.environ.get("RATE_LIMIT_GLOBAL_PER_MINUTE", "90"))

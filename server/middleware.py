@@ -152,10 +152,14 @@ FALLBACK_RESPONSES = {
         "You can update your voter registration information online here: "
         "https://voterservices.elections.maryland.gov/OnlineVoterUpdate/InstructionsStep1"
     ),
+    # URL comes from config (CANDIDATES_URL) so the operator can repoint it at
+    # the general-election candidates page without a code change. The message
+    # deliberately doesn't name a specific election so it stays accurate when
+    # the URL is swapped.
     "candidates": (
         "You can find the up-to-date list of candidates for the 2026 "
-        "Maryland Primary Election here: "
-        "https://elections.maryland.gov/elections/2026/primary_candidates/index.html"
+        "Maryland elections here: "
+        + config.CANDIDATES_URL
     ),
     # Redirect, not a refusal: name what this assistant covers and invite the
     # user to ask one of those things instead of just closing the door.
@@ -501,7 +505,7 @@ async def check_partisan_response(
     chain,
     ctx: QueryContext,
     callbacks: list | None = None,
-) -> tuple[str, list | None]:
+) -> tuple[str, list | None, list | None, bool]:
     """
     Check the RAG chain's response for partisan content, retrying up to
     MAX_PARTISAN_RETRIES times if partisan content is detected.
@@ -516,9 +520,14 @@ async def check_partisan_response(
     return the canned nonpartisan fallback (which nudges the user to
     rephrase) rather than showing unvetted partisan content.
 
-    Returns a tuple of (answer, sources). Sources is None if no retry
-    fired (main.py keeps the original sources), or the retry's sources
-    if a retry produced a clean response.
+    Returns a tuple of (answer, sources, retrieved_sources, fallback).
+    Sources is None if no retry fired (main.py keeps the original sources),
+    or the retry's sources if a retry produced a clean response.
+    retrieved_sources is the retry's full retrieval list when a retry
+    produced the final answer (so main.py caches the retrieval that
+    actually backs the shown answer), None otherwise. fallback is True
+    only when we failed closed — the shown answer is canned, so main.py
+    must not cache any sources for it.
 
     Fails closed on exceptions too: if the checker itself errors, the
     unchecked response is discarded and the safe canned nonpartisan
@@ -526,6 +535,7 @@ async def check_partisan_response(
     """
     current_response = response
     current_sources = None
+    current_retrieved = None
 
     for attempt in range(MAX_PARTISAN_RETRIES + 1):  # 0 = original, 1-2 = retries
         try:
@@ -548,7 +558,8 @@ async def check_partisan_response(
             )
 
             if not result.is_partisan:
-                return current_response, current_sources  # clean — return as-is
+                # clean — return as-is
+                return current_response, current_sources, current_retrieved, False
 
             if attempt < MAX_PARTISAN_RETRIES:
                 # Retries remaining — re-invoke the chain with stricter prompt
@@ -575,9 +586,11 @@ async def check_partisan_response(
                 if isinstance(retry_result, dict):
                     current_response = str(retry_result.get("answer", retry_result))
                     current_sources = retry_result.get("sources")
+                    current_retrieved = retry_result.get("retrieved_sources")
                 else:
                     current_response = str(retry_result)
                     current_sources = None
+                    current_retrieved = None
 
             else:
                 # All retries exhausted and the response is STILL partisan.
@@ -590,7 +603,7 @@ async def check_partisan_response(
                     MAX_PARTISAN_RETRIES,
                     ctx.user_id,
                 )
-                return FALLBACK_RESPONSES["partisan_persist"], None
+                return FALLBACK_RESPONSES["partisan_persist"], None, None, True
 
         except Exception as exc:
             logger.error(
@@ -603,4 +616,4 @@ async def check_partisan_response(
             # Fail closed: the response was never verified, so never show the
             # unchecked LLM output. Return the canned nonpartisan fallback and
             # drop any retry sources tied to the unverified answer.
-            return FALLBACK_RESPONSES["partisan"], None  # fail closed
+            return FALLBACK_RESPONSES["partisan"], None, None, True  # fail closed

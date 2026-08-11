@@ -30,6 +30,15 @@ SEED_URLS = [
 # --- Domains ---
 DOMAINS = ['elections.maryland.gov', 'mcg.montgomerycountymd.gov']
 
+# --- HTTP ---
+# Honest project User-Agent sent on ALL outbound requests (page GETs,
+# document HEADs, robots.txt). Both target sites' WAFs reject the default
+# python-requests / Python-urllib user-agents with 403.
+USER_AGENT = (
+    "VIOLETS-crawler/1.0 "
+    "(University of Maryland research; contact: violets-project@example.edu)"
+)
+
 # --- Crawl Limits ---
 MAX_DEPTH = 6
 RATE_LIMIT_SECONDS = 0.75

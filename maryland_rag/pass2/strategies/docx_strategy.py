@@ -38,15 +38,19 @@ def extract_docx_from_path(path: str) -> dict:
     return _walk_headings(doc)
 
 
-def extract_docx(url: str) -> dict:
+def extract_docx(url: str, data: bytes | None = None) -> dict:
     """
     Extract text from a DOCX file fetched via the Pass 2 disk cache.
+    `data` is used when the caller already fetched (and magic-validated)
+    the bytes.
 
     Returns:
         Dict with 'sections', 'tables', and 'full_text' keys.
     """
-    from ..cache import get_bytes
-    docx_bytes = get_bytes(url)
+    docx_bytes = data
+    if docx_bytes is None:
+        from ..cache import get_bytes
+        docx_bytes = get_bytes(url, expect='ooxml')
     if not docx_bytes:
         return dict(_EMPTY_DOCX)
 

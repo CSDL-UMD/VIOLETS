@@ -7,9 +7,22 @@ Checks:
                  chunking_strategy='skip', which is deliberately unchunked)
                  must have at least one chunk in data/chunks.jsonl.
   2. Junk      — chunks.jsonl + box_chunks.jsonl are scanned for literal
-                 'None:' prefixes, texts exceeding the Pass-2 size caps, and
-                 empty/whitespace-only texts.
-  3. DB parity — if DATABASE_URL is set and Postgres is reachable, the JSONL
+                 'None:' prefixes, texts exceeding the Pass-2 size caps,
+                 empty/whitespace-only texts, nav-menu boilerplate ("Skip to
+                 Content" / mostly menu-link lines — the poisoned-cache
+                 signature), non-Latin-script text, and Spanish leakage
+                 (langfilter.is_spanish).
+  3. Dup ids   — duplicate chunk_ids within and across the two JSONL files.
+                 All collisions are reported; only collisions whose
+                 source_urls point at DIFFERENT documents fail (URL-variant
+                 / same-document collisions are accepted dedup).
+  4. Lengths   — chunks under MIN_CHUNK_CHARS_WARN or over
+                 MAX_CHUNK_CHARS_WARN chars are counted and listed.
+                 WARN-only, never fails.
+  5. Box cov   — every url_manifest.json entry must have >= 1 chunk in
+                 box_chunks.jsonl. SKIPPED when the box chunks file or the
+                 manifest is absent.
+  6. DB parity — if DATABASE_URL is set and Postgres is reachable, the JSONL
                  chunk_id set is compared against the pgvector chunks table
                  in both directions. SKIPPED (not a failure) when the DB is
                  unavailable.
@@ -25,12 +38,15 @@ import json
 import os
 import sqlite3
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 from maryland_rag.pass1.config import DB_PATH as _DB_PATH, PROJECT_ROOT
-from maryland_rag.pass2.langfilter import MAX_NON_LATIN_RATIO, is_non_english
+from maryland_rag.pass2.langfilter import (
+    MAX_NON_LATIN_RATIO, is_non_english, is_spanish,
+)
 from maryland_rag.pass2.strategies.semantic import MAX_CHUNK_CHARS, MAX_CHUNK_WORDS
 
 DB_PATH = Path(_DB_PATH)
@@ -38,6 +54,21 @@ ROOT = Path(PROJECT_ROOT)
 
 # How many offenders to print per failing check.
 SAMPLE = 10
+
+# Length bands (check 4, warn-only): sub-50-char chunks are usually table-row
+# stubs that embed poorly; >8000 chars usually signals extraction salad.
+MIN_CHUNK_CHARS_WARN = 50
+MAX_CHUNK_CHARS_WARN = 8000
+
+# Boilerplate detection (check 2): the poisoned-cache signature is the site's
+# HTML nav page extracted as text — it starts with the skip link, and its menu
+# items render as literal '•'-bulleted link lines. Only bullet lines count as
+# nav-menu-like: PDF forms, instruction sheets, and trafilatura's '- ' lists
+# also produce many short lines and must never fail this gate.
+BOILERPLATE_PREFIX = "Skip to Content"
+NAV_LINE_MAX_WORDS = 4   # a menu-item line has at most this many words
+NAV_LINE_RATIO = 0.5     # >50% menu-like lines => boilerplate
+NAV_MIN_LINES = 10       # don't judge short chunks on line shape alone
 
 
 def _load_jsonl(path: Path) -> list[dict]:
@@ -117,6 +148,21 @@ def check_coverage(web_chunks: list[dict]) -> list[str]:
 # Check 2: junk heuristics
 # ---------------------------------------------------------------------------
 
+def _is_nav_boilerplate(text: str) -> bool:
+    """Nav-menu boilerplate: the skip link, or a chunk whose lines are
+    mostly short '•'-bulleted menu links (the extracted-nav signature)."""
+    if text.lstrip().startswith(BOILERPLATE_PREFIX):
+        return True
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) < NAV_MIN_LINES:
+        return False
+    nav_like = sum(
+        1 for ln in lines
+        if ln.startswith("•") and len(ln.lstrip("• ").split()) <= NAV_LINE_MAX_WORDS
+    )
+    return nav_like / len(lines) > NAV_LINE_RATIO
+
+
 def check_junk(chunks: list[dict]) -> dict[str, list[str]]:
     """Scan all chunks for junk. Returns {problem: [chunk_ids]} for failures."""
     none_prefix: list[str] = []
@@ -124,6 +170,8 @@ def check_junk(chunks: list[dict]) -> dict[str, list[str]]:
     oversize_words: list[str] = []
     empty: list[str] = []
     non_english: list[str] = []
+    spanish: list[str] = []
+    boilerplate: list[str] = []
 
     for c in chunks:
         cid = c.get("chunk_id", "?")
@@ -137,8 +185,14 @@ def check_junk(chunks: list[dict]) -> dict[str, list[str]]:
             oversize_chars.append(cid)
         if len(text.split()) > MAX_CHUNK_WORDS:
             oversize_words.append(cid)
-        if is_non_english(text):
+        # Spanish leakage is reported separately from script-based
+        # non-English so the operator can tell the two failure modes apart.
+        if is_spanish(text):
+            spanish.append(cid)
+        elif is_non_english(text):
             non_english.append(cid)
+        if _is_nav_boilerplate(text):
+            boilerplate.append(cid)
 
     print(f"  Chunks scanned:                      {len(chunks)}")
     print(f"  Empty/whitespace-only text:          {len(empty)}")
@@ -146,9 +200,13 @@ def check_junk(chunks: list[dict]) -> dict[str, list[str]]:
     print(f"  Over char cap (>{MAX_CHUNK_CHARS}):          {len(oversize_chars)}")
     print(f"  Over word cap (>{MAX_CHUNK_WORDS}, warn only): {len(oversize_words)}")
     print(f"  Non-English (>{MAX_NON_LATIN_RATIO:.0%} non-Latin letters):  {len(non_english)}")
+    print(f"  Spanish leakage (is_spanish):        {len(spanish)}")
+    print(f"  Nav-menu boilerplate:                {len(boilerplate)}")
     for label, ids in (("empty", empty), ("'None:'", none_prefix),
                        ("over char cap", oversize_chars),
-                       ("non-English", non_english)):
+                       ("non-English", non_english),
+                       ("Spanish", spanish),
+                       ("boilerplate", boilerplate)):
         if ids:
             print(f"  Sample chunk_ids [{label}]:")
             _print_sample(ids)
@@ -161,11 +219,110 @@ def check_junk(chunks: list[dict]) -> dict[str, list[str]]:
         "'None:' prefixes": none_prefix,
         "over char cap": oversize_chars,
         "non-English text": non_english,
+        "Spanish text": spanish,
+        "nav-menu boilerplate": boilerplate,
     }
 
 
 # ---------------------------------------------------------------------------
-# Check 3: JSONL vs pgvector parity
+# Check 3: duplicate chunk_ids
+# ---------------------------------------------------------------------------
+
+def _norm_doc_url(url: str) -> str:
+    """Collapse URL variants of the same document: drop query/fragment and
+    the trailing slash, percent-decode, and lowercase — the manifest holds
+    space-vs-%20 and path-case variants of identical documents (accepted
+    dedup). Genuinely different paths remain different documents."""
+    from urllib.parse import unquote
+    u = url.split("#", 1)[0].split("?", 1)[0].rstrip("/")
+    return unquote(u).lower()
+
+
+def check_duplicate_ids(chunks: list[dict]) -> list[str]:
+    """Report chunk_id collisions within/across the JSONL files.
+
+    Every collision is printed (warning-level detail with its sources), but
+    only ids whose colliding rows cite DIFFERENT documents are returned as
+    failures — same-document / URL-variant collisions are accepted dedup
+    per operator decision.
+    """
+    occurrences: dict[str, list[str]] = defaultdict(list)
+    for c in chunks:
+        cid = c.get("chunk_id")
+        if cid:
+            occurrences[cid].append(c.get("source_url") or "?")
+
+    collisions = {cid: urls for cid, urls in occurrences.items() if len(urls) > 1}
+    cross_doc = [
+        cid for cid, urls in collisions.items()
+        if len({_norm_doc_url(u) for u in urls}) > 1
+    ]
+
+    print(f"  Distinct chunk_ids:                  {len(occurrences)}")
+    print(f"  Colliding ids (any source):          {len(collisions)}")
+    print(f"  Colliding ids across documents:      {len(cross_doc)}")
+    if collisions:
+        print("  WARNING: collision detail (id: sources):")
+        _print_sample([
+            f"{cid}: {' | '.join(sorted(set(urls)))}"
+            for cid, urls in sorted(collisions.items())
+        ])
+    return cross_doc
+
+
+# ---------------------------------------------------------------------------
+# Check 4: length bands (warn-only)
+# ---------------------------------------------------------------------------
+
+def check_length_bands(chunks: list[dict]) -> None:
+    """Count/list chunks outside the useful length band. Never fails."""
+    tiny = [c.get("chunk_id", "?") for c in chunks
+            if len(c.get("text") or "") < MIN_CHUNK_CHARS_WARN]
+    huge = [c.get("chunk_id", "?") for c in chunks
+            if len(c.get("text") or "") > MAX_CHUNK_CHARS_WARN]
+    print(f"  Under {MIN_CHUNK_CHARS_WARN} chars (warn only):          {len(tiny)}")
+    if tiny:
+        _print_sample(tiny)
+    print(f"  Over {MAX_CHUNK_CHARS_WARN} chars (warn only):         {len(huge)}")
+    if huge:
+        _print_sample(huge)
+
+
+# ---------------------------------------------------------------------------
+# Check 5: box manifest coverage
+# ---------------------------------------------------------------------------
+
+def check_box_coverage(box_chunks: list[dict]) -> tuple[str, list[str]]:
+    """Every url_manifest.json entry must have >= 1 chunk in box_chunks.
+
+    Returns (status, offenders) with status 'ok' | 'fail' | 'skipped'.
+    """
+    try:
+        from box_ingest.paths import MANIFEST_PATH
+    except ImportError:
+        print("  SKIPPED: box_ingest package not importable.")
+        return "skipped", []
+    if not MANIFEST_PATH.exists():
+        print(f"  SKIPPED: {MANIFEST_PATH} not found.")
+        return "skipped", []
+
+    with open(MANIFEST_PATH, encoding="utf-8") as f:
+        manifest = json.load(f)
+    entries = {k: v for k, v in manifest.items() if not k.startswith("_")}
+
+    covered = {c.get("source_url") for c in box_chunks}
+    offenders = [f"{key} -> {url}" for key, url in sorted(entries.items())
+                 if url not in covered]
+
+    print(f"  Manifest entries:                    {len(entries)}")
+    print(f"  Entries with ZERO box chunks:        {len(offenders)}")
+    if offenders:
+        _print_sample(offenders)
+    return ("fail" if offenders else "ok"), offenders
+
+
+# ---------------------------------------------------------------------------
+# Check 6: JSONL vs pgvector parity
 # ---------------------------------------------------------------------------
 
 def check_db_parity(jsonl_ids: set[str]) -> tuple[str, list[str], list[str]]:
@@ -242,7 +399,28 @@ def run_verify(chunks_path: str, box_chunks_path: str) -> int:
         if ids:
             failures.append(f"junk: {len(ids)} chunk(s) with {problem}")
 
-    print("\n== 3. JSONL vs pgvector parity ==")
+    print("\n== 3. Duplicate chunk_ids (within + across files) ==")
+    cross_doc = check_duplicate_ids(web_chunks + box_chunks)
+    if cross_doc:
+        failures.append(
+            f"dup ids: {len(cross_doc)} chunk_id(s) shared across different documents"
+        )
+
+    print("\n== 4. Length bands (warn only) ==")
+    check_length_bands(web_chunks + box_chunks)
+
+    print("\n== 5. Box manifest coverage ==")
+    if box_chunks:
+        box_status, box_offenders = check_box_coverage(box_chunks)
+    else:
+        print("  SKIPPED: no box chunks loaded.")
+        box_status, box_offenders = "skipped", []
+    if box_status == "fail":
+        failures.append(
+            f"box coverage: {len(box_offenders)} manifest entr(ies) with zero chunks"
+        )
+
+    print("\n== 6. JSONL vs pgvector parity ==")
     jsonl_ids = {c.get("chunk_id", "") for c in web_chunks + box_chunks}
     jsonl_ids.discard("")
     db_status, missing, orphans = check_db_parity(jsonl_ids)
@@ -255,6 +433,8 @@ def run_verify(chunks_path: str, box_chunks_path: str) -> int:
     if failures:
         for f in failures:
             print(f"  FAIL  {f}")
+    if box_status == "skipped":
+        print("  SKIP  box coverage: box chunks/manifest unavailable")
     if db_status == "skipped":
         print("  SKIP  db parity: Postgres unavailable")
     if not failures:

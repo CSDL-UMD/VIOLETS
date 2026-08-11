@@ -20,6 +20,9 @@ ALLOWED_URL_PREFIXES = [
     "https://elections.maryland.gov/voter_registration/",
     # 2026 press releases only (documents published under this path)
     "https://elections.maryland.gov/press_room/documents/2026/",
+    # Current election cycle subtree — the past-years exclusion below
+    # exempts 2026 via its (?!2026) lookahead, so the two rules compose
+    "https://elections.maryland.gov/elections/2026/",
 ]
 
 # Exact URLs that are in scope
@@ -60,6 +63,15 @@ _ALLOWED_PREFIXES_LOWER = [p.lower() for p in ALLOWED_URL_PREFIXES]
 EXCLUDED_PATH_PATTERNS = [
     # Past election year folders — exempt 2026 which is explicitly allowlisted
     (r'/elections/(?!2026)\d{4}/',          "Past election results folder"),
+    # 2026 cycle bulk data published as the cycle progresses: hundreds of
+    # per-district results detail pages and per-county sample-ballot books.
+    # The /elections/2026/ allowlist keeps the cycle's informational pages;
+    # these two subtrees are raw data, not chatbot content. 'general' is
+    # included preemptively for the November publication wave.
+    (r'/elections/2026/(primary|general)_results/',
+     "2026 bulk results detail pages — raw data out of scope"),
+    (r'/elections/2026/(primary|general)_ballots/',
+     "2026 per-county sample ballot books — raw data out of scope"),
     (r'/elections/\d{4}_special/',           "Past special election results"),
     (r'/elections/special_elections\.html',  "Legacy special elections page"),
     (r'/elections/presidential',             "Historical presidential data"),
@@ -79,6 +91,61 @@ EXCLUDED_PATH_PATTERNS = [
      r'farsi|portuguese|haitian[-_]?creole|(simplified|traditional)[-_]?chinese'
      r'|chinese)(?![a-z])[^/]*\.(pdf|docx?|xlsx?)$',
      "non-English translated document — English original is indexed"),
+    # Language-suffix file naming for the same translated docs
+    # (Maryland_Voting_Pocket_Guide-Es.pdf, English_Internet_VRA_KO.pdf,
+    # ...-ES.docx). The token must sit between a -/_ separator and the
+    # extension, so English filenames that merely end in these letters
+    # (updates.pdf, notes.pdf, 02_Minutes.pdf) are never caught.
+    # 'vi' and 'fr' are deliberately absent: 'VI' matches Roman-numeral
+    # filenames (Title-VI.pdf) and 'FR' matches Final-Report-style
+    # abbreviations; Vietnamese/French translations are still caught by the
+    # full-language-name pattern above.
+    (r'[-_](es|ko|zh|ru)\.(pdf|docx?|xlsx?)$',
+     "non-English translated document (language-suffix filename) — "
+     "English original is indexed"),
+    # 2014–2016 wait-time / usability research reports: a decade old, ~28% of
+    # the corpus as mostly context-free table fragments, diluting current
+    # election info. Removed 2026-07-29. Separators match both literal
+    # spaces (as stored in the manifest) and %20-encoded link variants;
+    # "wait time" alone identifies the two wait-time PDFs (one filename
+    # misspells "Observations").
+    (r'/press_room/documents/[^/]*(schaefer(?:[ _+-]|%20)center'
+     r'|wait(?:[ _+-]|%20)time'
+     r'|onlineballot_usabilitytestresults)[^/]*\.pdf$',
+     "2014-2016 wait-time/usability study — too old, out of scope"),
+    (r'/voting_system/documents/expressvote[^/]*usability[^/]*\.pdf$',
+     "2014-2016 wait-time/usability study — too old, out of scope"),
+    # 2012 precinct register counts (PG12 = Presidential General, PP12 =
+    # Presidential Primary): 52 per-county PDFs of 14-year-old raw
+    # registration counts. Same class as the wait-time studies above —
+    # stale raw data that answers "how many registered voters" questions
+    # with 2012 numbers. Removed 2026-07-29.
+    (r'/press_room/documents/p[gp]12/',
+     "2012 precinct register counts — raw data, too old"),
+    # The voter_registration copies of the same report family: bcp11 is the
+    # 2011 Baltimore City primary, byprecinct.xls is the bulk spreadsheet
+    # already dropped by the XLS row guardrail (excluding it here records
+    # the decision instead of warning as zero-chunk every run).
+    (r'/voter_registration/documents/precinctregistercounts_[^/]+$',
+     "precinct register counts — raw data, too old"),
+    # 2014 certification testing report for the prior ES&S EVS version:
+    # superseded by the EVS 6.5.0.0 (2026) testing report in the Box corpus,
+    # and its usability-survey tables extract as garbled header/fragment
+    # text. Removed 2026-07-29.
+    (r'/voting_system/documents/closed_certification(?:[ _+-]|%20)+testing'
+     r'(?:[ _+-]|%20)+report[^/]*\.pdf$',
+     "2014 ES&S EVS certification testing report — superseded by the "
+     "EVS 6.5.0.0 (2026) report, garbled table extraction"),
+    # Dead documents: the server soft-404s these (HTTP 200 + HTML site
+    # template), so pass2's magic-byte guard refuses them and they warn as
+    # zero-chunk every run. Confirmed removed from the site 2026-07-29.
+    (r'/pdf/vrar/msr-\d{4}_\d{2}\.pdf$',
+     "dead URL — monthly registration report removed from site (soft-404)"),
+    (r'/get_involved/challenger(?:[ _+-]|%20)+watcher(?:[ _+-]|%20)summary'
+     r'[^/]*\.pdf$',
+     "dead URL — removed from site (soft-404)"),
+    (r'/voter_registration/documents/english_internet_vra\.pdf$',
+     "dead URL — removed from site (soft-404)"),
 ]
 
 # Pre-compile patterns for performance
@@ -97,8 +164,12 @@ EXCLUDED_HTTP_STATUSES = {404, 410, 403, 500, 502, 503}
 # written to the Pass 2 cache (the response body is an error page, not the
 # document). The crawler's retry loop and extractor's cache write both consult
 # this set — keep them in sync through it. 5xx is handled separately via a
-# `>= 500` check.
-TRANSIENT_HTTP_STATUSES = {408, 429}
+# `>= 500` check. 403 is here because both sites' WAFs intermittently
+# challenge legitimate requests with a one-off 403: it gets the standard
+# retry-with-backoff, and if it survives every retry the crawler's existing
+# post-retry handling applies (preserve a previously-crawled row, else
+# 'failed').
+TRANSIENT_HTTP_STATUSES = {403, 408, 429}
 
 SKIP_EXTENSIONS = {
     '.jpg', '.jpeg', '.png', '.gif', '.svg', '.ico', '.bmp', '.webp',
@@ -134,6 +205,22 @@ def should_exclude(url: str) -> tuple[bool, str | None]:
     if not is_allowlisted(url):
         return True, "Not in allowlist"
 
+    return matches_exclusion_rules(url)
+
+
+def matches_exclusion_rules(url: str) -> tuple[bool, str | None]:
+    """
+    Layer 2 ONLY: exclusion path patterns + extension/scheme checks, without
+    the Layer-1 allowlist gate.
+
+    Used by the crawler's retroactive exclusion pass over EXISTING manifest
+    rows: those rows already passed whatever scope decision was in force
+    when they were crawled (including the keep_filter_2026 grandfathering of
+    document rows that sit outside the link-follow allowlist), so re-running
+    the allowlist gate against them would wrongly flip deliberately-kept
+    content. New junk/translation rules land in this layer and DO need to
+    apply retroactively.
+    """
     parsed = urlparse(url)
     path = parsed.path
 

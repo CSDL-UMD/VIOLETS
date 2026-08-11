@@ -59,7 +59,27 @@ def _save_tokens(access: str, refresh: str) -> None:
 
 
 def _load_tokens() -> dict | None:
-    return json.loads(TOKEN_CACHE.read_text(encoding="utf-8")) if TOKEN_CACHE.exists() else None
+    """Return cached tokens, or None when the cache is missing or unusable.
+
+    A corrupt/truncated .box_token must never crash the run — any load
+    failure (bad JSON, missing keys, unreadable file) is treated as "no
+    cached token": the bad file is dropped and the normal re-auth flow
+    takes over.
+    """
+    if not TOKEN_CACHE.exists():
+        return None
+    try:
+        data = json.loads(TOKEN_CACHE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not data.get("refresh_token"):
+            raise ValueError("token cache has no refresh_token")
+        return data
+    except (OSError, ValueError) as exc:  # JSONDecodeError subclasses ValueError
+        logger.warning("Ignoring unusable token cache %s (%s); re-authorizing", TOKEN_CACHE, exc)
+        try:
+            TOKEN_CACHE.unlink()
+        except OSError:
+            pass
+        return None
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):
@@ -139,8 +159,10 @@ def _api_get(path: str, access_token: str) -> dict:
 def _list_folder(folder_id: str, access_token: str) -> list[dict]:
     items, offset, limit = [], 0, 1000
     while True:
+        # sha1 + size let automate.py detect files updated in Box and verify
+        # downloads; both come back only for file entries (folders lack them).
         data = _api_get(
-            f"folders/{folder_id}/items?limit={limit}&offset={offset}&fields=id,name,type",
+            f"folders/{folder_id}/items?limit={limit}&offset={offset}&fields=id,name,type,sha1,size",
             access_token,
         )
         items.extend(data.get("entries", []))
@@ -200,6 +222,8 @@ class BoxFile:
     folder_path: str   # e.g. "2026-03" or "2026-03/subfolder"
     box_url:     str   # direct share URL for the file
     decision:    str   # FILTER_INCLUDE | FILTER_EXCLUDE | FILTER_REVIEW
+    sha1:        str = ""   # Box-reported content sha1 ("" if not returned)
+    size:        int = -1   # Box-reported byte size (-1 if not returned)
 
 
 def _is_2026_folder(name: str, depth: int) -> bool:
@@ -232,6 +256,8 @@ def _walk_folder(folder_id: str, folder_path: str, access_token: str, results: l
                 folder_path=folder_path,
                 box_url=f"{SHARED_LINK}/file/{item['id']}",
                 decision=classify_filename(name),
+                sha1=item.get("sha1") or "",
+                size=int(item["size"]) if item.get("size") is not None else -1,
             ))
 
 

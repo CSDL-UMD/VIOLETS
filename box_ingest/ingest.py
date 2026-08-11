@@ -42,6 +42,7 @@ from box_ingest.paths import (
     STATE_PATH,
     DEFAULT_OUTPUT,
 )
+from maryland_rag.pass2.chunker import MIN_CHUNK_BODY_CHARS
 from maryland_rag.pass2.metadata import build_chunk_metadata
 from maryland_rag.pass2.strategies.docx_strategy import extract_docx_from_path
 from maryland_rag.pass2.strategies.pdf import extract_pdf_from_path
@@ -53,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 SHORT_DOC_WORDS      = 150
 FALLBACK_CHUNK_WORDS = 400
-SKIP_NAMES           = {"url_manifest.json", "review_files.txt", ".DS_Store"}
+SKIP_NAMES           = {"url_manifest.json", "review_files.txt", "README.md", ".DS_Store"}
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +130,19 @@ def _record(state: dict, rel_key: str, fp: Path, box_url: str,
 # ---------------------------------------------------------------------------
 
 def _chunk_text(text: str) -> list[str]:
-    """Route text to single/semantic/paragraph-fallback chunking by length."""
+    """Route text to single/semantic/paragraph-fallback chunking by length.
+
+    Chunks under MIN_CHUNK_BODY_CHARS (same floor as web pass 2) are dropped:
+    they are section stubs like "No updates.", not retrievable content."""
+    chunks = _route_chunks(text)
+    kept = [c for c in chunks if len(c.strip()) >= MIN_CHUNK_BODY_CHARS]
+    for c in chunks:
+        if len(c.strip()) < MIN_CHUNK_BODY_CHARS:
+            logger.info("Dropped under-length chunk: %.60r", c)
+    return kept
+
+
+def _route_chunks(text: str) -> list[str]:
     if not text or not text.strip():
         return []
     if len(text.split()) <= SHORT_DOC_WORDS:

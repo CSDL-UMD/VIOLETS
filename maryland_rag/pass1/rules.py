@@ -36,6 +36,16 @@ FAQ_URL_PATHS = [
     'early_voting', 'absentee', 'election_day_questions',
     'learn_about_the_new_voting_system', 'redistricting',
     '/about/pia',
+    # Lives under /press_room/ but is a Rumor/Fact accordion, not a news
+    # item. PRESS_SIGNALS matched it first and routed it to simple_split,
+    # which severed Rumor lines from the Fact answering them. The FAQ rule
+    # runs before the press rule, so listing it here wins.
+    'rumor_control',
+    # A 350-word Q/A accordion ("What is a party primary election?"). Under
+    # the word-count threshold for prose and listed in SHORT_STATIC_SIGNALS,
+    # so it was collapsed into one blob before rule 9's structural FAQ
+    # detection ever ran.
+    '/voting/primary',
 ]
 
 # Press-release keyword variants checked against url + title + text.

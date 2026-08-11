@@ -70,6 +70,7 @@ from .rag_logger import (
     LOG_RESPONSES,
 )
 from .session import SessionStore
+from .timing import begin_request, format_line, stage
 from .middleware import (
     QueryContext,
     classify_query,
@@ -137,6 +138,13 @@ class _RateLimiter:
 
 
 _rate_limiter = _RateLimiter(max_requests=config.RATE_LIMIT_PER_MINUTE)
+
+# Global backstop — the per-user limiter above is keyed on the client-supplied
+# user_id, so rotating ids bypasses it. This second limiter uses one fixed key
+# for ALL requests and caps total throughput regardless of how many ids a
+# client invents.
+_global_rate_limiter = _RateLimiter(max_requests=config.RATE_LIMIT_GLOBAL_PER_MINUTE)
+_GLOBAL_RATE_KEY = "__global__"
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +346,18 @@ async def chat(req: ChatRequest):
     # guardrails, chain, and callbacks) is stamped with it via the log filter.
     new_request_id()
 
+    # Per-stage wall-clock accounting. Stages inside the chain (rephrase,
+    # embed, retrieve, generate) record themselves into this same dict via the
+    # timing contextvar. One TIMINGS line is logged per request outcome.
+    timings = begin_request()
+    req_start = time.time()
+
+    def _log_timings(outcome: str) -> None:
+        logger.info(
+            "TIMINGS [user=%s outcome=%s] %s",
+            req.user_id, outcome, format_line(timings, time.time() - req_start),
+        )
+
     # Shared context object — travels through all guardrails
     ctx = QueryContext(user_id=req.user_id)
 
@@ -345,9 +365,18 @@ async def chat(req: ChatRequest):
     if store is None or chain is None:
         raise HTTPException(status_code=503, detail="Service starting, retry shortly")
 
-    # Rate limit check (before any LLM calls)
+    # Per-user rate limit check first (before any LLM calls) — checked before
+    # the global limiter so a client hammering a single user_id is rejected
+    # here without consuming global slots (at most RATE_LIMIT_PER_MINUTE of
+    # them per minute) instead of starving every other user.
     if not _rate_limiter.check(req.user_id):
         logger.warning("Rate limit exceeded [user=%s]", req.user_id)
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+    # Global backstop — a client rotating user_ids slips past the per-user
+    # check above but still hits this hard ceiling.
+    if not _global_rate_limiter.check(_GLOBAL_RATE_KEY):
+        logger.warning("Global rate limit exceeded [user=%s]", req.user_id)
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
     # ------------------------------------------------------------------
@@ -356,7 +385,8 @@ async def chat(req: ChatRequest):
     # spend tokens on classification or the RAG chain.
     # ------------------------------------------------------------------
     # Presidio analysis is CPU-bound and blocks the event loop; offload it.
-    pii_response = await asyncio.to_thread(detect_pii, req.query, ctx)
+    with stage("pii"):
+        pii_response = await asyncio.to_thread(detect_pii, req.query, ctx)
     if pii_response:
         logger.warning(
             "Request blocked — PII detected [user=%s type=%s]",
@@ -364,6 +394,7 @@ async def chat(req: ChatRequest):
             ctx.pii_type,
         )
         METRICS.record_request("blocked:pii")
+        _log_timings("blocked:pii")
         return ChatResponse(response=pii_response)
 
     # ------------------------------------------------------------------
@@ -371,7 +402,8 @@ async def chat(req: ChatRequest):
     # Runs after PII check. Blocks out-of-scope and partisan queries
     # before the expensive RAG chain is invoked.
     # ------------------------------------------------------------------
-    classification_response = await classify_query(req.query, ctx)
+    with stage("classify"):
+        classification_response = await classify_query(req.query, ctx)
     if classification_response:
         logger.info(
             "Request blocked — query not in scope [user=%s category=%s]",
@@ -379,6 +411,7 @@ async def chat(req: ChatRequest):
             ctx.query_category,
         )
         METRICS.record_request("blocked:scope")
+        _log_timings("blocked:scope")
         return ChatResponse(response=classification_response)
 
     # ------------------------------------------------------------------
@@ -387,6 +420,7 @@ async def chat(req: ChatRequest):
     # ------------------------------------------------------------------
     store.get_or_create(req.user_id)
     chat_history = to_langchain_messages(store.get_history(req.user_id))
+    last_sources = store.get_last_sources(req.user_id)
 
     # ------------------------------------------------------------------
     # MAIN RAG CHAIN
@@ -397,7 +431,8 @@ async def chat(req: ChatRequest):
         result = await asyncio.wait_for(
             chain.ainvoke(
                 {"input": req.query, "chat_history": chat_history,
-                 "query_category": ctx.query_category},
+                 "query_category": ctx.query_category,
+                 "last_sources": last_sources},
                 config={"callbacks": [_rag_callback]},
             ),
             timeout=RAG_CHAIN_TIMEOUT,
@@ -405,12 +440,14 @@ async def chat(req: ChatRequest):
     except asyncio.TimeoutError:
         logger.error("RAG chain timed out after %ds [user=%s]", RAG_CHAIN_TIMEOUT, req.user_id)
         METRICS.record_request("error:timeout")
+        _log_timings("error:timeout")
         raise HTTPException(status_code=502, detail="Failed to generate response.")
     except Exception:
         # logger.exception captures the full traceback — this is the line a lead
         # forwards to a developer, so it must carry more than the message string.
         logger.exception("RAG chain error [user=%s]", req.user_id)
         METRICS.record_request("error:chain")
+        _log_timings("error:chain")
         raise HTTPException(status_code=502, detail="Failed to generate response.")
 
     answer = result["answer"]
@@ -423,20 +460,49 @@ async def chat(req: ChatRequest):
     # if partisan content is detected. If all retries fail, fails closed —
     # discards the response and returns a nonpartisan fallback.
     # ------------------------------------------------------------------
-    answer, new_sources = await check_partisan_response(
-        query=req.query,
-        response=answer,
-        chat_history=chat_history,
-        chain=chain,
-        ctx=ctx,
-        callbacks=[_rag_callback] if _rag_callback else None,
-    )
-    if new_sources is not None:
-        sources = [SourceReference(**s) for s in new_sources]
+    retry_retrieved: list | None = None
+    partisan_fallback = False
+    if result.get("skip_partisan"):
+        # The cached-links short-circuit is a deterministic template over
+        # already-vetted titles/URLs, not model output — nothing to vet, so
+        # don't burn a checker LLM call (or risk a retry) on it.
+        logger.debug("Partisan check skipped — deterministic cached-links answer")
+    else:
+        # NOTE: a partisan retry re-invokes the full chain, so its rephrase/
+        # embed/retrieve/generate time lands BOTH in those stages and inside
+        # "partisan" — on retry requests the stages sum to more than total.
+        with stage("partisan"):
+            answer, new_sources, retry_retrieved, partisan_fallback = await check_partisan_response(
+                query=req.query,
+                response=answer,
+                chat_history=chat_history,
+                chain=chain,
+                ctx=ctx,
+                callbacks=[_rag_callback] if _rag_callback else None,
+            )
+        if new_sources is not None:
+            sources = [SourceReference(**s) for s in new_sources]
 
     METRICS.record_request("ok")
+    _log_timings("ok")
     log_request(req.user_id, req.query, answer, elapsed=time.time() - start, outcome="ok")
     store.add_exchange(req.user_id, req.query, answer)
+    # Cache this turn's retrieved sources so a link follow-up ("can you give
+    # me the links?") is answered from real URLs instead of model memory.
+    # Conversational turns don't retrieve and omit the key, leaving the cache
+    # untouched — a "thanks" doesn't wipe the links to the previous answer.
+    if partisan_fallback:
+        # Partisan check failed closed — the shown answer is a canned
+        # fallback, so never cache the suppressed answer's sources, and clear
+        # any previously cached links so a "give me the links" follow-up
+        # can't serve sources for an answer the user never saw.
+        store.set_last_sources(req.user_id, [])
+    elif retry_retrieved is not None:
+        # A partisan retry produced the final answer — cache ITS retrieval,
+        # not the discarded pre-retry attempt's.
+        store.set_last_sources(req.user_id, retry_retrieved)
+    elif "retrieved_sources" in result:
+        store.set_last_sources(req.user_id, result["retrieved_sources"])
 
     return ChatResponse(response=answer, sources=sources)
 
@@ -445,6 +511,9 @@ async def chat(req: ChatRequest):
 async def reset_session(req: ResetRequest):
     if store is None:
         raise HTTPException(status_code=503, detail="Service starting, retry shortly")
+    if not _global_rate_limiter.check(_GLOBAL_RATE_KEY):
+        logger.warning("Global rate limit exceeded [user=%s]", req.user_id)
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
     store.reset(req.user_id)
     return {"status": "session cleared"}
 

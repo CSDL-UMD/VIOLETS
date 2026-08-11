@@ -34,6 +34,15 @@ def normalize_url(href: str, base: str) -> str | None:
         if any(skip in parsed.netloc for skip in SKIP_DOMAINS):
             return None
 
+        # Upgrade http -> https on the target domains: both sites serve
+        # https, and the allowlist prefixes are https:// strings, so an
+        # absolute http:// internal link would otherwise be dropped. The
+        # netloc is lowercased in the same step — an uppercase-host http://
+        # link would otherwise pass the allowlist as a case-variant URL and
+        # create duplicate manifest rows.
+        if parsed.scheme == 'http' and parsed.netloc.lower() in DOMAINS:
+            parsed = parsed._replace(scheme='https', netloc=parsed.netloc.lower())
+
         # Drop fragment
         clean_parsed = parsed._replace(fragment='')
 

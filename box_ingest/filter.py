@@ -39,6 +39,15 @@ INCLUDE_TERMS = [
     "lwv",                  # Letter From/To LWV (League of Women Voters)
     "del long",             # Del Long response pt 2
     "house_admin",          # House_Admin_Response_06122026
+    # Added from manual triage of REVIEW files (2026-07-29):
+    "polling place",        # official polling place change notices (Cecil GP26, notification letters)
+    "request policy",       # Policy 2025-03 PIA/PSR voter-data request policy (official SBE policy)
+    "lvw",                  # "LVW Questions Reply" — typo'd LWV; SBE's official answers on ballot curing
+    # Content-verified additions (2026-07-29, opened every REVIEW/EXCLUDE file):
+    "ppp",                  # "2026 PPP Baltimore city" — full Baltimore City 2026 Polling Place Plan
+    "baltimorecity",        # "BaltimoreCity.pdf" — official Waxter Center polling place change notice (image-only, needs OCR)
+    "potomac heights",      # Washington Co. precincts 18002/18004 polling place move (filename says "Letter")
+    "doj_response",         # SBE's official NVRA/HAVA list-maintenance compliance response to DOJ
 ]
 
 EXCLUDE_TERMS = [
@@ -56,6 +65,19 @@ EXCLUDE_TERMS = [
     "bylaws",
     "transmittal",
     "appointment",
+    # Added from manual triage of REVIEW files (2026-07-29):
+    "letter",          # advocacy/vendor/meeting correspondence (MAEO, ES&S, Potomac Heights)
+    "presentation",    # public testimony presentations to the Board
+    "testimony",
+    "comment",         # public comments (subsumes "comments" above)
+    "proposed regs",   # superseded by Final Regulations (kept via INCLUDE)
+    "ccf",             # campaign-finance administrivia (CCF regs / closure requests)
+    "cost estimate",
+    "dashboard",       # NVS demo dashboard screenshots
+    "moco request",    # MoCo language-assistance request correspondence
+    "mdgop",           # partisan-org letters
+    "fatal flaws",     # third-party RLA-audit critique (advocacy)
+    "thompsom",        # one-off individual submission
 ]
 
 FILTER_INCLUDE = "include"

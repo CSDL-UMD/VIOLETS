@@ -13,9 +13,10 @@ Usage:
                                               #   pass1 → pass2 → box_ingest → pass3 (web) → pass3 (box)
                                               #   pass2 ALWAYS re-chunks every crawled page (never
                                               #   incremental): the operator drops the pgvector DB and
-                                              #   re-ingests from scratch each run, and pass2 truncates
-                                              #   chunks.jsonl, so it must contain the full corpus.
-                                              #   Incremental chunking is only for `pass2 --changed`.
+                                              #   re-ingests from scratch each run, and pass2 replaces
+                                              #   chunks.jsonl wholesale, so it must contain the full
+                                              #   corpus. `pass2 --changed` re-chunks only changed pages
+                                              #   and MERGES their chunks into the existing file.
 """
 import argparse
 import logging
@@ -38,7 +39,7 @@ def _configure_logging():
     )
 
 
-def _report_chunk_coverage(chunks: list[dict], expected_urls: set[str]):
+def _report_chunk_coverage(chunks: list[dict], expected_urls: set[str]) -> set[str]:
     """
     Compare the pages that actually produced chunks against the pages that
     should have (crawl_status='crawled', not strategy='skip'). Zero-chunk
@@ -46,6 +47,10 @@ def _report_chunk_coverage(chunks: list[dict], expected_urls: set[str]):
     nothing, exit non-zero — the operator rebuilds pgvector from
     chunks.jsonl, so shipping a badly incomplete file would silently drop
     that content from the vector store.
+
+    Returns the set of URLs that DID produce chunks — the hash snapshot is
+    restricted to exactly this set, so a failed/zero-chunk page is retried
+    by the next `pass2 --changed` instead of being marked reflected.
     """
     covered = set()
     for chunk in chunks:
@@ -75,6 +80,8 @@ def _report_chunk_coverage(chunks: list[dict], expected_urls: set[str]):
         logger.error(msg)
         print(msg, file=sys.stderr)
         sys.exit(1)
+
+    return covered
 
 
 def main():
@@ -116,10 +123,10 @@ def main():
         print(f"Produced {len(chunks)} chunks → {args.output}")
         if args.changed:
             print(
-                "WARNING: --changed wrote ONLY the changed pages' chunks to "
-                f"{args.output} (the file is truncated, not merged). Do not "
-                "embed it into a freshly-dropped database — use the full "
-                "`all` pipeline (or plain `pass2`) for a from-scratch rebuild."
+                "NOTE: --changed MERGED the changed pages' chunks into "
+                f"{args.output} (existing rows for unchanged pages were "
+                "kept; rows for reprocessed or no-longer-chunkable pages "
+                "were replaced/dropped)."
             )
 
     elif args.command == 'pass3':
@@ -147,13 +154,18 @@ def main():
 
         db = DB()
         # Coverage gate: exits non-zero if >20% of expected pages got no chunks.
-        _report_chunk_coverage(chunks, db.get_expected_chunk_urls())
+        covered = _report_chunk_coverage(chunks, db.get_expected_chunk_urls())
         # Snapshot AFTER a successful full chunk pass: previous_content_hash
         # now means "this content is reflected in chunks.jsonl", which is the
         # baseline `pass2 --changed` diffs against. Snapshotting before the
         # crawl (the old design) permanently swallowed change events whenever
-        # a run was interrupted between crawl and chunking.
-        db.snapshot_hashes_for_recrawl()
+        # a run was interrupted between crawl and chunking. Restricted to the
+        # pages that actually produced chunks: a page that threw or could not
+        # be fetched (e.g. a poisoned document payload) stays un-snapshotted
+        # so `pass2 --changed` retries it next run. (Deliberate-zero pages —
+        # skip strategy, legacy .doc, langfilter-emptied — are snapshotted by
+        # run_pass2 itself: their zero-chunk state is their reflected state.)
+        db.snapshot_hashes_for_recrawl(urls=covered)
         db.close()
 
         from box_ingest.ingest import run_ingest, DEFAULT_OUTPUT as BOX_OUTPUT
