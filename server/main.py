@@ -104,6 +104,7 @@ async def _verify_api_key(key: str | None = Security(_api_key_header)):
 # Rate Limiting
 # ---------------------------------------------------------------------------
 
+
 class _RateLimiter:
     """Simple sliding-window rate limiter keyed by user_id."""
 
@@ -119,16 +120,14 @@ class _RateLimiter:
             # Evict idle keys whose most recent request is outside the window
             # so the dict stays bounded (it is never otherwise pruned).
             stale = [
-                k for k, ts in self._requests.items()
+                k
+                for k, ts in self._requests.items()
                 if k != key and (not ts or now - ts[-1] >= self._window)
             ]
             for k in stale:
                 del self._requests[k]
 
-            timestamps = [
-                t for t in self._requests[key]
-                if now - t < self._window
-            ]
+            timestamps = [t for t in self._requests[key] if now - t < self._window]
             if len(timestamps) >= self._max:
                 self._requests[key] = timestamps
                 return False
@@ -178,7 +177,7 @@ def _pool_gauge() -> str:
     try:
         stats = _pool.get_stats() if _pool is not None else {}
         maximum = stats.get("pool_max", 0)
-        size = stats.get("pool_size", 0)          # connections currently open
+        size = stats.get("pool_size", 0)  # connections currently open
         available = stats.get("pool_available", 0)  # open and idle
         waiting = stats.get("requests_waiting", 0)
         in_use = size - available
@@ -212,8 +211,13 @@ async def _periodic_maintenance():
                 "HEARTBEAT last %dm — requests=%d errors=%d blocked=%d cost=~$%.4f "
                 "| since boot: requests=%d errors=%d cost=~$%.4f | %s",
                 HEARTBEAT_INTERVAL // 60,
-                m["requests"], m["errors"], m["blocked"], m["cost"],
-                m["total_requests"], m["total_errors"], m["total_cost"],
+                m["requests"],
+                m["errors"],
+                m["blocked"],
+                m["cost"],
+                m["total_requests"],
+                m["total_errors"],
+                m["total_cost"],
                 _pool_gauge(),
             )
         except Exception:
@@ -223,6 +227,7 @@ async def _periodic_maintenance():
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -240,13 +245,16 @@ async def lifespan(app: FastAPI):
     )
 
     if LOG_PROMPTS or LOG_RESPONSES:
-        logger.warning("Verbose prompt/response logging enabled — disable for production.")
+        logger.warning(
+            "Verbose prompt/response logging enabled — disable for production."
+        )
 
     # PII detection still runs in the threadpool via asyncio.to_thread, so keep
     # the limiter above the default 40 tokens. (Retrieval no longer uses the
     # threadpool — PgVectorRetriever is fully async via AsyncConnectionPool.)
     try:
         import anyio
+
         limiter = anyio.to_thread.current_default_thread_limiter()
         limiter.total_tokens = 100
     except Exception:
@@ -301,7 +309,7 @@ app = FastAPI(title="VIOLETS Election Chatbot", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.environ.get(
-        "CORS_ORIGINS", "https://umdsurvey.umd.edu"
+        "CORS_ORIGINS", "https://umdsurvey.umd.edu", "https://verasight.qualtrics.com"
     ).split(","),
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type", "X-API-Key"],
@@ -312,8 +320,9 @@ app.add_middleware(
 # Request / Response models
 # ---------------------------------------------------------------------------
 
+
 class ChatRequest(BaseModel):
-    user_id: str = Field(min_length=1, max_length=128, pattern=r'^[a-zA-Z0-9_-]+$')
+    user_id: str = Field(min_length=1, max_length=128, pattern=r"^[a-zA-Z0-9_-]+$")
     query: str = Field(min_length=1, max_length=2000)
 
 
@@ -333,12 +342,13 @@ class ChatResponse(BaseModel):
 
 
 class ResetRequest(BaseModel):
-    user_id: str = Field(min_length=1, max_length=128, pattern=r'^[a-zA-Z0-9_-]+$')
+    user_id: str = Field(min_length=1, max_length=128, pattern=r"^[a-zA-Z0-9_-]+$")
 
 
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
 
 @app.post("/chat", response_model=ChatResponse, dependencies=[Depends(_verify_api_key)])
 async def chat(req: ChatRequest):
@@ -355,7 +365,9 @@ async def chat(req: ChatRequest):
     def _log_timings(outcome: str) -> None:
         logger.info(
             "TIMINGS [user=%s outcome=%s] %s",
-            req.user_id, outcome, format_line(timings, time.time() - req_start),
+            req.user_id,
+            outcome,
+            format_line(timings, time.time() - req_start),
         )
 
     # Shared context object — travels through all guardrails
@@ -430,15 +442,20 @@ async def chat(req: ChatRequest):
     try:
         result = await asyncio.wait_for(
             chain.ainvoke(
-                {"input": req.query, "chat_history": chat_history,
-                 "query_category": ctx.query_category,
-                 "last_sources": last_sources},
+                {
+                    "input": req.query,
+                    "chat_history": chat_history,
+                    "query_category": ctx.query_category,
+                    "last_sources": last_sources,
+                },
                 config={"callbacks": [_rag_callback]},
             ),
             timeout=RAG_CHAIN_TIMEOUT,
         )
     except asyncio.TimeoutError:
-        logger.error("RAG chain timed out after %ds [user=%s]", RAG_CHAIN_TIMEOUT, req.user_id)
+        logger.error(
+            "RAG chain timed out after %ds [user=%s]", RAG_CHAIN_TIMEOUT, req.user_id
+        )
         METRICS.record_request("error:timeout")
         _log_timings("error:timeout")
         raise HTTPException(status_code=502, detail="Failed to generate response.")
@@ -472,20 +489,24 @@ async def chat(req: ChatRequest):
         # embed/retrieve/generate time lands BOTH in those stages and inside
         # "partisan" — on retry requests the stages sum to more than total.
         with stage("partisan"):
-            answer, new_sources, retry_retrieved, partisan_fallback = await check_partisan_response(
-                query=req.query,
-                response=answer,
-                chat_history=chat_history,
-                chain=chain,
-                ctx=ctx,
-                callbacks=[_rag_callback] if _rag_callback else None,
+            answer, new_sources, retry_retrieved, partisan_fallback = (
+                await check_partisan_response(
+                    query=req.query,
+                    response=answer,
+                    chat_history=chat_history,
+                    chain=chain,
+                    ctx=ctx,
+                    callbacks=[_rag_callback] if _rag_callback else None,
+                )
             )
         if new_sources is not None:
             sources = [SourceReference(**s) for s in new_sources]
 
     METRICS.record_request("ok")
     _log_timings("ok")
-    log_request(req.user_id, req.query, answer, elapsed=time.time() - start, outcome="ok")
+    log_request(
+        req.user_id, req.query, answer, elapsed=time.time() - start, outcome="ok"
+    )
     store.add_exchange(req.user_id, req.query, answer)
     # Cache this turn's retrieved sources so a link follow-up ("can you give
     # me the links?") is answered from real URLs instead of model memory.
