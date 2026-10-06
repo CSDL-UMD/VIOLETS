@@ -56,7 +56,7 @@ document chunks embed with their page context.
 | `strategies/` | `single`, `simple_split`, `semantic` (+ shared `enforce_chunk_caps`), `faq`, `table_rows` (header row never re-emitted; consecutive rows grouped ~200–1000 chars with `row_start`/`row_end`), `pdf` (digital-first, OCR fallback @ 300 dpi), `docx_strategy`, `xls_strategy` (same row grouping; stdlib-csv reader; skips sheets over `MAX_XLS_ROW_CHUNKS=200` **raw** rows, counted pre-grouping). |
 
 ### `pass3/` — embed → pgvector
-`embed.py`: batches of 100 → `text-embedding-3-small` (1536-dim); linear
+`embed.py`: batches of 100 → `text-embedding-3-large` (3072-dim); linear
 backoff + jitter; deterministic-4xx bisection; `ON CONFLICT DO UPDATE` upsert
 with per-row savepoints.
 
@@ -65,10 +65,8 @@ with per-row savepoints.
 |---|---|
 | `db_cleanup.py` | Remove duplicate URL variants + junk (timestamped backup first). |
 | `reclassify.py` | Re-run `rules.py` on stored metadata (no re-crawl). |
-| `apply_keep_filter.py` | Mark out-of-scope rows `excluded` (`keep_filter_2026`). |
 | `audit.py` | Manifest audit report (backs `maryland_rag audit`). |
 | `verify_chunks.py` | Post-ingest gate: coverage / junk (incl. nav boilerplate + Spanish leakage) / duplicate `chunk_id`s (fails only cross-document) / length bands (warn) / Box manifest coverage / pgvector parity. |
 | `stress_test.py` | Server concurrency + edge-case harness. |
 
 `db_cleanup` / `reclassify` default to **apply**; pass `--dry-run` to preview.
-`apply_keep_filter` requires one of `--dry-run` / `--apply` / `--revert`.

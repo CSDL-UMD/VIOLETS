@@ -69,7 +69,7 @@
 
 Each pass reads only from the previous stage's output. Re-running a single pass is safe: Pass 1 resumes from `pending` rows, Pass 2 has `--changed` mode, Pass 3 has `--resume` and uses `ON CONFLICT … DO UPDATE` upserts.
 
-Embedding model: `text-embedding-3-small` (1,536-dim, OpenAI).
+Embedding model: `text-embedding-3-large` (3,072-dim, OpenAI). Set in two places that must match: `maryland_rag/pass3/embed.py` `EMBED_MODEL` and `server/rag_chain.py` `EMBED_MODEL`.
 Default LLM: `gpt-5-nano` (overridable via `LLM_MODEL`).
 
 ---
@@ -139,7 +139,6 @@ VIOLETS/
 │   └── scripts/                      ← Maintenance & verification utilities
 │       ├── db_cleanup.py             ← Remove duplicate URL variants from manifest.db
 │       ├── reclassify.py             ← Re-classify pages using stored metadata
-│       ├── apply_keep_filter.py      ← Mark out-of-scope rows as excluded
 │       ├── audit.py                  ← Manifest audit report (backs `maryland_rag audit`)
 │       ├── verify_chunks.py          ← Post-ingest gate: coverage / junk / pgvector parity
 │       └── stress_test.py            ← Server-side concurrency + edge-case test harness
@@ -165,6 +164,8 @@ VIOLETS/
     ├── metrics.py                    ← In-process counters feeding the heartbeat log
     ├── session.py                    ← Thread-safe in-memory conversation store
     ├── eval_guardrails.py            ← Offline eval: reasoning-effort regression check
+    ├── eval_retrieval.py             ← Offline eval: retrieval ranking vs labeled benchmark
+    ├── retrieval_benchmark.json      ← Labeled questions + gold for eval_retrieval
     └── requirements.txt              ← Server Python dependencies
 ```
 
@@ -277,7 +278,7 @@ python -m maryland_rag pass1 --no-resume
 
 ### 4.1 How the Crawler Works (`pass1/crawler.py`)
 
-BFS from the seeds defined in `pass1/config.SEED_URLS`, up to 6 levels deep, scoped by the allowlist in `pass1/exclusions.py`.
+BFS from the seeds in `pass1/config.SEED_URLS`, up to 6 levels deep, scoped by the allowlist in `pass1/exclusions.py`. The seeds are derived from the allowlist's `ALLOWED_EXACT_URLS`, so a page is added to the crawl by adding it there.
 
 **Seed set (current):**
 - State BoE — prefix-crawled: `/voting/`, `/voter_registration/`, plus `/press_room/documents/2026/`
@@ -317,7 +318,7 @@ The robots fetch itself retries up to `MAX_RETRIES` (3) times with `2 ** attempt
 
 ### 4.2 The Allowlist + Exclusions (`pass1/exclusions.py`)
 
-`exclusions.py` is the single source of truth for both layers — referenced by the crawler, `db_cleanup`, and `apply_keep_filter`.
+`exclusions.py` is the single source of truth for both layers — referenced by the crawler and `db_cleanup`.
 
 **Layer 1 — Allowlist** (`should_exclude` returns "Not in allowlist" otherwise):
 - `ALLOWED_URL_PREFIXES` — full subtrees in scope (e.g., `…/voting/`)
@@ -586,7 +587,7 @@ python -m maryland_rag pass3 --chunks data/box_chunks.jsonl
 1. Read chunks from the JSONL file.
 2. Create the `chunks` table if it doesn't exist (`CREATE EXTENSION IF NOT EXISTS vector` first).
 3. If `--resume`: query existing `chunk_id`s and skip them.
-4. Embed in batches of `EMBED_BATCH_SIZE` (100) → `text-embedding-3-small` → 1,536-dim vectors. Up to 3 attempts with **linear backoff + jitter** (`RETRY_DELAY * attempt + random(0, RETRY_DELAY)`) on transient errors (incl. 408/429). On a deterministic 4xx the batch is recursively **bisected** to isolate the offending input; a chunk that still fails deterministically raises `RuntimeError` and aborts the run (non-zero exit) rather than silently dropping content.
+4. Embed in batches of `EMBED_BATCH_SIZE` (100) → `text-embedding-3-large` → 3,072-dim vectors. Up to 3 attempts with **linear backoff + jitter** (`RETRY_DELAY * attempt + random(0, RETRY_DELAY)`) on transient errors (incl. 408/429). On a deterministic 4xx the batch is recursively **bisected** to isolate the offending input; a chunk that still fails deterministically raises `RuntimeError` and aborts the run (non-zero exit) rather than silently dropping content.
 5. Upsert into PostgreSQL with `ON CONFLICT (chunk_id) DO UPDATE`. Each row is wrapped in a savepoint so a single failure doesn't roll back the rest of the batch.
 
 ---
@@ -596,7 +597,7 @@ python -m maryland_rag pass3 --chunks data/box_chunks.jsonl
 ```sql
 CREATE TABLE chunks (
     chunk_id   TEXT PRIMARY KEY,
-    embedding  vector(1536),
+    embedding  vector(3072),
     text       TEXT,
     source_url TEXT,
     title      TEXT,
@@ -606,10 +607,10 @@ CREATE TABLE chunks (
 
 | Setting | Value | Reason |
 |---|---|---|
-| Dimension | 1,536 | Matches `text-embedding-3-small` |
+| Dimension | 3,072 | Matches `text-embedding-3-large` |
 | Metric | Cosine | Standard for normalized text embeddings (`embedding <=> %s::vector`) |
 
-> ⚠️ The table is created with no ANN index. For the current corpus size this is fine and queries do a sequential scan. If the corpus grows enough that retrieval latency matters, add an `ivfflat` or `hnsw` index manually on `embedding`.
+> ⚠️ The table is created with no ANN index. For the current corpus size this is fine and queries do a sequential scan. If the corpus grows enough that retrieval latency matters, add an `hnsw` index manually. pgvector can't index a plain `vector` column above 2,000 dimensions, so with 3,072-dim embeddings use a `halfvec` expression index (`CREATE INDEX ON chunks USING hnsw ((embedding::halfvec(3072)) halfvec_cosine_ops);`) and cast the query the same way. At ~2.5k chunks the exact scan takes ~23 ms locally, small next to the ~200 ms query-embedding call, so no index is needed yet.
 
 ---
 
@@ -678,7 +679,7 @@ User query
 └───────────────────────┬───────────────────────────────┘
                         ▼
 ┌───────────────────────────────────────────────────────┐
-│  RATE LIMIT: sliding-window per user_id (20/min)      │
+│  RATE LIMIT: 20/min per user_id + 225/min global      │
 │  → 429 if exceeded                                     │
 └───────────────────────┬───────────────────────────────┘
                         ▼
@@ -738,9 +739,9 @@ User query
 
 ### Server Modules
 
-**`main.py`** — FastAPI app with async lifespan startup: `setup_logging()`, an **`AsyncConnectionPool`** (`min_size=4, max_size=25, timeout=10`, opened with `wait=True`; if the DB is unreachable at startup the server refuses to start), `SessionStore`, and `build_chain(pool)`. Hosts `_RateLimiter` (which also evicts stale per-user windows each call), the `X-API-Key` dependency, CORS middleware, and a background `_periodic_maintenance()` task (every `HEARTBEAT_INTERVAL` = 300 s) that runs `store.cleanup_expired()` **and** emits a `HEARTBEAT` log line (requests / errors / blocked / cost + pool gauge). The RAG call is wrapped in `asyncio.wait_for(..., RAG_CHAIN_TIMEOUT=60)`; timeout or chain error → HTTP 502. Each `/chat` gets an 8-char request id (`new_request_id()`) that tags every log line for that request. Pool is closed with a 30 s grace on shutdown; the process pins `workers=1`.
+**`main.py`** — FastAPI app with async lifespan startup: `setup_logging()`, an **`AsyncConnectionPool`** (`min_size=4, max_size=25, timeout=10`, opened with `wait=True`; if the DB is unreachable at startup the server refuses to start), `SessionStore`, and `build_chain(pool)`. Hosts `_RateLimiter` (which also evicts stale per-user windows each call), the `X-API-Key` dependency, CORS middleware, and a background `_periodic_maintenance()` task (every `HEARTBEAT_INTERVAL` = 300 s) that runs `store.cleanup_expired()` **and** emits a `HEARTBEAT` log line (requests / errors / blocked / auth failures / cost + pool gauge). Failed-auth warnings are throttled to one per 60 s (with a suppressed count) so unauthenticated floods can't rotate real entries out of the log. The RAG call is wrapped in `asyncio.wait_for(..., RAG_CHAIN_TIMEOUT=60)`; timeout or chain error → HTTP 502. Each `/chat` gets an 8-char request id (`new_request_id()`) that tags every log line for that request. Pool is closed with a 30 s grace on shutdown; the process pins `workers=1`.
 
-**`rag_chain.py`** — Built with `langchain_core` runnables. `full_pipeline` is a `RunnableLambda` that branches on `query_category`: `conversational` → answer from history, no retrieval; `concerns` → Rumor Control prompt; else standard QA. A custom `PgVectorRetriever(BaseRetriever)` queries PostgreSQL via pgvector directly (`embedding <=> %s::vector`, with `SET LOCAL statement_timeout = '30s'`). Four prompts:
+**`rag_chain.py`** — Built with `langchain_core` runnables. `full_pipeline` is a `RunnableLambda` that branches on `query_category`: `conversational` → answer from history, no retrieval; `concerns` → Rumor Control prompt; else standard QA. A custom `PgVectorRetriever(BaseRetriever)` queries PostgreSQL via pgvector directly (`embedding <=> %s::vector`, with `SET LOCAL statement_timeout = '30s'`). Ranking adds `PAST_ELECTION_PENALTY` to the cosine distance of chunks whose `source_url` matches `PAST_ELECTION_URL_PATTERNS`, so stale primary-election lists lose close calls to current ones. Four prompts:
   - `_CONTEXTUALIZE_PROMPT` — rephrases follow-ups into standalone questions
   - `_QA_PROMPT` — main answer prompt with `[Source N]` citation contract
   - `_CONVERSATIONAL_PROMPT` — answers from chat history only, no retrieval
@@ -755,7 +756,7 @@ Retrieval is **fully async**: `_aget_relevant_documents` uses `aembed_query` + a
 | Function | Purpose | Failure mode |
 |---|---|---|
 | `detect_pii(query, ctx)` | Presidio scan for `US_SSN`, `CREDIT_CARD`, `EMAIL_ADDRESS`, `IP_ADDRESS`, `PHONE_NUMBER`, `US_PASSPORT`, `US_DRIVER_LICENSE` at score ≥ 0.5 | **Fail closed** — blocks (canned PII fallback) on any analyzer error |
-| `classify_query(query, ctx)` | LLM (`LLM_MODEL`, structured `ClassificationResult`, `reasoning_effort="medium"`) → 9 categories. Short-circuits `__User concerns:__` to skip the LLM | **Fail closed** — returns canned `error` reply on classifier failure |
+| `classify_query(query, ctx, history)` | LLM (`LLM_MODEL`, structured `ClassificationResult`, `reasoning_effort="medium"`) → 9 categories. Sees the latest message plus the last 2 exchanges (each truncated to 600 chars) so follow-ups like "where is it?" resolve against the conversation. Short-circuits `__User concerns:__` to skip the LLM | **Fail closed** — returns canned `error` reply on classifier failure |
 | `check_partisan_response(...)` | Structured `PartisanCheckResult` (`reasoning_effort="minimal"`); on `is_partisan=True`, re-invokes chain with stricter retry prompt up to `MAX_PARTISAN_RETRIES` (2) | **Fail closed** — still-partisan → `partisan_persist` refusal; exception → `partisan` refusal |
 
 Categories `normal` / `conversational` / `concerns` reach the RAG chain. The four "hardcoded URL" categories (`polling_location`, `voter_lookup`, `voter_update`, `candidates`) return a static URL from `FALLBACK_RESPONSES` without ever calling the LLM. `partisan` returns a refusal; `out_of_scope` returns a redirect toward what the assistant can help with (registration, polling locations, ballot procedures, candidates) rather than a flat decline. `FALLBACK_RESPONSES` also carries `pii`, `partisan_persist`, and `error` messages.
@@ -769,6 +770,8 @@ Categories `normal` / `conversational` / `concerns` reach the RAG chain. The fou
 **`session.py`** — Thread-safe in-memory per-`user_id` conversation store with TTL expiration (`SESSION_TTL_MINUTES`) and max-turn cap (`MAX_HISTORY_TURNS`). Designed for pilot-scale (tens of concurrent users) — swap to Redis or a database for production scale.
 
 **`eval_guardrails.py`** — Offline eval (not part of the server runtime). Runs the classifier and partisan checker at both `reasoning_effort="minimal"` and `"medium"` over labeled fixtures and reports whether `minimal` disagrees with the expected labels or with `medium`. Makes ~26 real OpenAI calls; exit code = number of `minimal` mislabels. `python -m server.eval_guardrails`.
+
+**`eval_retrieval.py`** — Offline retrieval eval. Runs the 49 questions in `retrieval_benchmark.json` through the production `PgVectorRetriever` and scores hit@1, hit@K, MRR@10 and P@K. Gold chunks are matched by URL substring + text regex (not chunk_id), so labels survive a drop-and-reingest. Questions tagged `candidates` are reported separately because the classifier usually routes them to the canned `CANDIDATES_URL` reply. Rerun after any change to chunking, embedding or ranking. `python -m server.eval_retrieval [-v]`.
 
 ---
 
@@ -808,19 +811,28 @@ CORS_ORIGINS=http://localhost:3000,http://localhost:5173 uvicorn server.main:app
 
 ### 9.3 Rate Limiting
 
-In-memory sliding-window limiter (`_RateLimiter` in `main.py`), keyed by `user_id`, defaulting to `RATE_LIMIT_PER_MINUTE = 20` requests per 60 s. Exceeded → **HTTP 429** `{"detail":"Rate limit exceeded"}`. Runs **before** PII/classification/RAG, so a runaway client cannot drain OpenAI credits.
+Two in-memory sliding-window limiters (`_RateLimiter` in `main.py`, 60 s window), both checked **before** PII/classification/RAG so a runaway client cannot drain OpenAI credits:
+
+- **Per-user** — keyed by `user_id`, `RATE_LIMIT_PER_MINUTE = 20`. Checked first; its rejections don't consume global slots.
+- **Global** — one shared bucket for all `/chat` + `/reset` traffic, `RATE_LIMIT_GLOBAL_PER_MINUTE = 225`. Backstop for clients rotating `user_id`s past the per-user limit.
+
+Exceeding either → **HTTP 429** `{"detail":"Rate limit exceeded"}`.
+
+At ~6.5k OpenAI tokens per `/chat` (4–5 calls), a saturated 225/min global cap is ~1.5M tokens/min — above OpenAI's Build-tier TPM, within Launch. Check your tier before raising it further.
 
 The limiter is per-process. Behind multiple replicas you would either pin users to a replica or move the counter into Redis.
 
 ### 9.4 Stress Testing
 
-`maryland_rag/scripts/stress_test.py` exercises the running server with concurrent RAG queries, same-user races, malformed inputs, mixed guardrail paths, session reset under load, and health responsiveness during load.
+`maryland_rag/scripts/stress_test.py` exercises the running server with concurrent RAG queries, same-user races, malformed inputs, mixed guardrail paths, session reset under load, health responsiveness during load, and the exact rate-limit boundaries. It exits non-zero on any failure.
 
 ```bash
-export VIOLETS_API_KEY=...
-uvicorn server.main:app --host 0.0.0.0 --port 8000 &   # start server first
-python -m maryland_rag.scripts.stress_test
+python -m server.main &                                     # start server first
+python -m maryland_rag.scripts.stress_test                  # full suite (real LLM spend)
+python -m maryland_rag.scripts.stress_test --limits-only    # rate limits only (free, ~2 min)
 ```
+
+The rate-limit phase reads both limits from `server.config`, so run it with the same `.env`/environment as the server. It waits out one window, then asserts that exactly `RATE_LIMIT_PER_MINUTE` requests from one user pass and the next 429, that distinct users fill exactly `RATE_LIMIT_GLOBAL_PER_MINUTE` before everything (including `/reset`) 429s, and that both recover after the window. It uses PII-blocked queries (an email address), which count against the limiters but never reach OpenAI; it aborts before the global burst if that stops being true. Counts are exact, so the server must have no other traffic during the run.
 
 ---
 
@@ -843,22 +855,7 @@ python -m maryland_rag.scripts.db_cleanup --dry-run   # preview
 python -m maryland_rag.scripts.db_cleanup              # apply
 ```
 
-### 10.2 Apply Keep Filter (`scripts/apply_keep_filter.py`)
-
-Narrows the crawled set down to a curated keep list for 2025–2026, marking everything else as `excluded` with reason `keep_filter_2026`. Rows are **never deleted** — Pass 2 reads `crawl_status='crawled'` only, so excluded rows are skipped automatically. This is how the corpus is restricted to current-cycle PDFs and key handbooks even when the crawler discovered older material.
-
-Rule shapes:
-- `year_prefix` — URL starts with prefix AND contains `2025` or `2026`
-- `prefix` — URL starts with prefix (no year filter)
-- `exact` — exact URL match (including alternative encodings, e.g. spaces vs `%20`)
-
-```bash
-python -m maryland_rag.scripts.apply_keep_filter --dry-run   # show counts
-python -m maryland_rag.scripts.apply_keep_filter --apply     # mark excluded
-python -m maryland_rag.scripts.apply_keep_filter --revert    # undo
-```
-
-### 10.3 Re-classification (`scripts/reclassify.py`)
+### 10.2 Re-classification (`scripts/reclassify.py`)
 
 Re-applies the current `pass1/rules.py` classifier to all crawled HTML rows using stored metadata (no re-fetching). Use this whenever you change `rules.py`. Crawl-time vs. reclassify-time differ only in that crawl-time has `raw_html` for the structural-pattern fallback; reclassify does not.
 
@@ -867,7 +864,7 @@ python -m maryland_rag.scripts.reclassify --dry-run   # preview transitions
 python -m maryland_rag.scripts.reclassify              # apply
 ```
 
-### 10.4 Verify Chunks (`scripts/verify_chunks.py`)
+### 10.3 Verify Chunks (`scripts/verify_chunks.py`)
 
 Post-ingest verification gate. Exits non-zero on any failure so it can gate a pipeline run. Three checks:
 1. **Coverage** — every `crawl_status='crawled'` page (except `chunking_strategy='skip'`) must have at least one chunk in `chunks.jsonl` (counting both `source_url` and dedup `source_urls`).
@@ -879,11 +876,11 @@ python -m maryland_rag.scripts.verify_chunks
 python -m maryland_rag.scripts.verify_chunks --chunks data/chunks.jsonl --box-chunks data/box_chunks.jsonl
 ```
 
-### 10.5 Audit (`scripts/audit.py`)
+### 10.4 Audit (`scripts/audit.py`)
 
 Backs the `python -m maryland_rag audit` command — see [Section 11](#audit-the-database). Prints the classification/strategy breakdown, exclusion reasons, depth distribution, failed pages, duplicate content, top documents by inbound links, an exclusion-leak check, and the largest `semantic_with_overlap` candidates.
 
-### 10.6 Stress Test (`scripts/stress_test.py`)
+### 10.5 Stress Test (`scripts/stress_test.py`)
 
 See [Section 9.4](#94-stress-testing).
 
@@ -907,32 +904,29 @@ python -m maryland_rag pass1
 # 4. Clean up duplicates (recommended after a fresh crawl)
 python -m maryland_rag.scripts.db_cleanup
 
-# 5. (Optional) narrow corpus to the 2025/2026 keep list
-python -m maryland_rag.scripts.apply_keep_filter --apply
-
-# 6. Chunk the web pages
+# 5. Chunk the web pages
 python -m maryland_rag pass2
 
-# 7. (Optional) auto-download curated Box documents into needtochunk/
+# 6. (Optional) auto-download curated Box documents into needtochunk/
 #    Requires BOX_CLIENT_ID / BOX_CLIENT_SECRET in .env + playwright (Section 6.5)
 python -m box_ingest.automate
 
-# 8. Chunk Box documents (skips any file missing a URL in url_manifest.json)
+# 7. Chunk Box documents (skips any file missing a URL in url_manifest.json)
 python -m box_ingest.ingest
 
-# 9. Verify chunk coverage / junk / DB parity before embedding
+# 8. Verify chunk coverage / junk / DB parity before embedding
 python -m maryland_rag.scripts.verify_chunks
 
-# 10. Embed and upload — web chunks
+# 9. Embed and upload — web chunks
 python -m maryland_rag pass3 --chunks data/chunks.jsonl
 
-# 11. Embed and upload — Box chunks (same table, different input)
+# 10. Embed and upload — Box chunks (same table, different input)
 python -m maryland_rag pass3 --chunks data/box_chunks.jsonl
 
-# 12. Verify vectors are in PostgreSQL:
+# 11. Verify vectors are in PostgreSQL:
 #     psql $DATABASE_URL -c "SELECT count(*) FROM chunks;"
 
-# 13. Start the server
+# 12. Start the server
 uvicorn server.main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -1139,7 +1133,7 @@ Same rationale as `table_rows`: per-row chunks make spreadsheet data independent
 
 | Constant | Default | Description |
 |---|---|---|
-| `SEED_URLS` | curated list | Seed URLs for the BFS crawl (State BoE + MoCo) |
+| `SEED_URLS` | `ALLOWED_EXACT_URLS` | Seed URLs for the BFS crawl (State BoE + MoCo), derived from the allowlist in `exclusions.py` |
 | `DOMAINS` | `elections.maryland.gov`, `mcg.montgomerycountymd.gov` | Domains considered "internal" for link queuing |
 | `MAX_DEPTH` | `6` | Max BFS depth |
 | `MAX_RETRIES` | `3` | Retries for transient page fetches and the robots.txt fetch |
@@ -1171,8 +1165,8 @@ Same rationale as `table_rows`: per-row chunks make spreadsheet data independent
 
 | Constant | Default | Description |
 |---|---|---|
-| `EMBED_MODEL` | `text-embedding-3-small` | OpenAI embedding model |
-| `EMBED_DIM` | `1536` | Vector dimension (must match model) |
+| `EMBED_MODEL` | `text-embedding-3-large` | OpenAI embedding model (also `server/rag_chain.py`) |
+| `EMBED_DIM` | `3072` | Vector dimension (must match model) |
 | `EMBED_BATCH_SIZE` | `100` | Texts per OpenAI call |
 | `INSERT_BATCH_SIZE` | `100` | Rows per commit (each wrapped in a savepoint) |
 | `RETRY_DELAY` | `5` | Base seconds for embedding retry backoff — linear + jitter, 3 attempts |
@@ -1192,11 +1186,13 @@ Validated in `server/config.py` (the first three raise at import time if missing
 | `ELECTION_DATE` | `November 3, 2026` | Date of that election, injected alongside `ELECTION_NAME` |
 | `RETRIEVER_K` | `5` | Number of chunks retrieved per query |
 | `SIMILARITY_FLOOR` | `0.0` | Drop retrieved chunks whose similarity score (1 − cosine distance) is below this value; `0.0` disables the filter |
+| `PAST_ELECTION_URL_PATTERNS` | `/primary_candidates/` | Comma-separated `source_url` substrings marking past-election documents, which get down-weighted at ranking time. Empty disables. |
+| `PAST_ELECTION_PENALTY` | `0.02` | Amount subtracted from a past-election chunk's similarity for ranking only (the floor and logged score stay raw). 0.02 tuned with `eval_retrieval`; ≥0.04 starts hiding answers to questions about the primary. `0` disables. |
 | `CANDIDATES_URL` | 2026 primary candidates page | URL returned verbatim for `candidates`-classified queries — repoint at the general-election page once the State Board publishes it |
 | `SESSION_TTL_MINUTES` | `30` | Session expiration |
 | `MAX_HISTORY_TURNS` | `20` | Max conversation turns kept per user |
 | `RATE_LIMIT_PER_MINUTE` | `20` | Per-`user_id` sliding-window request limit |
-| `RATE_LIMIT_GLOBAL_PER_MINUTE` | `90` | Request cap per minute across **all** users combined (`/chat` + `/reset`) — backstop for `RATE_LIMIT_PER_MINUTE`, which rotating `user_id`s can bypass |
+| `RATE_LIMIT_GLOBAL_PER_MINUTE` | `225` | Request cap per minute across **all** users combined (`/chat` + `/reset`) — backstop for `RATE_LIMIT_PER_MINUTE`, which rotating `user_id`s can bypass |
 
 Read elsewhere at runtime (not in `config.py`):
 
@@ -1242,7 +1238,7 @@ Fully resumable — just rerun `python -m maryland_rag pass1`. It picks up from 
 All three extraction tiers are tried before failing. If all fail, the error is logged and the batch continues. Check the URL manually — the PDF may be password-protected or corrupted.
 
 **Pass 3: "Dimension mismatch" from pgvector**
-The `chunks` table was created with a different vector dimension than 1,536. Drop and recreate the table (`DROP TABLE chunks;`) and re-run Pass 3, or adjust `EMBED_DIM` in `embed.py`.
+The `chunks` table was created with a different vector dimension than `EMBED_DIM` (3,072). Pass 3 checks this at startup and stops with a `RuntimeError` naming both dimensions. Back up the table (`pg_dump -Fc -t chunks`), `DROP TABLE chunks;`, and re-run Pass 3 for both `chunks.jsonl` and `box_chunks.jsonl`. Then run `python -m server.eval_retrieval` and restart the server so query embeddings use the same model.
 
 **Pass 3: persistent rate limit errors from OpenAI**
 The code batches and retries. If limits persist, reduce `EMBED_BATCH_SIZE` in `embed.py`.
@@ -1260,7 +1256,7 @@ A previous run didn't exit cleanly. Kill any running `python -m maryland_rag` pr
 Missing or wrong `X-API-Key` header. Confirm `VIOLETS_API_KEY` is set in `.env` and that your client is sending it as `X-API-Key`.
 
 **Server returns 429**
-A single `user_id` exceeded `RATE_LIMIT_PER_MINUTE`. Either back off or raise the limit.
+A single `user_id` exceeded `RATE_LIMIT_PER_MINUTE`, or all traffic combined exceeded `RATE_LIMIT_GLOBAL_PER_MINUTE` (the log line says which: `Rate limit exceeded` vs `Global rate limit exceeded`). Either back off or raise the limit.
 
 **Browser CORS error**
 Your origin isn't in `CORS_ORIGINS`. Set it explicitly at startup (comma-separated for multiple).
@@ -1295,7 +1291,6 @@ Project-specific terms and non-obvious library names only.
 | **Box automate** | `box_ingest.automate` — Step 1 of the Box pipeline: OAuth into Box, scrape the Hub (Playwright), download `include` files into `needtochunk/`, and update `url_manifest.json`. Separate from `box_ingest.ingest` (Step 2, chunking). |
 | **verify_chunks** | Post-ingest gate (`scripts/verify_chunks.py`) checking per-page coverage, junk heuristics, and JSONL-vs-pgvector parity; exits non-zero on failure. |
 | **allowlist** | Two-layer URL gate in `pass1/exclusions.py`: prefix list + exact list. Crawler will not enqueue anything failing the allowlist. |
-| **keep filter** | Curated 2025–2026 keep list applied via `apply_keep_filter` — narrows the crawl down to current-cycle materials by marking everything else `excluded`. |
 | **trafilatura** | Library that extracts clean article text from HTML, removing nav, footers, boilerplate. Primary HTML extractor in Pass 1. |
 | **pdfplumber** | Primary digital-PDF extractor in Pass 2 (text + tables). |
 | **nav_hub** | Pages 150–499 words that are primarily lists of links — treated as navigation, kept as a single chunk so the link set stays together. |

@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS pages (
     parent_url              TEXT,
     title                   TEXT,
     section_hierarchy       TEXT,           -- JSON array e.g. ["Voting", "Register", "FAQ"]
-    content_type            TEXT,           -- 'html', 'pdf', 'docx', 'xls', 'csv'
+    content_type            TEXT,           -- 'html', 'pdf', 'docx', 'xls', 'xlsx', 'csv'
     page_classification     TEXT,           -- 'faq', 'prose', 'table_data', 'form', 'press_release', 'short_static', 'document'
     chunking_strategy       TEXT,           -- 'qa_pairs', 'semantic_with_overlap', 'simple_split', 'ingest_as_single', 'document_extraction', 'skip'
     classification_confidence TEXT,         -- 'high', 'medium', 'low'

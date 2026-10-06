@@ -79,8 +79,13 @@ def get_content_type(url: str) -> str:
             # Legacy OLE format — python-docx cannot parse it, so it must
             # never be labeled 'docx'. Excluded from crawling in exclusions.py.
             return 'doc'
-        if ext in ('.xls', '.xlsx'):
+        # .xlsx is an OOXML zip, not the legacy OLE .xls container: pass2
+        # picks the payload magic check and the reader from this label, so
+        # lumping them together rejects every valid .xlsx as corrupt.
+        if ext == '.xls':
             return 'xls'
+        if ext == '.xlsx':
+            return 'xlsx'
         if ext == '.csv':
             return 'csv'
     except Exception:

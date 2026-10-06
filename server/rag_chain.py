@@ -13,6 +13,7 @@ import logging
 import re
 from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from pydantic import ConfigDict
 
@@ -33,6 +34,19 @@ from .rag_logger import LOG_QUERIES
 from .timing import stage
 
 logger = logging.getLogger(__name__)
+
+# Must match maryland_rag/pass3/embed.py EMBED_MODEL — query and chunk vectors
+# have to come from the same model.
+EMBED_MODEL = "text-embedding-3-large"
+
+_MARYLAND_TZ = ZoneInfo("America/New_York")
+
+# LIKE patterns for config.PAST_ELECTION_URL_PATTERNS. LIKE wildcards in the
+# configured substrings are escaped so they match literally.
+_PAST_ELECTION_LIKE = [
+    "%" + re.sub(r"([%_\\])", r"\\\1", p) + "%"
+    for p in config.PAST_ELECTION_URL_PATTERNS
+]
 
 # ---------------------------------------------------------------------------
 # Prompt templates
@@ -213,15 +227,24 @@ class PgVectorRetriever(BaseRetriever):
                 # connection indefinitely. SET LOCAL applies within the implicit
                 # transaction of this (non-autocommit) connection.
                 await conn.execute("SET LOCAL statement_timeout = '30s'")
+                # Past-election chunks rank as if PAST_ELECTION_PENALTY less
+                # similar (see config); the returned score stays raw.
                 cur = await conn.execute(
                     """
                     SELECT chunk_id, text, source_url, title, metadata,
-                           1 - (embedding <=> %s::vector) AS score
+                           1 - (embedding <=> %(q)s::vector) AS score
                     FROM chunks
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s
+                    ORDER BY (embedding <=> %(q)s::vector)
+                             + CASE WHEN source_url LIKE ANY(%(past)s)
+                                    THEN %(penalty)s ELSE 0 END
+                    LIMIT %(k)s
                     """,
-                    (query_embedding, query_embedding, self.k),
+                    {
+                        "q": query_embedding,
+                        "past": _PAST_ELECTION_LIKE,
+                        "penalty": config.PAST_ELECTION_PENALTY,
+                        "k": self.k,
+                    },
                 )
                 rows = await cur.fetchall()
 
@@ -403,7 +426,7 @@ def _replace_source_refs(answer: str, sources: list[dict]) -> str:
 def build_chain(pool):
     """Build and return the full RAG chain. Called once at server startup."""
     embeddings = OpenAIEmbeddings(
-        model="text-embedding-3-small",
+        model=EMBED_MODEL,
         openai_api_key=config.OPENAI_API_KEY,
         base_url=config.OPENAI_BASE_URL,
     )
@@ -496,7 +519,9 @@ def build_chain(pool):
         # Step 4: generate answer with citations. Concerns queries use the
         # Rumor Control system prompt; everything else uses the standard QA prompt.
         # Both prompts carry the election/date context, so fill in today's date.
-        now = datetime.now()
+        # Maryland time, not the host's: Ubuntu servers default to UTC, which
+        # rolls the date over at 7-8pm ET (Election Day evening included).
+        now = datetime.now(_MARYLAND_TZ)
         current_date = f"{now:%B} {now.day}, {now.year}"
         if query_category == "concerns":
             logger.debug("Concerns query — using Rumor Control system prompt")

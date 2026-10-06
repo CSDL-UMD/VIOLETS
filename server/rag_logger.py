@@ -84,6 +84,11 @@ def _estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> fl
 # Callback handler
 # ---------------------------------------------------------------------------
 
+# Start entries older than this are orphans (no end/error callback will come):
+# well past RAG_CHAIN_TIMEOUT, so no live call is ever pruned.
+_ORPHAN_TTL_SECONDS = 600
+
+
 class RAGCallbackHandler(BaseCallbackHandler):
     """
     Logs every LLM call the chain makes:
@@ -123,6 +128,7 @@ class RAGCallbackHandler(BaseCallbackHandler):
         )
         key = str(run_id)
         with self._lock:
+            self._prune_orphans()
             self._llm_starts[key] = (time.time(), model)
 
         if LOG_PROMPTS:
@@ -151,6 +157,7 @@ class RAGCallbackHandler(BaseCallbackHandler):
         )
         key = str(run_id)
         with self._lock:
+            self._prune_orphans()
             self._llm_starts[key] = (time.time(), model)
 
         if LOG_PROMPTS:
@@ -225,6 +232,7 @@ class RAGCallbackHandler(BaseCallbackHandler):
     ) -> None:
         key = str(run_id)
         with self._lock:
+            self._prune_orphans()
             self._ret_starts[key] = time.time()
         # Raw query is user content — only log it when LOG_QUERIES is enabled,
         # matching log_request(). Otherwise log its length. DEBUG either way.
@@ -246,6 +254,29 @@ class RAGCallbackHandler(BaseCallbackHandler):
             "RETRIEVER END [run=%s] (%.2fs): %d docs",
             key[:8], elapsed, len(documents),
         )
+
+    def on_retriever_error(
+        self,
+        error: BaseException,
+        *,
+        run_id: UUID,
+        **kwargs: Any,
+    ) -> None:
+        with self._lock:
+            self._ret_starts.pop(str(run_id), None)
+
+    def _prune_orphans(self) -> None:
+        """Drop start entries whose end/error callback never fired.
+
+        A call cancelled by asyncio.wait_for (RAG_CHAIN_TIMEOUT) raises
+        CancelledError, which LangChain's retriever does not report, so its
+        start entry would otherwise stay in the dict for the process lifetime.
+        Caller must hold self._lock.
+        """
+        cutoff = time.time() - _ORPHAN_TTL_SECONDS
+        for d, start_of in ((self._llm_starts, lambda v: v[0]), (self._ret_starts, lambda v: v)):
+            for k in [k for k, v in d.items() if start_of(v) < cutoff]:
+                del d[k]
 
 
 # ---------------------------------------------------------------------------

@@ -56,6 +56,16 @@ PRESS_SIGNALS = [
     'rumor_control', 'dis-misinformation',
 ]
 
+# Pages crawled only for their links: the content is a list of
+# "January (PDF) | February (PDF) …" links or the site menu, which crowds real
+# answers out of retrieval. They stay crawled (so new monthly reports are still
+# discovered through them) but produce no chunks. Added 2026-10-05.
+LINK_INDEX_PATHS = [
+    '/voter_registration/stats.html',
+    '/voter_registration/archive_bydistricts.html',
+    '/voter_registration/data_form.html',
+]
+
 # URL path substrings that indicate an actual online form (not a page that
 # happens to mention forms).
 FORM_URL_PATHS = [
@@ -162,6 +172,10 @@ def _classify(
     # 1. Junk (Cloudflare stubs)
     if 'cdn-cgi' in url_lower:
         return 'junk', 'skip', 'high'
+
+    # 1b. Link-only index pages — crawl for links, never chunk
+    if path in LINK_INDEX_PATHS:
+        return 'nav_hub', 'skip', 'high'
 
     # 2. FAQ — keyword in url/title OR known FAQ path (never page text,
     # which false-matches on sidebar boilerplate)

@@ -112,17 +112,28 @@ def _extract_with_pdfplumber(path: str) -> dict | None:
         tables = []
         full_text_parts = []
 
+        column_pages = _two_column_page_texts(path)
         with pdfplumber.open(path) as pdf:
             for i, page in enumerate(pdf.pages):
-                # Extract text
-                text = page.extract_text() or ''
+                # Extract text. pdfplumber reads line-by-line across the
+                # full page width, which interleaves side-by-side columns
+                # (one county's early-voting center next to another
+                # county's address); two-column pages use the
+                # column-ordered text instead.
+                text = column_pages.get(i) or page.extract_text() or ''
                 pages.append({'page_num': i + 1, 'text': text})
                 full_text_parts.append(text)
 
                 # Extract tables
                 page_tables = page.extract_tables()
                 for t_idx, table_data in enumerate(page_tables):
-                    if table_data and len(table_data) > 1:
+                    # A "table" with at most one non-empty cell per row is
+                    # prose inside ruled borders/boxes (charter amendment
+                    # texts, letterhead press releases), not tabular data.
+                    # Keeping it routed the PDF to table_heavy and emitted
+                    # every text line as its own row chunk (the Howard
+                    # County charter text produced 448 ~36-word fragments).
+                    if table_data and len(table_data) > 1 and _is_multi_column(table_data):
                         tables.append({
                             'page_num': i + 1,
                             'table_index': t_idx,
@@ -142,6 +153,77 @@ def _extract_with_pdfplumber(path: str) -> dict | None:
     except Exception as exc:
         logger.warning("pdfplumber extraction failed: %s", exc)
         return None
+
+
+# Two-column page detection (fractions of page width). Text blocks starting
+# left of _COL_SPLIT are the left column; a block at least _FULL_WIDTH wide
+# spans both columns (title, intro paragraph) and separates column bands.
+_COL_SPLIT = 0.40
+_FULL_WIDTH = 0.55
+
+
+def _is_two_column_page(blocks: list, width: float) -> bool:
+    """True when the page body is two side-by-side text columns: at least
+    three narrow blocks start in the left third and at least three start
+    just right of center, vertically overlapping. Blocks starting anywhere
+    else mean a multi-column table, whose row-wise reading order must be
+    kept, so those pages are left alone."""
+    narrow = [b for b in blocks if (b[2] - b[0]) < _FULL_WIDTH * width]
+    left = [b for b in narrow if b[0] < 0.30 * width]
+    right = [b for b in narrow if _COL_SPLIT * width <= b[0] < 0.65 * width]
+    other = [b for b in narrow
+             if 0.30 * width <= b[0] < _COL_SPLIT * width or b[0] >= 0.65 * width]
+    if len(left) < 3 or len(right) < 3 or len(other) > max(2, 0.2 * len(narrow)):
+        return False
+    overlapping = sum(
+        1 for r in right if any(l[1] < r[3] and r[1] < l[3] for l in left)
+    )
+    return overlapping >= 3
+
+
+def _column_ordered_text(blocks: list, width: float) -> str:
+    """Page text with each column read top-to-bottom, left column first.
+    Full-width blocks are emitted in place and split the page into bands,
+    so a heading above the columns stays above them."""
+    out, band = [], []
+
+    def flush():
+        left = [b for b in band if b[0] < _COL_SPLIT * width]
+        right = [b for b in band if b[0] >= _COL_SPLIT * width]
+        for col in (left, right):
+            out.extend(b[4].strip() for b in sorted(col, key=lambda b: b[1]))
+        band.clear()
+
+    for b in sorted(blocks, key=lambda b: (b[1], b[0])):
+        if (b[2] - b[0]) >= _FULL_WIDTH * width:
+            flush()
+            out.append(b[4].strip())
+        else:
+            band.append(b)
+    flush()
+    return '\n'.join(out)
+
+
+def _two_column_page_texts(path: str) -> dict[int, str]:
+    """{page_index: column-ordered text} for the PDF's two-column pages.
+    Uses pymupdf text blocks (one block = one paragraph/address within a
+    column). Empty when pymupdf is unavailable or the PDF can't be read."""
+    try:
+        import fitz  # pymupdf
+    except ImportError:
+        return {}
+    texts = {}
+    try:
+        with fitz.open(path) as doc:
+            for i, page in enumerate(doc):
+                blocks = [b for b in page.get_text("blocks")
+                          if b[6] == 0 and b[4].strip()]
+                if _is_two_column_page(blocks, page.rect.width):
+                    texts[i] = _column_ordered_text(blocks, page.rect.width)
+    except Exception as exc:
+        logger.warning("two-column detection failed for %s: %s", path, exc)
+        return {}
+    return texts
 
 
 def _extract_with_pymupdf(path: str) -> dict | None:
@@ -218,6 +300,14 @@ def _extract_with_ocr(path: str) -> dict:
     except Exception as exc:
         logger.error("OCR extraction failed: %s", exc)
         return {'text': '', 'pages': [], 'tables': [], 'structure_type': 'ocr_failed'}
+
+
+def _is_multi_column(table_data: list) -> bool:
+    """True when some row of the table has at least two non-empty cells."""
+    return any(
+        sum(1 for cell in row if cell and str(cell).strip()) >= 2
+        for row in table_data
+    )
 
 
 def _detect_pdf_structure(text: str, tables: list) -> str:

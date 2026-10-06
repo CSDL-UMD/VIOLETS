@@ -1,11 +1,17 @@
-fastapi>=0.115
-uvicorn[standard]>=0.34
-pydantic>=2.0
-langchain>=0.3
-langchain-openai>=0.3
-python-dotenv>=1.0
-psycopg[binary]>=3.1
-psycopg-pool>=3.1
-pgvector>=0.3
-presidio-analyzer>=2.2.0
-spacy>=3.0.0
+# Pinned to the versions tested in the dev venv (Python 3.14, 2026-10-05).
+# Upgrade deliberately: bump, re-run stress_test + eval_guardrails, then commit.
+fastapi==0.135.1
+uvicorn[standard]==0.41.0
+pydantic==2.12.5
+langchain==1.2.11
+langchain-core==1.2.18
+langchain-openai==1.1.11
+openai==2.26.0
+python-dotenv==1.2.2
+psycopg[binary]==3.3.4
+psycopg-pool==3.3.1
+pgvector==0.4.2
+presidio-analyzer==2.2.359
+spacy==3.8.13
+# Presidio's NLP model. Installing it here avoids a ~400MB download on first boot.
+en_core_web_lg @ https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.8.0/en_core_web_lg-3.8.0-py3-none-any.whl

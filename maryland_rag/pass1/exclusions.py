@@ -8,7 +8,7 @@ Two-layer filtering:
 Both layers must pass for a URL to be crawled.
 """
 import re
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 # ---------------------------------------------------------------------------
 # Layer 1 — Allowlist
@@ -25,8 +25,10 @@ ALLOWED_URL_PREFIXES = [
     "https://elections.maryland.gov/elections/2026/",
 ]
 
-# Exact URLs that are in scope
-ALLOWED_EXACT_URLS = {
+# Exact URLs that are in scope. These are also the crawl's seed URLs
+# (config.SEED_URLS is derived from this tuple, in this order), so a page
+# added here is both allowed and crawled — there is no second list to update.
+ALLOWED_EXACT_URLS = (
     # State BoE exact pages
     "https://elections.maryland.gov/voting/index.html",
     "https://elections.maryland.gov/voter_registration/index.html",
@@ -47,11 +49,29 @@ ALLOWED_EXACT_URLS = {
     "https://mcg.montgomerycountymd.gov/elections/vote-by-mail.html",
     "https://mcg.montgomerycountymd.gov/Elections/Accessibility/voting-assistance.html",
     "https://mcg.montgomerycountymd.gov/Elections/EarlyVoting/EarlyVotingCenters.html",
-}
+    # Standalone State BoE documents outside the prefixes above, kept after a
+    # 2026-10-05 review of the Feb 2026 whole-site crawl (the other 27
+    # documents from that crawl were excluded as outdated). Listing them here
+    # seeds them, so every crawl re-checks they still exist.
+    "https://elections.maryland.gov/pdf/Challenger_and_Watchers_Manual.pdf",
+    # about/Signed Board Bylaws.pdf removed 2026-10-05: the Box corpus has the
+    # newer signed version (Feb 2025, adds §4.7); indexing both would give the
+    # chatbot two conflicting bylaws.
+    "https://elections.maryland.gov/press_room/Voter%20Registration%20Security%20Talking%20Points.pdf",
+    "https://elections.maryland.gov/get_involved/Election_Judge_Application.pdf",
+    "https://elections.maryland.gov/laws_and_regs/documents/Misc-c_SBE Policy 2025-01 Line Management.pdf",
+    # Filename says 2023-01 List Maintenance; contents are SBE Policy 2025-02
+    # (removing deceased voters from the rolls).
+    "https://elections.maryland.gov/laws_and_regs/documents/Misc-b_SBE Policy 2023-01 List Maintenance Updated Policy.pdf",
+    "https://elections.maryland.gov/press_room/documents/Maryland's Blank Ballot Procedures.pdf",
+    "https://elections.maryland.gov/pdf/Request_for_Accessible_Polling_Place.pdf",
+)
 
-# Lowercase copies for case-insensitive matching
-_ALLOWED_EXACT_LOWER = {u.lower() for u in ALLOWED_EXACT_URLS}
-_ALLOWED_PREFIXES_LOWER = [p.lower() for p in ALLOWED_URL_PREFIXES]
+# Lowercase, percent-decoded copies: both sites serve paths
+# case-insensitively, and the server redirects a literal-space URL
+# ("Signed Board Bylaws.pdf") to its %20 form — both spellings must match.
+_ALLOWED_EXACT_LOWER = {unquote(u).lower() for u in ALLOWED_EXACT_URLS}
+_ALLOWED_PREFIXES_LOWER = [unquote(p).lower() for p in ALLOWED_URL_PREFIXES]
 
 # ---------------------------------------------------------------------------
 # Layer 2 — Exclusions (applied within the allowlisted scope)
@@ -72,6 +92,24 @@ EXCLUDED_PATH_PATTERNS = [
      "2026 bulk results detail pages — raw data out of scope"),
     (r'/elections/2026/(primary|general)_ballots/',
      "2026 per-county sample ballot books — raw data out of scope"),
+    # Precinct-count tables (any election): raw numbers no participant asks
+    # for, which crowd real answers out of the top retrieval results.
+    (r'/elections/2026/number_of_precincts',
+     "precinct count tables — raw data out of scope"),
+    # Statewide precinct reference spreadsheets (GP26 = 2026 Gubernatorial
+    # Primary): ~7,400 rows of per-precinct, per-party voter counts — raw
+    # bulk data, far over the pass2 row guardrail. Same class as the
+    # precinct-count tables above.
+    (r'/elections/2026/g[pg]\d\d_state_precinct_reference',
+     "precinct reference spreadsheet — raw bulk data out of scope"),
+    # Bulk candidate-list CSVs (statewide / all-counties / house of
+    # delegates): every candidate in them is already indexed via the
+    # chunked HTML candidate lists (verified 100% name coverage 2026-10-05)
+    # and they exceed the pass2 row guardrail, so they only ever produced
+    # zero-chunk warnings. The small per-office CSVs stay in.
+    (r'/elections/2026/(primary|general)_candidates/[^/]*_'
+     r'(statewide|all_counties|houseofdelegatesbydistrict)_candidatelist\.csv$',
+     "bulk candidate CSV — duplicate of the indexed HTML candidate list"),
     (r'/elections/\d{4}_special/',           "Past special election results"),
     (r'/elections/special_elections\.html',  "Legacy special elections page"),
     (r'/elections/presidential',             "Historical presidential data"),
@@ -146,6 +184,11 @@ EXCLUDED_PATH_PATTERNS = [
      "dead URL — removed from site (soft-404)"),
     (r'/voter_registration/documents/english_internet_vra\.pdf$',
      "dead URL — removed from site (soft-404)"),
+    # 2020-cycle registration statistics (PG20 / weekly snapshots). The one
+    # copy still linked under /voter_registration/ soft-404s (HTML served
+    # for the .xlsx). Confirmed 2026-10-05.
+    (r'/2020_stats/',
+     "2020 registration statistics — too old / dead URL"),
 ]
 
 # Pre-compile patterns for performance
@@ -185,7 +228,7 @@ SKIP_EXTENSIONS = {
 
 def is_allowlisted(url: str) -> bool:
     """Return True if the URL is permitted by the allowlist."""
-    url_lower = url.lower()
+    url_lower = unquote(url).lower()
     if url_lower in _ALLOWED_EXACT_LOWER:
         return True
     return any(url_lower.startswith(p) for p in _ALLOWED_PREFIXES_LOWER)
@@ -211,15 +254,7 @@ def should_exclude(url: str) -> tuple[bool, str | None]:
 def matches_exclusion_rules(url: str) -> tuple[bool, str | None]:
     """
     Layer 2 ONLY: exclusion path patterns + extension/scheme checks, without
-    the Layer-1 allowlist gate.
-
-    Used by the crawler's retroactive exclusion pass over EXISTING manifest
-    rows: those rows already passed whatever scope decision was in force
-    when they were crawled (including the keep_filter_2026 grandfathering of
-    document rows that sit outside the link-follow allowlist), so re-running
-    the allowlist gate against them would wrongly flip deliberately-kept
-    content. New junk/translation rules land in this layer and DO need to
-    apply retroactively.
+    the Layer-1 allowlist gate. should_exclude() runs this after the allowlist.
     """
     parsed = urlparse(url)
     path = parsed.path

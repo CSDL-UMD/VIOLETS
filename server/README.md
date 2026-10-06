@@ -37,6 +37,7 @@ run as a single worker**.
 | `metrics.py` | Thread-safe in-process counters (`METRICS`) feeding the heartbeat line. No HTTP surface. |
 | `session.py` | Thread-safe in-memory per-`user_id` history with TTL + max-turn cap, plus a cache of the latest retrieval turn's sources (for link follow-ups). |
 | `eval_guardrails.py` | Offline eval: does `reasoning_effort="minimal"` match `"medium"` on labeled fixtures? `python -m server.eval_guardrails` (makes real OpenAI calls). |
+| `eval_retrieval.py` | Offline eval: scores the production retriever against `retrieval_benchmark.json` (49 hand-labeled questions; gold = URL substring + text regex, so it survives re-ingest). Reports hit@1 / hit@K / MRR@10 / P@K. `python -m server.eval_retrieval [-v]`. |
 | `requirements.txt` | Server dependencies. |
 
 ## Guardrails fail *closed*
@@ -59,4 +60,6 @@ full env-var table (`LLM_MODEL`, `RETRIEVER_K`, `CORS_ORIGINS`, `LOG_LEVEL`,
 | `ELECTION_NAME` | `2026 Maryland Gubernatorial General Election` | Election named in the QA/concerns system prompts (with today's date) so deadlines are anchored to the right election. |
 | `ELECTION_DATE` | `November 3, 2026` | Date of that election, injected alongside `ELECTION_NAME`. |
 | `SIMILARITY_FLOOR` | `0.0` | Drop retrieved chunks whose similarity score (1 − cosine distance) is below this value. `0.0` disables the filter. |
+| `PAST_ELECTION_URL_PATTERNS` | `/primary_candidates/` | Comma-separated `source_url` substrings marking past-election documents, which get down-weighted at ranking time. Empty disables. |
+| `PAST_ELECTION_PENALTY` | `0.02` | Amount subtracted from a past-election chunk's similarity for ranking only (the floor and logged score stay raw). 0.02 tuned with `eval_retrieval`; ≥0.04 starts hiding answers to questions about the primary. `0` disables. |
 | `CANDIDATES_URL` | 2026 primary candidates page | URL returned verbatim for `candidates`-classified queries. **Set this to the general-election candidates page once the State Board publishes it** — the crawl has no such page yet, so the default still points at the primary. |

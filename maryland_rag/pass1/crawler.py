@@ -43,7 +43,6 @@ from .extractor import extract_page
 from .classifier import classify_page
 from .exclusions import (
     should_exclude,
-    matches_exclusion_rules,
     is_excluded_status,
     TRANSIENT_HTTP_STATUSES,
 )
@@ -191,17 +190,19 @@ def apply_retroactive_exclusions(db: DB) -> int:
     rows to 'excluded' with the rule's reason. Idempotent: already-excluded
     rows are not re-examined, and a row is only ever updated once per run.
 
-    Deliberately uses matches_exclusion_rules(), NOT should_exclude(): the
-    allowlist gate must not be re-run against existing rows — the manifest
-    holds ~100 deliberately-kept document rows (keep_filter_2026) that sit
-    outside the link-follow allowlist and would be wrongly flipped.
+    Uses the full should_exclude() check, allowlist included, so the
+    allowlist is the single authority over what stays in the corpus: removing
+    a URL from it (or from the exclusion rules) also drops an already-crawled
+    row. Until 2026-10-05 this pass skipped the allowlist to preserve 35
+    documents kept from the Feb 2026 whole-site crawl; those were reviewed,
+    and the 8 worth keeping were added to ALLOWED_EXACT_URLS.
     """
     rows = db.conn.execute(
         "SELECT url FROM pages WHERE crawl_status IN ('crawled', 'failed')"
     ).fetchall()
     flipped = 0
     for row in rows:
-        excluded, reason = matches_exclusion_rules(row['url'])
+        excluded, reason = should_exclude(row['url'])
         if excluded:
             logger.info("RETRO-EXCLUDED [%s]: %s", reason, row['url'])
             db.update_status(row['url'], 'excluded', reason=reason)
@@ -293,6 +294,11 @@ def run_crawl(resume: bool = True):
 
     rate_monitor = RateMonitor(REQUESTS_PER_MINUTE_WARN)
     pages_crawled = 0
+    # Exact (case-preserved) URLs fetched this run, and how many fetches
+    # failed in a way that may have hidden child links — both feed the
+    # end-of-run sweep of rows this crawl never reached.
+    fetched_exact: set[str] = set()
+    fetch_failures = 0
 
     while queue:
         url, parent_url, depth = queue.popleft()
@@ -323,6 +329,7 @@ def run_crawl(resume: bool = True):
             continue
 
         visited.add(url.lower())
+        fetched_exact.add(url)
         logger.info("[depth=%d] Crawling: %s", depth, url)
 
         try:
@@ -330,6 +337,7 @@ def run_crawl(resume: bool = True):
 
             if result is None:
                 # Network-level failure that survived all retries
+                fetch_failures += 1
                 _mark_failure_preserving_crawled(db, url, "Network failure after retries")
                 continue
 
@@ -340,6 +348,7 @@ def run_crawl(resume: bool = True):
             # never persist the error body as page content
             if http_status >= 500 or http_status in TRANSIENT_HTTP_STATUSES:
                 logger.info("HTTP %d after retries: %s", http_status, url)
+                fetch_failures += 1
                 _mark_failure_preserving_crawled(db, url, f"HTTP {http_status} after retries")
                 continue
 
@@ -438,6 +447,7 @@ def run_crawl(resume: bool = True):
 
         except Exception as exc:
             logger.error("Exception on %s: %s", url, exc, exc_info=True)
+            fetch_failures += 1
             # Same no-demotion rule as fetch failures: an unexpected bug
             # (classifier, sqlite write, link parsing) while re-processing a
             # previously-crawled page must not flip its row to 'failed' —
@@ -449,10 +459,63 @@ def run_crawl(resume: bool = True):
         finally:
             time.sleep(RATE_LIMIT_SECONDS)
 
+    # A fresh crawl is the authority on what the site currently links to.
+    # (A resumed crawl only covers the pending tail, so it must not sweep.)
+    if not pending:
+        _sweep_unreached_rows(db, fetched_exact, visited, fetch_failures)
+
     # --- Finalize ---
     db.finalize_run(run_id)
     logger.info("Pass 1 complete. Pages crawled: %d", pages_crawled)
     db.close()
+
+
+def _sweep_unreached_rows(db: DB, fetched_exact: set[str],
+                          visited: set[str], fetch_failures: int) -> None:
+    """
+    Exclude 'crawled' rows that a completed fresh crawl did not fetch, so
+    Pass 2 never chunks stale cached content for them:
+
+      - case-variant duplicates: a different casing of the same URL was
+        fetched this run (both sites serve paths case-insensitively, but
+        manifest rows are keyed case-sensitively, so a seed or link that
+        changed casing leaves the old row behind with old content);
+      - orphans: no in-scope page links to the URL any more, i.e. the site
+        stopped publishing it.
+
+    Exclusion is not sticky: if a later crawl discovers a link to the URL
+    again, it is re-queued and its row returns to 'crawled'. Orphans are
+    only swept when every fetch succeeded — a hub page that failed
+    transiently would otherwise orphan all of its children for a run.
+    """
+    rows = db.conn.execute(
+        "SELECT url FROM pages WHERE crawl_status = 'crawled'"
+    ).fetchall()
+    dupes, orphans = [], []
+    for row in rows:
+        url = row['url']
+        if url in fetched_exact:
+            continue
+        (dupes if url.lower() in visited else orphans).append(url)
+
+    for url in dupes:
+        logger.warning("CASE-DUPLICATE row excluded (another casing was crawled): %s", url)
+        db.update_status(url, 'excluded',
+                         reason="case-variant duplicate of a page crawled this run")
+
+    if orphans and fetch_failures:
+        logger.warning(
+            "%d crawled row(s) were not reached this run, but %d fetch(es) "
+            "failed — keeping them rather than risk excluding children of a "
+            "page that failed transiently:", len(orphans), fetch_failures,
+        )
+        for url in orphans:
+            logger.warning("  unreached (kept): %s", url)
+        return
+    for url in orphans:
+        logger.warning("ORPHANED row excluded (no longer linked from the site): %s", url)
+        db.update_status(url, 'excluded',
+                         reason="not linked from the site in the latest crawl")
 
 
 def _save_raw_html(url: str, html: str):

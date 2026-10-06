@@ -48,6 +48,12 @@ INCLUDE_TERMS = [
     "baltimorecity",        # "BaltimoreCity.pdf" — official Waxter Center polling place change notice (image-only, needs OCR)
     "potomac heights",      # Washington Co. precincts 18002/18004 polling place move (filename says "Letter")
     "doj_response",         # SBE's official NVRA/HAVA list-maintenance compliance response to DOJ
+    # Manual triage of REVIEW files (2026-10-05):
+    "drop box",             # county drop-box location changes (Carroll GG26)
+    "prediction markets",   # Policy 2026-02: staff barred from election prediction markets
+    "board by-laws",        # signed SBE bylaws (Feb 2025, adds §4.7) — supersedes the site's 2024 PDF.
+                            # Hyphenated on purpose: "bylaws" stays in EXCLUDE_TERMS for the Howard
+                            # County board's bylaws-amendment correspondence.
 ]
 
 EXCLUDE_TERMS = [

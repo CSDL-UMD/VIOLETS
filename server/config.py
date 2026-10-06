@@ -75,6 +75,19 @@ RETRIEVER_K: int = int(os.environ.get("RETRIEVER_K", "5"))
 # Minimum similarity score (1 - cosine distance) a retrieved chunk must meet.
 # 0.0 (default) disables the floor and keeps every retrieved chunk.
 SIMILARITY_FLOOR: float = float(os.environ.get("SIMILARITY_FLOOR", "0.0"))
+# Down-weight chunks from past-election documents so they lose close calls to
+# current-election ones but still surface when clearly the best match (e.g.
+# "who ran in the primary?"). PAST_ELECTION_PENALTY is subtracted from the
+# similarity score for ranking only — the floor and logged score stay raw.
+# Patterns are comma-separated source_url substrings. 0.02 tuned on
+# server/eval_retrieval.py (2026-10-06): fixes current-candidate questions with
+# no general regressions; >=0.04 starts hiding primary answers entirely.
+PAST_ELECTION_URL_PATTERNS: list[str] = [
+    p.strip() for p in os.environ.get(
+        "PAST_ELECTION_URL_PATTERNS", "/primary_candidates/"
+    ).split(",") if p.strip()
+]
+PAST_ELECTION_PENALTY: float = float(os.environ.get("PAST_ELECTION_PENALTY", "0.02"))
 
 # Hardcoded candidates redirect URL (middleware.py). Defaults to the 2026
 # primary candidates page — the crawl contains no general-election candidates
@@ -92,4 +105,4 @@ MAX_HISTORY_TURNS: int = int(os.environ.get("MAX_HISTORY_TURNS", "20"))
 RATE_LIMIT_PER_MINUTE: int = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "20"))
 # Global backstop across all users combined — the per-user limit is keyed on
 # the client-supplied user_id and can be bypassed by rotating ids.
-RATE_LIMIT_GLOBAL_PER_MINUTE: int = int(os.environ.get("RATE_LIMIT_GLOBAL_PER_MINUTE", "90"))
+RATE_LIMIT_GLOBAL_PER_MINUTE: int = int(os.environ.get("RATE_LIMIT_GLOBAL_PER_MINUTE", "225"))

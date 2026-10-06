@@ -6,7 +6,7 @@ FastAPI server for the VIOLETS Election Chatbot.
 MIDDLEWARE PIPELINE (inside /chat, in order):
 ---------------------------------------------
     [1] detect_pii()                — Presidio, 0 tokens
-    [2] classify_query()            — small LLM, ~70 tokens
+    [2] classify_query()            — small LLM, sees last 2 exchanges
     [3] Main RAG chain              — only if [1] and [2] pass
     [4] check_partisan_response()   — small LLM, ~100 tokens
 
@@ -49,7 +49,7 @@ import hmac
 import logging
 import os
 import time
-from collections import defaultdict
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from threading import Lock
 
@@ -92,11 +92,34 @@ RAG_CHAIN_TIMEOUT = 60  # seconds
 _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
+# Failed-auth logging is throttled: unauthenticated callers are unlimited, so
+# logging every 401 would let a scanner rotate real entries out of the 50MB log.
+_AUTH_LOG_INTERVAL = 60  # seconds
+_auth_fail_last_logged = float("-inf")
+_auth_fail_suppressed = 0
+_auth_fail_interval_count = 0  # drained by the heartbeat
+
+
 async def _verify_api_key(key: str | None = Security(_api_key_header)):
-    if key is None or not hmac.compare_digest(key, config.VIOLETS_API_KEY):
-        # WARNING, not ERROR — a single bad key is routine, but a burst of these
-        # is worth a lead's attention (misconfigured client or probing).
-        logger.warning("Auth failed — missing or invalid API key")
+    global _auth_fail_last_logged, _auth_fail_suppressed, _auth_fail_interval_count
+    # Compare as bytes: compare_digest raises TypeError on non-ASCII str, which
+    # turned a junk header into a 500 + traceback instead of a 401.
+    if key is None or not hmac.compare_digest(
+        key.encode("utf-8"), config.VIOLETS_API_KEY.encode("utf-8")
+    ):
+        _auth_fail_interval_count += 1
+        now = time.monotonic()
+        if now - _auth_fail_last_logged >= _AUTH_LOG_INTERVAL:
+            # WARNING, not ERROR — a single bad key is routine, but a burst of
+            # these is worth a lead's attention (misconfigured client or probing).
+            logger.warning(
+                "Auth failed — missing or invalid API key (%d more suppressed since the last one; logged at most every %ds)",
+                _auth_fail_suppressed, _AUTH_LOG_INTERVAL,
+            )
+            _auth_fail_last_logged = now
+            _auth_fail_suppressed = 0
+        else:
+            _auth_fail_suppressed += 1
         raise HTTPException(status_code=401, detail="Missing or invalid API key")
 
 
@@ -111,28 +134,33 @@ class _RateLimiter:
     def __init__(self, max_requests: int, window_seconds: int = 60):
         self._max = max_requests
         self._window = window_seconds
-        self._requests: dict[str, list[float]] = defaultdict(list)
+        # Ordered by each key's newest accepted request, so idle keys sit at the
+        # front and eviction never has to scan the whole dict.
+        self._requests: OrderedDict[str, list[float]] = OrderedDict()
         self._lock = Lock()
 
     def check(self, key: str) -> bool:
-        now = time.time()
+        now = time.monotonic()
         with self._lock:
-            # Evict idle keys whose most recent request is outside the window
-            # so the dict stays bounded (it is never otherwise pruned).
-            stale = [
-                k
-                for k, ts in self._requests.items()
-                if k != key and (not ts or now - ts[-1] >= self._window)
-            ]
-            for k in stale:
+            # Evict idle keys from the front so the dict stays bounded. Each
+            # key is evicted at most once, so this is O(1) amortized even
+            # when a client floods rotating user_ids (a full scan per call
+            # was O(n) and burned event-loop CPU under that flood).
+            while self._requests:
+                k, ts = next(iter(self._requests.items()))
+                if ts and now - ts[-1] < self._window:
+                    break
                 del self._requests[k]
 
-            timestamps = [t for t in self._requests[key] if now - t < self._window]
+            timestamps = [t for t in self._requests.get(key, ()) if now - t < self._window]
             if len(timestamps) >= self._max:
+                # Rejections don't append, so the key keeps its position
+                # (order tracks each key's newest timestamp).
                 self._requests[key] = timestamps
                 return False
             timestamps.append(now)
             self._requests[key] = timestamps
+            self._requests.move_to_end(key)
             return True
 
 
@@ -196,6 +224,7 @@ async def _periodic_maintenance():
     instant they occur elsewhere. The heartbeat only answers "how's it doing?"
     (volume, cost, pool utilization) at a glance.
     """
+    global _auth_fail_interval_count
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL)
         try:
@@ -207,13 +236,15 @@ async def _periodic_maintenance():
 
         try:
             m = METRICS.drain_rolling()
+            auth_failures, _auth_fail_interval_count = _auth_fail_interval_count, 0
             logger.info(
-                "HEARTBEAT last %dm — requests=%d errors=%d blocked=%d cost=~$%.4f "
-                "| since boot: requests=%d errors=%d cost=~$%.4f | %s",
+                "HEARTBEAT last %dm — requests=%d errors=%d blocked=%d auth_failed=%d "
+                "cost=~$%.4f | since boot: requests=%d errors=%d cost=~$%.4f | %s",
                 HEARTBEAT_INTERVAL // 60,
                 m["requests"],
                 m["errors"],
                 m["blocked"],
+                auth_failures,
                 m["cost"],
                 m["total_requests"],
                 m["total_errors"],
@@ -410,12 +441,14 @@ async def chat(req: ChatRequest):
         return ChatResponse(response=pii_response)
 
     # ------------------------------------------------------------------
-    # GUARDRAIL 2: Query classification (~70 tokens)
+    # GUARDRAIL 2: Query classification (latest message + last 2 exchanges)
     # Runs after PII check. Blocks out-of-scope and partisan queries
     # before the expensive RAG chain is invoked.
     # ------------------------------------------------------------------
+    # Read-only: returns [] for a new user and does not create a session.
+    history = store.get_history(req.user_id)
     with stage("classify"):
-        classification_response = await classify_query(req.query, ctx)
+        classification_response = await classify_query(req.query, ctx, history)
     if classification_response:
         logger.info(
             "Request blocked — query not in scope [user=%s category=%s]",
@@ -431,7 +464,7 @@ async def chat(req: ChatRequest):
     # on blocked PII / out-of-scope / partisan queries).
     # ------------------------------------------------------------------
     store.get_or_create(req.user_id)
-    chat_history = to_langchain_messages(store.get_history(req.user_id))
+    chat_history = to_langchain_messages(history)
     last_sources = store.get_last_sources(req.user_id)
 
     # ------------------------------------------------------------------

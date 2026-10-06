@@ -1,29 +1,67 @@
 """
 Production-readiness stress test for VIOLETS server.
-Tests auth, concurrency, session races, bad inputs, rate limiting, and the
-Qualtrics usage pattern (multi-turn sequential conversations).
+Tests auth, concurrency, session races, bad inputs, the Qualtrics usage
+pattern (multi-turn sequential conversations), and the exact rate-limit
+boundaries.
 
-Requires VIOLETS_API_KEY env var (or set API_KEY below).
+Usage:
+    python -m maryland_rag.scripts.stress_test                # full suite
+    python -m maryland_rag.scripts.stress_test --limits-only  # rate limits only
 
-The suite issues ~110 requests, some in bursts. The server's global rate
-limiter (RATE_LIMIT_GLOBAL_PER_MINUTE, default 90) can therefore 429 mid-run;
-start the server with RATE_LIMIT_GLOBAL_PER_MINUTE=1000 for a clean pass.
-The rate-limit burst test runs last so its 429s cannot contaminate earlier
-tests.
+Rate limits are read from server.config (RATE_LIMIT_PER_MINUTE,
+RATE_LIMIT_GLOBAL_PER_MINUTE), so run this with the same .env / environment
+as the server under test. The rate-limit phase asserts the boundaries
+exactly: every request up to a limit must succeed and every request past it
+must get 429. It therefore needs the server to itself — any other traffic in
+the same 60 s window shifts the counts and fails the run.
+
+The rate-limit phase uses PII-blocked queries: they count against both
+limiters (which run first) but Presidio blocks them locally before any LLM
+call, so `--limits-only` spends no OpenAI tokens. It waits out one full
+window before starting and another to check recovery, so it takes ~2 min.
 
 Refuses to run against a non-localhost target (real LLM spend + junk
-sessions) unless STRESS_CONFIRM=yes is set.
+sessions) unless STRESS_CONFIRM=yes is set. Exits non-zero on any failure.
 """
+import argparse
 import asyncio
-import json
 import os
+import sys
 import time
+import uuid
+from collections import Counter
+
 import httpx
+
+# Also loads .env, so VIOLETS_API_KEY and the limits match the server's.
+from server import config
+
 BASE = os.environ.get("VIOLETS_BASE_URL", "http://localhost:8000")
 TIMEOUT = 60.0
-API_KEY = os.environ.get("VIOLETS_API_KEY", "")
+API_KEY = config.VIOLETS_API_KEY
 AUTH_HEADERS = {"X-API-Key": API_KEY}
+
+PER_USER_LIMIT = config.RATE_LIMIT_PER_MINUTE
+GLOBAL_LIMIT = config.RATE_LIMIT_GLOBAL_PER_MINUTE
+# Must match _RateLimiter's default window_seconds in server/main.py.
+LIMIT_WINDOW_SECONDS = 60
+# Slack on top of the window for request latency and clock granularity.
+WINDOW_SLACK_SECONDS = 3
+# Requests sent past each limit; every one of them must be rejected.
+OVERFLOW_REQUESTS = 5
+RATE_LIMIT_DETAIL = "Rate limit exceeded"
+# Blocked locally by Presidio, so limit tests make no LLM calls. An email is
+# used because Presidio matches it deterministically; SSN detection skips
+# known dummy numbers (e.g. 123-45-6789), which would reach the classifier.
+FREE_QUERY = "My email is jane.doe@example.com, am I registered?"
+# Distinguishing phrase from FALLBACK_RESPONSES["pii"] in server/middleware.py.
+PII_MARKER = "may contain personal information"
+# Fresh user_ids per run so a re-run never inherits an earlier run's windows.
+RUN_ID = uuid.uuid4().hex[:8]
+
 results = {"pass": 0, "fail": 0, "errors": []}
+
+
 def record(name, passed, detail=""):
     if passed:
         results["pass"] += 1
@@ -32,6 +70,8 @@ def record(name, passed, detail=""):
         results["fail"] += 1
         results["errors"].append(f"{name}: {detail}")
         print(f"  FAIL  {name} — {detail}")
+
+
 async def chat(client, user_id, query):
     resp = await client.post(
         f"{BASE}/chat",
@@ -40,6 +80,8 @@ async def chat(client, user_id, query):
         timeout=TIMEOUT,
     )
     return resp.status_code, resp.json()
+
+
 async def test_auth():
     """Missing/wrong API key must 401 on both authed endpoints; /health stays open."""
     print("\n[0] Authentication")
@@ -58,6 +100,8 @@ async def test_auth():
         record("/reset without key returns 401", resp.status_code == 401, f"got {resp.status_code}")
         resp = await client.get(f"{BASE}/health", timeout=5.0)
         record("/health needs no key", resp.status_code == 200, f"got {resp.status_code}")
+
+
 async def test_qualtrics_conversations():
     """3 users in parallel, each holding a sequential 7-turn conversation —
     the real Qualtrics usage pattern (5-8 turns/user, history growing each turn)."""
@@ -93,26 +137,8 @@ async def test_qualtrics_conversations():
         ok == total,
         f"{ok}/{total} turns succeeded",
     )
-async def test_rate_limit():
-    """25 concurrent requests from one user must trip the 20/min per-user
-    limiter. Uses PII-blocked queries: they count against the limiter (which
-    runs first) but Presidio blocks them locally before any LLM call, so the
-    burst is free. Runs LAST so its 429s can't leak into other tests."""
-    print("\n[8] Per-user rate limit (25 concurrent, one user)")
-    async with httpx.AsyncClient() as client:
-        tasks = [
-            chat(client, "ratelimit-user", f"My SSN is 123-45-678{i % 10}, am I registered?")
-            for i in range(25)
-        ]
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
-    statuses = [r[0] for r in responses if not isinstance(r, Exception)]
-    n_429 = sum(1 for s in statuses if s == 429)
-    n_ok = sum(1 for s in statuses if s == 200)
-    record(
-        "Per-user limiter trips (>=5 of 25 got 429)",
-        n_429 >= 5,
-        f"{n_429} x 429, {n_ok} x 200 (statuses: {sorted(set(statuses))})",
-    )
+
+
 async def test_concurrent_rag_queries():
     """25 different users, same question, all at once — saturates the connection pool (max_size=25)."""
     print("\n[1] Concurrent RAG queries (25 users, same question)")
@@ -156,6 +182,8 @@ async def test_concurrent_rag_queries():
         fallback_count == 0,
         f"{fallback_count}/25 responses returned the error fallback",
     )
+
+
 async def test_same_user_concurrent():
     """Same user_id, 5 concurrent requests — tests session store race."""
     print("\n[2] Same user_id under concurrent load (session race)")
@@ -187,6 +215,8 @@ async def test_same_user_concurrent():
             resp.status_code == 200 and "response" in resp.json(),
             f"status={resp.status_code}",
         )
+
+
 async def test_malformed_inputs():
     """Bad inputs that shouldn't crash the server."""
     print("\n[3] Malformed / edge-case inputs")
@@ -252,6 +282,8 @@ async def test_malformed_inputs():
             resp.status_code == 422,
             f"got {resp.status_code}",
         )
+
+
 async def test_mixed_guardrail_paths():
     """Fire PII, partisan, out-of-scope, and normal queries concurrently."""
     print("\n[4] Mixed guardrail paths concurrently")
@@ -295,6 +327,8 @@ async def test_mixed_guardrail_paths():
                     f"expected out_of_scope fallback, got: {body.get('response', '')[:120]!r}",
                 )
     print(f"  All 5 mixed queries completed in {elapsed:.1f}s")
+
+
 async def test_session_reset_under_load():
     """Reset a session while another request is in-flight for that user."""
     print("\n[5] Session reset during active request")
@@ -322,6 +356,8 @@ async def test_session_reset_under_load():
             )
         except Exception as e:
             record("In-flight request completes after reset", False, str(e))
+
+
 async def test_health_during_load():
     """Health endpoint should respond quickly even when RAG is busy."""
     print("\n[6] Health endpoint responsiveness under load")
@@ -345,32 +381,198 @@ async def test_health_during_load():
         )
         # Let RAG queries finish so we don't leave dangling connections
         await asyncio.gather(*rag_tasks, return_exceptions=True)
-async def main():
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit boundaries
+# ---------------------------------------------------------------------------
+
+async def wait_out_window(reason):
+    seconds = LIMIT_WINDOW_SECONDS + WINDOW_SLACK_SECONDS
+    print(f"  ... waiting {seconds}s for the rate-limit window to clear ({reason})")
+    await asyncio.sleep(seconds)
+
+
+async def burst(client, user_ids):
+    """Send one free (PII-blocked) /chat per user_id, all concurrently."""
+    return await asyncio.gather(
+        *(chat(client, uid, FREE_QUERY) for uid in user_ids),
+        return_exceptions=True,
+    )
+
+
+def summarize(responses):
+    counts = Counter(
+        type(r).__name__ if isinstance(r, Exception) else r[0] for r in responses
+    )
+    return ", ".join(f"{k} x{v}" for k, v in sorted(counts.items(), key=str))
+
+
+def all_accepted(responses):
+    return all(not isinstance(r, Exception) and r[0] == 200 for r in responses)
+
+
+def all_pii_blocked(responses):
+    return all(
+        not isinstance(r, Exception) and PII_MARKER in r[1].get("response", "")
+        for r in responses
+    )
+
+
+def all_rate_limited(responses):
+    return all(
+        not isinstance(r, Exception)
+        and r[0] == 429
+        and r[1].get("detail") == RATE_LIMIT_DETAIL
+        for r in responses
+    )
+
+
+async def test_per_user_limit(client):
+    """Exactly PER_USER_LIMIT requests from one user_id pass; the rest 429.
+
+    Returns the number of global slots consumed, or None if the query was
+    not PII-blocked (the later bursts would then make real LLM calls). Per-user
+    rejections are checked before the global limiter and must not consume
+    global slots — test_global_limit's exact count proves that.
+    """
+    print(f"\n[8] Per-user rate limit (exactly {PER_USER_LIMIT}/min, one user_id)")
+    uid = f"limit-user-{RUN_ID}"
+
+    within = await burst(client, [uid] * PER_USER_LIMIT)
+    record(
+        f"{PER_USER_LIMIT} requests at the per-user limit all succeed",
+        all_accepted(within),
+        summarize(within),
+    )
+    accepted = [r for r in within if not isinstance(r, Exception) and r[0] == 200]
+    # Needs at least one 200 to prove anything — an all-failed burst must not
+    # pass this vacuously and green-light the 200+ request global burst.
+    free = bool(accepted) and all_pii_blocked(accepted)
+    record(
+        "Limit-test query is PII-blocked (no LLM spend)",
+        free,
+        "query reached the LLM — aborting before the global burst",
+    )
+    if not free:
+        return None
+
+    over = await burst(client, [uid] * OVERFLOW_REQUESTS)
+    record(
+        f"{OVERFLOW_REQUESTS} requests over the per-user limit all get 429",
+        all_rate_limited(over),
+        summarize(over),
+    )
+    return PER_USER_LIMIT
+
+
+async def test_global_limit(client, used):
+    """Distinct user_ids fill the global cap exactly; anything past it 429s,
+    including /reset, which shares the same global budget."""
+    remaining = GLOBAL_LIMIT - used
+    print(
+        f"\n[9] Global rate limit (exactly {GLOBAL_LIMIT}/min across all "
+        f"user_ids, {used} already used)"
+    )
+
+    within = await burst(client, [f"global-{RUN_ID}-{i}" for i in range(remaining)])
+    record(
+        f"{remaining} requests from distinct users fill the global cap",
+        all_accepted(within),
+        summarize(within),
+    )
+
+    over = await burst(
+        client, [f"global-over-{RUN_ID}-{i}" for i in range(OVERFLOW_REQUESTS)]
+    )
+    record(
+        f"{OVERFLOW_REQUESTS} fresh user_ids over the global cap all get 429",
+        all_rate_limited(over),
+        summarize(over),
+    )
+
+    resp = await client.post(
+        f"{BASE}/reset",
+        json={"user_id": f"global-over-{RUN_ID}-0"},
+        headers=AUTH_HEADERS,
+        timeout=TIMEOUT,
+    )
+    record(
+        "/reset over the global cap gets 429",
+        resp.status_code == 429,
+        f"got {resp.status_code}",
+    )
+
+
+async def test_limit_recovery(client):
+    """Once the window slides past, previously rejected callers are served."""
+    print("\n[10] Rate-limit recovery after the window slides")
+    await wait_out_window("recovery check")
+
+    s, _ = await chat(client, f"limit-user-{RUN_ID}", FREE_QUERY)
+    record("Previously limited user_id is accepted again", s == 200, f"got {s}")
+
+    resp = await client.post(
+        f"{BASE}/reset",
+        json={"user_id": f"limit-user-{RUN_ID}"},
+        headers=AUTH_HEADERS,
+        timeout=TIMEOUT,
+    )
+    record("/reset is accepted again", resp.status_code == 200, f"got {resp.status_code}")
+
+
+async def run_rate_limit_tests():
+    if PER_USER_LIMIT > GLOBAL_LIMIT:
+        record(
+            "Rate-limit config is testable",
+            False,
+            f"RATE_LIMIT_PER_MINUTE ({PER_USER_LIMIT}) exceeds "
+            f"RATE_LIMIT_GLOBAL_PER_MINUTE ({GLOBAL_LIMIT})",
+        )
+        return
+    print(f"\nRate limits under test: {PER_USER_LIMIT}/min per user, {GLOBAL_LIMIT}/min global")
+    await wait_out_window("start from an empty window")
+    async with httpx.AsyncClient() as client:
+        used = await test_per_user_limit(client)
+        if used is None:
+            return
+        await test_global_limit(client, used)
+        await test_limit_recovery(client)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+async def main(limits_only):
     print("=" * 60)
     print("VIOLETS Production Stress Test")
     print("=" * 60)
-    if not API_KEY:
-        print("WARNING: VIOLETS_API_KEY not set. Auth-protected endpoints will fail.")
     local = any(h in BASE for h in ("localhost", "127.0.0.1", "[::1]"))
     if not local and os.environ.get("STRESS_CONFIRM") != "yes":
         print(f"Refusing to stress-test non-local target {BASE!r}: this spends")
         print("real LLM tokens and writes junk sessions. Set STRESS_CONFIRM=yes to override.")
-        return
+        return False
     # Quick sanity check
     async with httpx.AsyncClient() as client:
-        h = await client.get(f"{BASE}/health", timeout=5.0)
-        if h.status_code != 200:
+        try:
+            h = await client.get(f"{BASE}/health", timeout=5.0)
+        except httpx.HTTPError:
+            h = None
+        if h is None or h.status_code != 200:
             print("Server not reachable. Aborting.")
-            return
-    await test_auth()
-    await test_concurrent_rag_queries()
-    await test_same_user_concurrent()
-    await test_malformed_inputs()
-    await test_mixed_guardrail_paths()
-    await test_session_reset_under_load()
-    await test_health_during_load()
-    await test_qualtrics_conversations()
-    await test_rate_limit()  # keep last: floods one user's limiter with 429s
+            return False
+    if not limits_only:
+        await test_auth()
+        await test_concurrent_rag_queries()
+        await test_same_user_concurrent()
+        await test_malformed_inputs()
+        await test_mixed_guardrail_paths()
+        await test_session_reset_under_load()
+        await test_health_during_load()
+        await test_qualtrics_conversations()
+    # Always last: the phase deliberately exhausts both limiters.
+    await run_rate_limit_tests()
     print("\n" + "=" * 60)
     print(f"RESULTS: {results['pass']} passed, {results['fail']} failed")
     if results["errors"]:
@@ -380,5 +582,15 @@ async def main():
     else:
         print("All tests passed.")
     print("=" * 60)
+    return results["fail"] == 0
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument(
+        "--limits-only",
+        action="store_true",
+        help="run only the rate-limit boundary tests (no LLM spend, ~2 min)",
+    )
+    args = parser.parse_args()
+    sys.exit(0 if asyncio.run(main(args.limits_only)) else 1)

@@ -2,7 +2,7 @@
 Pass 3: Embed chunks and insert into PostgreSQL with pgvector.
 
 Reads data/chunks.jsonl (output from Pass 2), embeds each chunk's text
-using OpenAI text-embedding-3-small (1536-dim), and inserts vectors +
+using OpenAI text-embedding-3-large (3072-dim), and inserts vectors +
 metadata into a PostgreSQL table with the pgvector extension.
 
 Env vars (set in .env or shell):
@@ -25,8 +25,12 @@ from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
-EMBED_MODEL = "text-embedding-3-small"
-EMBED_DIM = 1536
+# Must match server/rag_chain.py EMBED_MODEL. Changing the model means a full
+# drop-and-reingest: the stored vectors and the column dimension both change.
+# 3-large beat 3-small on server/eval_retrieval.py (hit@1 0.77 -> 0.82,
+# 2026-10-05) at ~equal query latency.
+EMBED_MODEL = "text-embedding-3-large"
+EMBED_DIM = 3072
 
 # OpenAI allows up to 2048 inputs per request; 100 is conservative and
 # keeps individual request payloads small.
@@ -85,7 +89,12 @@ def run_embed(
         return 0
 
     from openai import OpenAI
-    oai = OpenAI(api_key=openai_api_key)
+    # Same Enterprise endpoint as server/config.py: the project key is
+    # rejected (401 incorrect_hostname) on the default api.openai.com.
+    oai = OpenAI(
+        api_key=openai_api_key,
+        base_url=os.environ.get("OPENAI_BASE_URL", "https://us.api.openai.com/v1"),
+    )
 
     total = len(chunks)
     inserted = 0
@@ -192,6 +201,20 @@ def _setup_pgvector(database_url: str):
         )
     """)
     conn.commit()
+    # CREATE TABLE IF NOT EXISTS leaves an existing table untouched, so after a
+    # model swap the old column dimension would survive and every insert would
+    # fail. Check up front and say exactly what to do.
+    existing = conn.execute(
+        "SELECT format_type(atttypid, atttypmod) FROM pg_attribute "
+        "WHERE attrelid = 'chunks'::regclass AND attname = 'embedding'"
+    ).fetchone()[0]
+    if existing != f"vector({EMBED_DIM})":
+        conn.close()
+        raise RuntimeError(
+            f"chunks.embedding is {existing} but {EMBED_MODEL} produces "
+            f"vector({EMBED_DIM}). Back up and DROP TABLE chunks, then re-run "
+            "pass 3 for chunks.jsonl and box_chunks.jsonl."
+        )
     logger.info("pgvector table 'chunks' is ready (dim=%d).", EMBED_DIM)
     return conn
 
