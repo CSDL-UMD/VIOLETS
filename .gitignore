@@ -238,3 +238,8 @@ data/chunks.checkpoint
 data/raw/
 logs/venv/
 logs/chat_logs.db
+# Local backups and SQLite WAL sidecars
+data/*.bak*
+data/*.dump
+data/manifest.db-shm
+data/manifest.db-wal
